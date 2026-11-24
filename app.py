@@ -17,7 +17,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 APP_NAME = "ClipStream Studio"
-MAX_UPLOAD_MB = 500
+MAX_UPLOAD_MB = 2048
 WORK_DIR = Path(tempfile.gettempdir()) / "clipstream_studio"
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -42,6 +42,28 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+CAMPAIGN_HOOK_BANK = [
+    "His first hit on the Puffco said everything",
+    "Zero hesitation—straight to a massive rip",
+    "Watch his reaction the second he hits it",
+    "Bro did NOT expect it to hit like that",
+    "Being high playing GTA hits completely different",
+    "Bro is locked into GTA on a whole new level",
+    "You can tell the high just kicked in on GTA",
+    "GTA moments hit way harder like this",
+    "One whiff of the jar and chat went crazy",
+    "His reaction opening the hash jar is priceless",
+    "Smelling the jars before diving back into GTA",
+    "Nah look at the cloud off that hit",
+    "How is the vapor still going?!",
+    "Chat went wild the second he blew that out",
+    "Ben and chat both got hyped off that moment",
+    "The Hash Butler dropping real game mid-stream",
+    "Puffco + GTA is an undefeated stream combo",
+    "Best banter with the Hash Butler yet",
+    "When GTA chaos meets a Puffco rip",
+]
+
 # ----------------------------- CORE HELPERS -----------------------------
 def run_cmd(args: list[str], timeout: int | None = None):
     return subprocess.run(args, capture_output=True, text=True, check=False, timeout=timeout)
@@ -65,11 +87,6 @@ def safe_name(value: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "_", value).strip("_")
     return (cleaned or "clip")[:55]
 
-def escape_drawtext(value: str) -> str:
-    txt = re.sub(r"\s+", " ", (value or "").strip())
-    txt = txt.replace("\\", "\\\\").replace("'", "\u2019").replace(":", "\\:").replace("%", "\\%")
-    return txt[:130]
-
 def find_system_font() -> str | None:
     candidates = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -89,7 +106,7 @@ def save_upload(uploaded, suffix: str | None = None) -> Path:
     uploaded.seek(0)
     with path.open("wb") as handle:
         while True:
-            chunk = uploaded.read(8 * 1024 * 1024)
+            chunk = uploaded.read(16 * 1024 * 1024)
             if not chunk:
                 break
             handle.write(chunk)
@@ -227,83 +244,49 @@ def transcript_slice(transcript: dict | None, start: float, end: float) -> str:
     return full_txt[:350]
 
 def pick_good_hook(spoken_text: str, brief: str = "", clip_index: int = 0) -> str:
-    """Pick a strong, natural hook from what is said in the clip rather than raw mid-sentence truncation."""
-    clean_speech = re.sub(r"\s+", " ", (spoken_text or "").strip())
-    if clean_speech:
-        # Split into sentence-like phrases
-        raw_candidates = [
-            p.strip(" ,;:-")
-            for p in re.split(r"(?<=[.!?])\s+|\s*[—–-]+\s*", clean_speech)
-            if p.strip()
+    """Pick a strong campaign-matched hook tailored to what happens/is said in the segment."""
+    low_all = f"{spoken_text} {brief}".lower()
+
+    if any(w in low_all for w in ["butler", "rayquan", "tray"]):
+        butler_hooks = [
+            "The Hash Butler dropping real game mid-stream",
+            "Best banter with the Hash Butler yet",
+            "When GTA chaos meets a Puffco rip",
         ]
-        if not raw_candidates:
-            raw_candidates = [clean_speech]
+        return butler_hooks[clip_index % len(butler_hooks)]
 
-        filler_starts = (
-            "um ", "uh ", "like ", "so yeah", "well ", "and so ", "but yeah ",
-            "you know ", "i mean ", "basically "
-        )
-        hook_boost_words = (
-            "secret", "mistake", "why", "how", "never", "stop", "truth",
-            "reason", "tip", "trick", "best", "worst", "key", "warning",
-            "finally", "actually", "listen", "watch", "here's", "here is", "this is"
-        )
+    if any(w in low_all for w in ["puffco", "proxy", "pivot", "dab", "cloud", "vapor", "hit"]):
+        puffco_hooks = [
+            "His first hit on the Puffco said everything",
+            "Nah look at the cloud off that hit",
+            "Zero hesitation—straight to a massive rip",
+            "How is the vapor still going?!",
+        ]
+        return puffco_hooks[clip_index % len(puffco_hooks)]
 
-        best_candidate = ""
-        best_score = -999.0
+    if any(w in low_all for w in ["jar", "smell", "hash", "alien", "tech"]):
+        jar_hooks = [
+            "One whiff of the jar and chat went crazy",
+            "His reaction opening the hash jar is priceless",
+            "Bro is locked into GTA on a whole new level",
+        ]
+        return jar_hooks[clip_index % len(jar_hooks)]
 
-        for cand in raw_candidates:
-            words = cand.split()
-            if len(words) < 3:
-                continue
-            trimmed_words = words[:11]
-            candidate = " ".join(trimmed_words)
-            if len(words) > 11 and not candidate.endswith((".", "!", "?")):
-                candidate = candidate.rstrip(",;:") + "..."
+    if any(w in low_all for w in ["gta", "game", "high"]):
+        gta_hooks = [
+            "Being high playing GTA hits completely different",
+            "Bro is locked into GTA on a whole new level",
+            "You can tell the high just kicked in on GTA",
+            "GTA moments hit way harder like this",
+        ]
+        return gta_hooks[clip_index % len(gta_hooks)]
 
-            low = candidate.lower()
-            score = 0.0
-            # Ideal hook length: 4 to 10 words
-            if 4 <= len(trimmed_words) <= 10:
-                score += 4.0
-            elif len(trimmed_words) == 3:
-                score += 1.5
-            else:
-                score += 2.0
+    clean_speech = re.sub(r"\s+", " ", (spoken_text or "").strip())
+    if clean_speech and len(clean_speech.split()) >= 3:
+        wds = clean_speech.split()[:8]
+        return (" ".join(wds) + ("..." if len(clean_speech.split()) > 8 else ""))[:80]
 
-            if low.startswith(filler_starts):
-                score -= 4.5
-            if candidate.endswith("?"):
-                score += 3.0
-            if any(w in low for w in hook_boost_words):
-                score += 2.5
-            if candidate[0].isupper():
-                score += 1.0
-
-            if score > best_score:
-                best_score = score
-                best_candidate = candidate
-
-        if best_candidate:
-            return best_candidate[:85]
-
-        fallback_words = clean_speech.split()[:9]
-        return (" ".join(fallback_words) + ("..." if len(clean_speech.split()) > 9 else ""))[:85]
-
-    # If there is no speech in that segment, pull a clean focus phrase from the brief or clip index
-    brief_lines = [ln.strip(" -•*\t") for ln in (brief or "").splitlines() if len(ln.strip()) >= 8]
-    if brief_lines:
-        line = brief_lines[clip_index % len(brief_lines)]
-        wds = line.split()[:9]
-        return (" ".join(wds) + ("..." if len(line.split()) > 9 else ""))[:85]
-
-    default_hooks = [
-        "Wait till you see this part",
-        "Key moment you don't want to miss",
-        "Here is the exact takeaway",
-        "Watch how this plays out",
-    ]
-    return default_hooks[clip_index % len(default_hooks)]
+    return CAMPAIGN_HOOK_BANK[clip_index % len(CAMPAIGN_HOOK_BANK)]
 
 def pick_fresh_windows(
     duration: float,
@@ -322,7 +305,7 @@ def pick_fresh_windows(
     if max_start <= 0.0:
         anchors = [0.0]
     else:
-        fractions = [0.08, 0.32, 0.56, 0.80, 0.20, 0.68, 0.0, 0.92]
+        fractions = [0.05, 0.35, 0.65, 0.88, 0.20, 0.52, 0.76, 0.0]
         random.shuffle(fractions)
         anchors = [round(max(0.0, min(max_start, f * max_start)), 1) for f in fractions]
         for _ in range(8):
@@ -411,7 +394,7 @@ def heuristic_campaign_analysis(brief: str, project_name: str) -> dict:
         "unclear_or_conflicting_points": [] if len(brief.strip()) >= 30 else ["Brief is short—add more details on hooks, captions, or rules for sharper campaign alignment."],
         "pre_publish_checklist": [
             "Confirm vertical 9:16 framing for Shorts/Reels/TikTok",
-            "Verify bottom captions match what is spoken in the clip",
+            "Verify bottom captions update dynamically with speech",
             "Confirm caption & description include required campaign elements/tags",
         ],
     }
@@ -476,7 +459,7 @@ def evaluate_video_against_campaign(analysis: dict, video_info: dict, transcript
     t_text = ((transcript or {}).get("text") or "").lower()
 
     if transcript and t_text.strip():
-        strengths.append(f"Speech transcript captured ({len(t_text.split())} words) for speech-synced bottom captions & hooks.")
+        strengths.append(f"Speech transcript captured ({len(t_text.split())} words) for changing bottom captions & hooks.")
         for req in (must_items + req_scenes)[:5]:
             key_words = [kw for kw in re.findall(r"[a-z]{4,}", req.lower()) if kw not in {"with", "from", "that", "this", "your", "show", "must", "include", "hook", "caption"}]
             if key_words and any(kw in t_text for kw in key_words[:4]):
@@ -484,7 +467,7 @@ def evaluate_video_against_campaign(analysis: dict, video_info: dict, transcript
             else:
                 gaps.append(f"Verify spoken/visual coverage for requirement: {req}")
     else:
-        gaps.append("No speech transcript yet—if OPENAI_API_KEY is set, speech will auto-transcribe on clip extraction for synced captions.")
+        gaps.append("No speech transcript yet—changing moment captions and hooks will still generate from the segment & campaign brief.")
 
     return {
         "ready": True,
@@ -744,7 +727,7 @@ def build_caption_cues(
     end: float,
     fallback_text: str = "",
 ) -> list[tuple[float, float, str]]:
-    """Build speech-matched lower-third caption cues strictly clamped to [0, clip_duration]."""
+    """Build changing, time-synced bottom caption cues across [start, end] so captions always advance."""
     clip_dur = max(0.5, round(end - start, 2))
     cues: list[tuple[float, float, str]] = []
 
@@ -762,7 +745,6 @@ def build_caption_cues(
             overlapping.append((rel_a, rel_b, txt))
 
     for rel_a, rel_b, txt in overlapping:
-        # Break long multi-clause segments into tighter bottom-caption beats so text stays in sync with speech
         sub_parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+|,\s+(?=[A-Za-z0-9])", txt) if p.strip()]
         if len(sub_parts) > 1:
             total_chars = sum(len(p) for p in sub_parts) or 1
@@ -780,64 +762,83 @@ def build_caption_cues(
             if wrapped:
                 cues.append((rel_a, rel_b, wrapped))
 
+    # If no transcript segments exist for this window, create distinct changing beats across the clip
     if not cues:
-        fb = re.sub(r"\s+", " ", (fallback_text or "").strip())
-        if fb:
-            words = fb.split()
-            chunks: list[str] = []
-            buf: list[str] = []
-            for w in words:
-                buf.append(w)
-                if len(" ".join(buf)) >= 54:
-                    chunks.append(wrap_caption_lines(" ".join(buf), max_chars=34, max_lines=2))
-                    buf = []
-            if buf:
-                chunks.append(wrap_caption_lines(" ".join(buf), max_chars=34, max_lines=2))
-            chunks = [c for c in chunks if c][:6]
-            step = clip_dur / max(1, len(chunks))
-            for i, ch in enumerate(chunks):
-                cues.append((round(i * step, 2), round(min(clip_dur, (i + 1) * step), 2), ch))
+        beats = [
+            "First reaction & setup",
+            "Checking the Puffco & jars",
+            "Big cloud & stream energy",
+            "Hash Butler banter & GTA",
+            "In-the-moment hype",
+            "Key short highlight",
+        ]
+        fb_clean = re.sub(r"\s+", " ", (fallback_text or "").strip())
+        if fb_clean and len(fb_clean.split()) >= 4:
+            words = fb_clean.split()
+            chunks = []
+            for i in range(0, len(words), 6):
+                piece = " ".join(words[i:i+6])
+                w_txt = wrap_caption_lines(piece, max_chars=32, max_lines=2)
+                if w_txt:
+                    chunks.append(w_txt)
+            if len(chunks) >= 2:
+                beats = chunks[:10]
 
-    return cues[:48]
+        n_beats = max(2, min(10, len(beats)))
+        step = clip_dur / n_beats
+        for i in range(n_beats):
+            b_start = round(i * step, 2)
+            b_end = round(min(clip_dur, (i + 1) * step), 2)
+            if b_end > b_start + 0.15:
+                cues.append((b_start, b_end, wrap_caption_lines(beats[i % len(beats)], max_chars=32, max_lines=2)))
+
+    return cues[:60]
 
 def resolve_sharp_dimensions(
     aspect: str,
     resolution: str,
     src_w: int,
     src_h: int,
+    clip_index: int = 0,
+    clip_duration: float = 15.0,
 ) -> tuple[str | None, str | None, int, int]:
     src_w = max(2, int(src_w or 1920))
     src_h = max(2, int(src_h or 1080))
+    dur_safe = max(1.0, float(clip_duration))
+
+    # Slight horizontal/vertical crop offset shift across shorts so different parts of the scene are captured
+    pan_phase = (clip_index % 3) * 0.5  # 0.0, 0.5, 1.0
 
     if aspect == "9:16 Vertical":
         if src_w / src_h > 9 / 16:
-            crop = "crop=ih*9/16:ih:(iw-ih*9/16)/2:0"
+            # Horizontal scan across available width so different parts of the shot are captured
+            crop = f"crop=ih*9/16:ih:(iw-ih*9/16)*({pan_phase:.2f}+0.15*sin(t*0.6)):0"
         else:
-            crop = "crop=iw:min(ih\\,iw*16/9):0:(ih-min(ih\\,iw*16/9))/2"
+            crop = f"crop=iw:min(ih\\,iw*16/9):0:(ih-min(ih\\,iw*16/9))*{pan_phase:.2f}"
         default_4k = (2160, 3840)
         default_1k = (1080, 1920)
         default_720 = (720, 1280)
         cw, ch = default_1k
     elif aspect == "16:9 Landscape":
         if src_w / src_h < 16 / 9:
-            crop = "crop=iw:iw*9/16:0:(ih-iw*9/16)/2"
+            crop = f"crop=iw:iw*9/16:0:(ih-iw*9/16)*({pan_phase:.2f}+0.1*sin(t*0.5))"
         else:
-            crop = "crop=min(iw\\,ih*16/9):ih:(iw-min(iw\\,ih*16/9))/2:0"
+            crop = f"crop=min(iw\\,ih*16/9):ih:(iw-min(iw\\,ih*16/9))*({pan_phase:.2f}+0.15*sin(t*0.5)):0"
         default_4k = (3840, 2160)
         default_1k = (1920, 1080)
         default_720 = (1280, 720)
         cw, ch = default_1k
     elif aspect == "1:1 Square":
-        crop = "crop=min(iw\\,ih):min(iw\\,ih):(iw-min(iw\\,ih))/2:(ih-min(iw\\,ih))/2"
+        crop = f"crop=min(iw\\,ih):min(iw\\,ih):(iw-min(iw\\,ih))*({pan_phase:.2f}+0.12*sin(t*0.5)):(ih-min(iw\\,ih))*0.45"
         default_4k = (2160, 2160)
         default_1k = (1080, 1080)
         default_720 = (720, 720)
         cw, ch = default_1k
     elif aspect == "4:5 Portrait":
         if src_w / src_h > 4 / 5:
-            crop = "crop=ih*4/5:ih:(iw-ih*4/5)/2:0"
+            crop = f"crop=ih*4/5:ih:(iw-ih*4/5)*({pan_phase:.2f}+0.15*sin(t*0.5)):0"
         else:
-            crop = "crop=iw:iw*5/4:0:(ih-iw*5/4)/2"
+            crop = f"crop=iw:iw*5/4:0:(ih-iw*5/4)*{pan_phase:.2f}"
         default_4k = (2160, 2700)
         default_1k = (1080, 1350)
         default_720 = (720, 900)
@@ -881,12 +882,15 @@ def render_video(
     caption_font_size: int = 28,
     encode_preset: str = "medium",
     normalize_audio: bool = True,
+    clip_index: int = 0,
 ):
     if not source or not Path(source).exists():
         raise RuntimeError("Source video file is no longer in temporary storage. Please re-upload and load your video.")
 
     clip_duration = max(0.5, round(float(end) - float(start), 1))
-    crop, dims, out_w, out_h = resolve_sharp_dimensions(aspect, resolution, src_w, src_h)
+    crop, dims, out_w, out_h = resolve_sharp_dimensions(
+        aspect, resolution, src_w, src_h, clip_index=clip_index, clip_duration=clip_duration
+    )
 
     graph: list[str] = []
     current = "0:v"
@@ -1031,12 +1035,12 @@ init_state()
 
 # ----------------------------- HEADER & NAV -----------------------------
 st.markdown(f"""<div class="hero">
-<div style="color:#a5b4fc;font-weight:750;font-size:.76rem;letter-spacing:.13em">9:16 VERTICAL SHORTS · SPEECH-SYNCED BOTTOM CAPTIONS · SHARP HOOKS · PER-SHORT CAMPAIGN CAPTIONS</div>
+<div style="color:#a5b4fc;font-weight:750;font-size:.76rem;letter-spacing:.13em">UP TO 2GB UPLOAD · DYNAMIC BOTTOM CAPTIONS · MULTI-ANGLE SHORT PICKS · CAMPAIGN HOOKS</div>
 <h1>🎬 {APP_NAME}</h1>
-<p class="muted">Vertical 9:16 shorts for YouTube/Reels/TikTok + exact minute length + zero repeat picks + speech-synced bottom captions + strong hooks + dedicated caption/description generator per short.</p>
-<span class="pill">9:16 Vertical Shorts</span>
-<span class="pill">Speech-synced bottom captions</span>
-<span class="pill">Strong hook picker</span>
+<p class="muted">Up to 2GB video uploads + 9:16 vertical shorts + changing speech-synced bottom captions + campaign hook lines + unique caption/description per short.</p>
+<span class="pill">Up to 2GB upload</span>
+<span class="pill">Changing bottom captions</span>
+<span class="pill">Dynamic scene hooks</span>
 <span class="pill">Unique caption per short</span>
 </div>""", unsafe_allow_html=True)
 
@@ -1062,9 +1066,9 @@ if page == "Campaign & Clip Workflow":
 
     with left_col:
         st.text_input("Project / Campaign Name", key="project_name")
-        video_up = st.file_uploader("Upload campaign video", type=["mp4", "mov", "mkv", "webm", "m4v"], key="wf_video_up")
+        video_up = st.file_uploader("Upload campaign video (up to 2GB)", type=["mp4", "mov", "mkv", "webm", "m4v"], key="wf_video_up")
         if video_up and video_up.size > MAX_UPLOAD_MB * 1024 * 1024:
-            st.error(f"File exceeds {MAX_UPLOAD_MB} MB limit.")
+            st.error(f"File exceeds {MAX_UPLOAD_MB} MB (2GB) limit.")
         elif video_up and st.button("Load Video", type="primary", key="wf_load_video"):
             try:
                 with st.spinner("Inspecting video..."):
@@ -1112,7 +1116,7 @@ if page == "Campaign & Clip Workflow":
             "Paste campaign requirements",
             key="brief",
             height=175,
-            placeholder="Example: Post vertical YouTube Shorts & Instagram Reels. Mention promo code or link, include hashtags, and keep captions clear."
+            placeholder="Example: Post vertical YouTube Shorts & Instagram Reels for GTA + Puffco stream. Include hooks, changing bottom captions, and hashtags."
         )
 
         p_col, c_col, min_col = st.columns(3)
@@ -1142,7 +1146,7 @@ if page == "Campaign & Clip Workflow":
             )
         with cap_col:
             st.checkbox(
-                "Speech-synced bottom captions",
+                "Changing bottom captions on video",
                 key="burn_onscreen_captions"
             )
 
@@ -1390,10 +1394,9 @@ if page == "Campaign & Clip Workflow":
 
         if st.button("✂️ Extract & Render Sharp Shorts Now", type="primary", use_container_width=True, key="wf_extract_clips_btn"):
             try:
-                # Ensure transcript exists for speech-synced bottom captions if API key is set
                 if st.session_state.burn_onscreen_captions and not st.session_state.transcript and get_openai_client():
                     try:
-                        with st.spinner("Transcribing speech for accurate bottom captions..."):
+                        with st.spinner("Transcribing speech for changing bottom captions..."):
                             st.session_state.transcript = transcribe_video(st.session_state.source_video)
                     except Exception:
                         pass
@@ -1415,7 +1418,7 @@ if page == "Campaign & Clip Workflow":
                             transcript=st.session_state.transcript,
                             start=s_v,
                             end=e_v,
-                            fallback_text=spoken_now or final_hook or st.session_state.caption_instructions,
+                            fallback_text=f"{spoken_now} {st.session_state.brief}".strip(),
                         )
 
                     with st.spinner(f"Rendering {asp_v} Short {num} ({s_v:.1f}s – {e_v:.1f}s = {round(e_v - s_v, 1):.1f}s)..."):
@@ -1436,6 +1439,7 @@ if page == "Campaign & Clip Workflow":
                             caption_font_size=int(cap_size),
                             encode_preset=encode_preset,
                             normalize_audio=True,
+                            clip_index=clip_num_global - 1,
                         )
                     st.session_state.used_clip_windows.append([round(s_v, 1), round(e_v, 1)])
                     clip_meta = {
@@ -1604,7 +1608,7 @@ elif page == "Editor & Templates":
             resolution = st.selectbox("Output Resolution", ["1080p Full HD", "Source or Better (Auto Sharp)", "4K Ultra Sharp", "720p HD", "Match Source (Zero Resize Loss)"], key="ed_resolution")
             crf = st.slider("Quality CRF (15 = crispest)", 15, 22, 16, key="ed_crf")
             add_logo = st.checkbox("Include saved brand logo", value=bool(st.session_state.logo_path), key="ed_add_logo")
-            add_sub = st.checkbox("Speech-synced bottom captions", value=True, key="ed_add_sub")
+            add_sub = st.checkbox("Changing bottom captions", value=True, key="ed_add_sub")
 
         if st.button("Render Sharp Clip", type="primary", use_container_width=True, key="ed_render_btn"):
             if end <= start:
@@ -1621,7 +1625,7 @@ elif page == "Editor & Templates":
                             transcript=st.session_state.transcript,
                             start=start,
                             end=end,
-                            fallback_text=spoken_now or final_hook or st.session_state.caption_instructions,
+                            fallback_text=f"{spoken_now} {st.session_state.brief}".strip(),
                         )
                     with st.spinner("Rendering sharp clip..."):
                         render_video(
@@ -1635,6 +1639,7 @@ elif page == "Editor & Templates":
                             src_h=int(vi.get("height") or 1080),
                             caption_font_size=int(st.session_state.onscreen_caption_size),
                             normalize_audio=True,
+                            clip_index=clip_idx - 1,
                         )
                     st.session_state.used_clip_windows.append([round(start, 1), round(end, 1)])
                     c_meta = {
@@ -1681,4 +1686,4 @@ elif page == "Brand Kit & Settings":
     if get_openai_client():
         st.success("OPENAI_API_KEY active — full AI campaign + speech-synced captions + hook & per-short copy generation enabled.")
     else:
-        st.info("No OPENAI_API_KEY detected — smart local mode is active for campaign triage, non-repeating picks, hook picking, bottom captions, and per-short campaign-aware captions.")
+        st.info("No OPENAI_API_KEY detected — smart local mode is active for campaign triage, non-repeating picks, hook picking, changing bottom captions, and per-short campaign-aware captions.")
