@@ -177,6 +177,57 @@ def workspace_dir(ws_key: str) -> Path:
     return d
 
 
+def list_saved_workspaces() -> list[dict]:
+    items: list[dict] = []
+    if not WORKSPACES_ROOT.exists():
+        return items
+    for sub in sorted(WORKSPACES_ROOT.iterdir(), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True):
+        if not sub.is_dir():
+            continue
+        state_file = sub / "workspace_state.json"
+        label = sub.name
+        saved_at = ""
+        if state_file.exists():
+            try:
+                data = json.loads(state_file.read_text(encoding="utf-8"))
+                proj = (data.get("project_name") or "").strip()
+                acct = (data.get("account_handle") or "").strip()
+                saved_at = data.get("saved_at") or ""
+                bits = [b for b in [proj, acct, sub.name[:16]] if b]
+                label = " · ".join(bits)
+            except Exception:
+                pass
+        size_mb = round(sum(f.stat().st_size for f in sub.rglob("*") if f.is_file()) / (1024 * 1024), 1)
+        items.append({"key": sub.name, "path": sub, "label": label, "saved_at": saved_at, "size_mb": size_mb})
+    return items
+
+
+def clear_workspace_data(ws_key: str, reset_session: bool = True) -> None:
+    wdir = workspace_dir(ws_key)
+    shutil.rmtree(wdir, ignore_errors=True)
+    wdir.mkdir(parents=True, exist_ok=True)
+    gc.collect()
+    if reset_session:
+        st.session_state["brief"] = ""
+        st.session_state["brief_analysis"] = None
+        st.session_state["campaign_feedback"] = None
+        st.session_state["go_ahead_clips"] = False
+        st.session_state["used_clip_windows"] = []
+        st.session_state["source_video"] = None
+        st.session_state["video_name"] = None
+        st.session_state["video_info"] = None
+        st.session_state["broken_parts"] = []
+        st.session_state["transcript"] = None
+        st.session_state["auto_candidates"] = []
+        st.session_state["clips"] = []
+        st.session_state["logo_path"] = None
+        st.session_state["logo_name"] = None
+        st.session_state["project_name"] = "My campaign"
+        st.session_state["brand_name"] = ""
+        st.session_state["caption_instructions"] = ""
+        st.session_state["last_saved_at"] = f"Cleared ({time.strftime('%H:%M:%S')})"
+
+
 def save_workspace_state(ws_key: str | None = None) -> Path:
     key = ws_key or st.session_state.get("workspace_key") or compute_workspace_key(
         st.session_state.get("account_handle", ""),
@@ -203,6 +254,7 @@ def save_workspace_state(ws_key: str | None = None) -> Path:
         "hook_banner_scope": st.session_state.get("hook_banner_scope", "8-Second Top Banner (0–8s)"),
         "burn_subtitles_chk_v2": bool(st.session_state.get("burn_subtitles_chk_v2", True)),
         "onscreen_caption_size": int(st.session_state.get("onscreen_caption_size", 32)),
+        "vertical_fit_mode": st.session_state.get("vertical_fit_mode", "Fit All (No Black Bars)"),
         "source_video": st.session_state.get("source_video"),
         "video_name": st.session_state.get("video_name"),
         "video_info": st.session_state.get("video_info"),
@@ -233,9 +285,10 @@ def load_workspace_state(ws_key: str) -> bool:
         "project_name", "brief", "brief_analysis", "campaign_feedback",
         "go_ahead_clips", "target_platform_choice", "desired_clip_minutes",
         "auto_clip_minutes", "used_clip_windows", "hook_banner_scope",
-        "burn_subtitles_chk_v2", "onscreen_caption_size", "video_name",
-        "video_info", "broken_parts", "transcript", "auto_candidates",
-        "logo_name", "brand_name", "brand_colour", "caption_instructions",
+        "burn_subtitles_chk_v2", "onscreen_caption_size", "vertical_fit_mode",
+        "video_name", "video_info", "broken_parts", "transcript",
+        "auto_candidates", "logo_name", "brand_name", "brand_colour",
+        "caption_instructions",
     ]:
         if field in data and data[field] is not None:
             st.session_state[field] = data[field]
@@ -814,7 +867,7 @@ def heuristic_campaign_analysis(brief: str, project_name: str) -> dict:
         "assets_to_request": [],
         "unclear_or_conflicting_points": [] if len(brief.strip()) >= 30 else ["Brief is short—add more details on hooks, captions, or rules for sharper campaign alignment."],
         "pre_publish_checklist": [
-            "Confirm 9:16 fills frame cleanly with hook & captions inside safe margins",
+            "Confirm full video fits inside 9:16 with no black bars & hook/captions inside safe margins",
             "Verify peak moments are stitched cleanly into one clip",
             "Check YouTube, Instagram, and Facebook captions/tags",
         ],
@@ -867,7 +920,7 @@ def evaluate_video_against_campaign(analysis: dict, video_info: dict, transcript
     w = int(video_info.get("width", 0) or 0)
     h = int(video_info.get("height", 0) or 0)
     if dur > 0:
-        strengths.append(f"Video duration is {dur:.1f}s ({fmt_time(dur)}) at {w}x{h} — full-screen 9:16 + multi-moment stitch ready.")
+        strengths.append(f"Video duration is {dur:.1f}s ({fmt_time(dur)}) at {w}x{h} — 9:16 fit + multi-moment stitch ready.")
     if analysis.get("caption_requirements") or analysis.get("hashtags"):
         strengths.append("Campaign caption/tag requirements detected—YouTube, IG & Facebook copy will incorporate them.")
     if analysis.get("requires_8s_hook"):
@@ -895,7 +948,7 @@ def evaluate_video_against_campaign(analysis: dict, video_info: dict, transcript
 
     return {
         "ready": True,
-        "verdict": "Ready for Go-Ahead — Full-Screen 9:16, Fitted Hook & Auto Subtitles Ready",
+        "verdict": "Ready for Go-Ahead — 9:16 Fit, Fitted Hook & Auto Subtitles Ready",
         "strengths": strengths,
         "gaps": gaps,
         "warnings": warnings,
@@ -1303,16 +1356,26 @@ def build_frame_stage_filter(
     out_h: int,
     aspect: str,
     out_label: str,
+    fit_mode: str = "Fit All (No Black Bars)",
 ) -> str:
-    """Fills vertical/square/portrait frames full-screen without black voids while staying fast."""
-    if aspect in {"9:16 Vertical", "1:1 Square", "4:5 Portrait"}:
+    """
+    - 'Fit All (No Black Bars)': scales the entire frame to out_w x out_h so 100% of the video is visible
+      inside 9:16 with zero black top/bottom bars and zero cropped edges.
+    - 'Fill & Crop (9:16 Zoom)': scales to cover out_w x out_h and center-crops overflow.
+    - 'Letterbox Fit': scales to fit inside out_w x out_h and pads remaining space cleanly.
+    """
+    if fit_mode == "Fill & Crop (9:16 Zoom)":
         return (
-            f"[{in_label}]scale={out_w}:{out_h}:force_original_aspect_ratio=increase:flags=bilinear,"
+            f"[{in_label}]scale={out_w}:{out_h}:force_original_aspect_ratio=increase:flags=lanczos,"
             f"crop={out_w}:{out_h}:(iw-{out_w})/2:(ih-{out_h})/2,setsar=1[{out_label}]"
         )
+    if fit_mode == "Letterbox Fit":
+        return (
+            f"[{in_label}]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease:flags=lanczos,"
+            f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:color=#090c13,setsar=1[{out_label}]"
+        )
     return (
-        f"[{in_label}]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease:flags=bilinear,"
-        f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:color=#090c13,setsar=1[{out_label}]"
+        f"[{in_label}]scale={out_w}:{out_h}:flags=lanczos,setsar=1[{out_label}]"
     )
 
 
@@ -1426,6 +1489,7 @@ def render_video(
     normalize_audio: bool = False,
     clip_index: int = 0,
     srt_output_path: str | None = None,
+    fit_mode: str = "Fit All (No Black Bars)",
 ) -> str | None:
     if not source or not Path(source).exists():
         raise RuntimeError("Source or broken-part video file is missing. Load or break the video again.")
@@ -1433,7 +1497,7 @@ def render_video(
     clip_duration = max(0.5, round(float(end) - float(start), 1))
     out_w, out_h = resolve_target_dimensions(aspect, resolution, src_w, src_h)
 
-    graph: list[str] = [build_frame_stage_filter("0:v", out_w, out_h, aspect, "vstage")]
+    graph: list[str] = [build_frame_stage_filter("0:v", out_w, out_h, aspect, "vstage", fit_mode=fit_mode)]
     temp_text_files: list[Path] = []
     try:
         current, saved_srt = append_overlays_and_subs(
@@ -1499,6 +1563,7 @@ def render_stitched_clip(
     caption_font_size: int = 32,
     encode_preset: str = "ultrafast",
     srt_output_path: str | None = None,
+    fit_mode: str = "Fit All (No Black Bars)",
 ) -> str | None:
     """Trims multiple peak moments from source and concatenates them into ONE single clip."""
     if not source or not Path(source).exists():
@@ -1523,7 +1588,7 @@ def render_stitched_clip(
         graph.append(
             f"[0:v]trim=start={s_v:.2f}:end={e_v:.2f},setpts=PTS-STARTPTS[{v_trim}]"
         )
-        graph.append(build_frame_stage_filter(v_trim, out_w, out_h, aspect, v_stage))
+        graph.append(build_frame_stage_filter(v_trim, out_w, out_h, aspect, v_stage, fit_mode=fit_mode))
         graph.append(
             f"[0:a]atrim=start={s_v:.2f}:end={e_v:.2f},asetpts=PTS-STARTPTS,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[{a_trim}]"
         )
@@ -1610,6 +1675,7 @@ def init_state():
         "pending_hook_banner_scope": None,
         "burn_subtitles_chk_v2": True,
         "onscreen_caption_size": 32,
+        "vertical_fit_mode": "Fit All (No Black Bars)",
         "source_video": None,
         "video_name": None,
         "video_info": None,
@@ -1638,13 +1704,13 @@ init_state()
 
 # ----------------------------- HEADER & NAV -----------------------------
 st.markdown(f"""<div class="hero">
-<div style="color:#a5b4fc;font-weight:750;font-size:.76rem;letter-spacing:.13em">YOUTUBE + IG + FACEBOOK · FULL-SCREEN 9:16 · FITTED HOOKS · AUTO BURNED CAPTIONS</div>
+<div style="color:#a5b4fc;font-weight:750;font-size:.76rem;letter-spacing:.13em">YOUTUBE + IG + FACEBOOK · 9:16 NO BLACK BARS · FITTED HOOKS · AUTO BURNED CAPTIONS</div>
 <h1>🎬 {APP_NAME}</h1>
-<p class="muted">Stitch peak moments into one clip with full-screen 9:16 framing, fitted top hooks, speech-matched burned captions + .SRT, and saved work per IP / sign-in demo.</p>
+<p class="muted">Stitch peak moments into one clip with full 9:16 visibility (no black top/bottom bars), fitted top hooks, speech-matched burned captions + .SRT, and clean workspace management.</p>
 <span class="pill">YouTube + IG + Facebook</span>
-<span class="pill">Full-screen 9:16</span>
+<span class="pill">9:16 fit (no black bars)</span>
 <span class="pill">Fitted hooks & burned captions</span>
-<span class="pill">Saved work (IP / Sign-in)</span>
+<span class="pill">Clear & manage saved work</span>
 </div>""", unsafe_allow_html=True)
 
 if not ffmpeg_ready():
@@ -1686,6 +1752,29 @@ with st.sidebar:
                 st.rerun()
             else:
                 st.info("No saved work for this ID/IP yet.")
+
+    if st.button("🧹 Clear Current Saved Work", use_container_width=True, key="clear_cur_ws_btn"):
+        clear_workspace_data(active_ws_key, reset_session=True)
+        st.success("Cleared saved work & reset current session.")
+        st.rerun()
+
+    saved_items = list_saved_workspaces()
+    if saved_items:
+        with st.expander(f"Manage Saved Workspaces ({len(saved_items)})"):
+            for item in saved_items[:10]:
+                st.caption(f"**{item['label']}** ({item['size_mb']} MB)")
+                c_ld, c_rm = st.columns(2)
+                with c_ld:
+                    if st.button("Load", key=f"ws_ld_{item['key']}", use_container_width=True):
+                        st.session_state["workspace_key"] = item["key"]
+                        load_workspace_state(item["key"])
+                        st.rerun()
+                with c_rm:
+                    if st.button("Delete", key=f"ws_rm_{item['key']}", use_container_width=True):
+                        is_cur = item["key"] == active_ws_key
+                        clear_workspace_data(item["key"], reset_session=is_cur)
+                        shutil.rmtree(item["path"], ignore_errors=True)
+                        st.rerun()
 
     if st.session_state.get("last_saved_at"):
         st.caption(f"Last saved: `{st.session_state['last_saved_at']}`")
@@ -1795,7 +1884,7 @@ if page == "Campaign & Auto-Clipper":
             "Paste campaign requirements",
             key="brief",
             height=175,
-            placeholder="Example: Post across YouTube Shorts, Instagram Reels & Facebook. Stitch peak moments, fill 9:16 cleanly, burn speech captions & hooks.",
+            placeholder="Example: Post across YouTube Shorts, Instagram Reels & Facebook. Stitch peak moments, fit 9:16 with no black bars, burn speech captions & hooks.",
         )
 
         p_col, c_col, min_col = st.columns(3)
@@ -1960,10 +2049,10 @@ if page == "Campaign & Auto-Clipper":
                 exact_s = minutes_to_seconds(float(st.session_state.auto_clip_minutes))
                 st.success(f"Go-ahead granted! Each stitched clip totals ~{float(st.session_state.auto_clip_minutes):.2f} min ({exact_s:.1f}s) with fitted hook & burned captions.")
 
-    # Step 3: Auto-Clipper (Multi-moment peak stitch + full-screen 9:16 + burned speech captions)
+    # Step 3: Auto-Clipper (Multi-moment peak stitch + 9:16 fit + burned speech captions)
     if st.session_state.go_ahead_clips and st.session_state.video_info and ffmpeg_ready():
         st.divider()
-        st.subheader("Step 3 · Auto-Clipper (Peak Moment Stitch + Full-Screen 9:16 + Burned Captions)")
+        st.subheader("Step 3 · Auto-Clipper (Peak Moment Stitch + 9:16 Fit + Burned Captions)")
         vi = st.session_state.video_info
         dur = max(1.0, float(vi["duration"]))
         use_subs = bool(st.session_state.get("burn_subtitles_chk_v2", True))
@@ -2022,7 +2111,7 @@ if page == "Campaign & Auto-Clipper":
         default_asp = default_aspect_for_platform(st.session_state.target_platform_choice)
         st.caption(
             f"Each clip stitches peak sub-moments summing to **{active_minutes:.2f} min ({exact_target_sec:.1f}s)** · "
-            f"Aspect: **{default_asp}** (fills screen cleanly with fitted hook & burned speech captions)."
+            f"Aspect: **{default_asp}** with fitted hook & burned speech captions."
         )
 
         cands = st.session_state.auto_candidates or build_auto_clip_candidates(
@@ -2037,7 +2126,7 @@ if page == "Campaign & Auto-Clipper":
         )
         cands = cands[:active_count]
 
-        q_col1, q_col2, q_col3, q_col4 = st.columns(4)
+        q_col1, q_col2, q_col3, q_col4, q_col5 = st.columns(5)
         with q_col1:
             sharp_res = st.selectbox(
                 "Output Resolution",
@@ -2045,10 +2134,16 @@ if page == "Campaign & Auto-Clipper":
                 key="wf_sharp_res",
             )
         with q_col2:
-            sharp_crf = st.slider("Quality CRF (18–26, 22 = fast & crisp)", 18, 26, 22, key="wf_sharp_crf")
+            fit_mode = st.selectbox(
+                "9:16 Frame Fit",
+                ["Fit All (No Black Bars)", "Fill & Crop (9:16 Zoom)", "Letterbox Fit"],
+                key="vertical_fit_mode",
+            )
         with q_col3:
-            encode_preset = st.selectbox("Encode speed", ["ultrafast", "veryfast", "fast"], key="wf_encode_preset")
+            sharp_crf = st.slider("Quality CRF (18–26)", 18, 26, 22, key="wf_sharp_crf")
         with q_col4:
+            encode_preset = st.selectbox("Encode speed", ["ultrafast", "veryfast", "fast"], key="wf_encode_preset")
+        with q_col5:
             cap_size = st.slider("Subtitle size", 24, 44, int(st.session_state.onscreen_caption_size), key="wf_cap_size")
 
         for idx, cand in enumerate(cands):
@@ -2124,6 +2219,7 @@ if page == "Campaign & Auto-Clipper":
                             caption_font_size=int(cap_size),
                             encode_preset=encode_preset,
                             srt_output_path=str(srt_file),
+                            fit_mode=fit_mode,
                         )
 
                     for m in moments:
@@ -2137,6 +2233,7 @@ if page == "Campaign & Auto-Clipper":
                         "start": float(moments[0]["start"]),
                         "end": round(float(moments[0]["start"]) + stitched_sec, 1),
                         "aspect": default_asp,
+                        "fit_mode": fit_mode,
                         "hook": final_hook,
                         "transcript_excerpt": all_spoken,
                     }
@@ -2182,7 +2279,7 @@ if page == "Campaign & Auto-Clipper":
                         used_windows=st.session_state.used_clip_windows,
                     )
                     save_workspace_state()
-                    st.success(f"Stitched {len(rendered_now)} peak-moment clip(s) at ~{active_minutes:.2f} min each in {default_asp} with fitted hooks & burned captions.")
+                    st.success(f"Stitched {len(rendered_now)} peak-moment clip(s) at ~{active_minutes:.2f} min each in {default_asp} ({fit_mode}) with fitted hooks & burned captions.")
             except Exception as exc:
                 st.error(f"Auto-clip stitch error: {exc}")
 
@@ -2232,6 +2329,7 @@ elif page == "Manual Clipper (Start → End)":
             hook_dur_opt = st.selectbox("Top hook duration", ["8s Banner", "Full Clip Banner"], key="ed_hook_dur")
         with b:
             aspect = st.selectbox("Aspect ratio", ["9:16 Vertical", "16:9 Landscape", "1:1 Square", "4:5 Portrait", "Keep original"], key="ed_aspect")
+            fit_mode_ed = st.selectbox("9:16 Frame Fit", ["Fit All (No Black Bars)", "Fill & Crop (9:16 Zoom)", "Letterbox Fit"], key="ed_fit_mode")
             resolution = st.selectbox("Output Resolution", ["720p HD", "1080p Full HD", "4K Ultra Sharp", "Match Source (Zero Resize Loss)"], key="ed_resolution")
             crf = st.slider("Quality CRF (18–26, 22 = fast & crisp)", 18, 26, 22, key="ed_crf")
             add_logo = st.checkbox("Include saved brand logo", value=bool(st.session_state.logo_path), key="ed_add_logo")
@@ -2273,6 +2371,7 @@ elif page == "Manual Clipper (Start → End)":
                             normalize_audio=False,
                             clip_index=clip_idx - 1,
                             srt_output_path=str(srt_out),
+                            fit_mode=fit_mode_ed,
                         )
                     st.session_state.used_clip_windows.append([round(start, 1), round(end, 1)])
                     c_meta = {
@@ -2282,6 +2381,7 @@ elif page == "Manual Clipper (Start → End)":
                         "start": start,
                         "end": end,
                         "aspect": aspect,
+                        "fit_mode": fit_mode_ed,
                         "hook": final_hook,
                         "transcript_excerpt": spoken_now,
                     }
