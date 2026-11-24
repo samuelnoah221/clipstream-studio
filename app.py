@@ -533,9 +533,9 @@ def pick_auto_clip_windows(
     max_start = round(max(0.0, duration - exact_len), 1)
 
     if max_start <= 0.0:
-        return [(0.0, round(min(duration, exact_len), 1), transcript_slice(transcript, 0.0, min(duration, exact_len)))]
+        end_s = round(min(duration, exact_len), 1)
+        return [(0.0, end_s, transcript_slice(transcript, 0.0, end_s))]
 
-    # Spread candidates evenly across different sections of the video first
     even_anchors = [
         round((i / max(1, count)) * max_start, 1)
         for i in range(count)
@@ -560,7 +560,6 @@ def pick_auto_clip_windows(
             picked.append((s_val, e_val, transcript_slice(transcript, s_val, e_val)))
             combined_used.append([s_val, e_val])
 
-    # Fallback if the video is short and windows slightly overlap
     if len(picked) < count:
         for idx in range(count):
             if len(picked) >= count:
@@ -1296,7 +1295,7 @@ def init_state():
         "used_clip_windows": [],
         "hook_mode_choice": "Standard Clip Length (Exact Minutes)",
         "hook_banner_scope": "8-Second Top Banner (0–8s)",
-        "burn_onscreen_captions": True,
+        "burn_onscreen_captions_widget": True,
         "onscreen_caption_size": 30,
         "source_video": None,
         "video_name": None,
@@ -1478,9 +1477,9 @@ if page == "Campaign & Auto-Clipper":
                 key="hook_mode_choice",
             )
         with cap_col:
-            st.checkbox(
+            burn_captions_enabled = st.checkbox(
                 "Burn bottom subtitles + export .SRT",
-                key="burn_onscreen_captions",
+                key="burn_onscreen_captions_widget",
             )
 
         st.selectbox(
@@ -1499,8 +1498,6 @@ if page == "Campaign & Auto-Clipper":
                         st.session_state.brief_analysis = analysis
                         st.session_state.auto_clip_minutes = float(st.session_state.desired_clip_minutes)
 
-                        if analysis.get("requires_onscreen_captions"):
-                            st.session_state.burn_onscreen_captions = True
                         if analysis.get("requires_8s_hook"):
                             st.session_state.hook_banner_scope = "8-Second Top Banner (0–8s)"
                         elif analysis.get("requires_video_hook"):
@@ -1602,11 +1599,12 @@ if page == "Campaign & Auto-Clipper":
     # Step 3: True Auto-Clipping (Different spots across video, exact desired minutes)
     if st.session_state.go_ahead_clips and st.session_state.video_info and ffmpeg_ready():
         st.divider()
-        st.subheader(f"Step 3 · Auto-Clipper (Different Spots · Exact Desired Minutes)")
+        st.subheader("Step 3 · Auto-Clipper (Different Spots · Exact Desired Minutes)")
         vi = st.session_state.video_info
         dur = max(1.0, float(vi["duration"]))
+        use_subs = bool(st.session_state.get("burn_onscreen_captions_widget", True))
 
-        if st.session_state.burn_onscreen_captions and not st.session_state.transcript and not get_openai_client():
+        if use_subs and not st.session_state.transcript and not get_openai_client():
             st.warning("No transcript available because `OPENAI_API_KEY` is not set—bottom subtitles will use transcript text only if available rather than live word-by-word speech.")
 
         ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([1.1, 1.0, 1.2, 1.0])
@@ -1686,11 +1684,8 @@ if page == "Campaign & Auto-Clipper":
         with q_col4:
             cap_size = st.slider("Bottom subtitle size", 22, 44, int(st.session_state.onscreen_caption_size), key="wf_cap_size")
 
-        asp_choices = ["9:16 Vertical", "16:9 Landscape", "1:1 Square", "4:5 Portrait", "Keep original"]
         default_asp = default_aspect_for_platform(st.session_state.target_platform_choice)
-        default_asp_idx = asp_choices.index(default_asp) if default_asp in asp_choices else 0
 
-        # Show preview of distinct auto-picked windows of exact desired_minutes
         max_start_limit = max(0.0, dur - 0.5)
         auto_windows_to_render: list[tuple[int, str, float, float, str, str, dict]] = []
         for idx, cand in enumerate(cands):
@@ -1710,7 +1705,7 @@ if page == "Campaign & Auto-Clipper":
 
         if st.button("⚡ Run Auto-Clipper (Render All Distinct Spots Now)", type="primary", use_container_width=True, key="wf_extract_clips_btn"):
             try:
-                if st.session_state.burn_onscreen_captions and not st.session_state.transcript and get_openai_client():
+                if use_subs and not st.session_state.transcript and get_openai_client():
                     try:
                         with st.spinner("Transcribing speech for bottom subtitles & SRT..."):
                             st.session_state.transcript = transcribe_video(st.session_state.source_video)
@@ -1731,7 +1726,7 @@ if page == "Campaign & Auto-Clipper":
 
                     wrap_chars = 26 if asp_v in {"9:16 Vertical", "4:5 Portrait", "1:1 Square"} else 38
                     cues = []
-                    if st.session_state.burn_onscreen_captions:
+                    if use_subs:
                         cues = build_caption_cues(
                             transcript=st.session_state.transcript,
                             start=s_v,
@@ -1797,7 +1792,6 @@ if page == "Campaign & Auto-Clipper":
                     rendered_now.append(rec)
 
                 if rendered_now:
-                    # Queue fresh non-overlapping candidates for the next auto-clip click
                     st.session_state.auto_candidates = build_auto_clip_candidates(
                         brief=st.session_state.brief,
                         transcript=st.session_state.transcript,
@@ -1986,7 +1980,7 @@ if st.session_state.clips:
                 short_zip_items.append((f"clip_{i+1}_{safe_name(cl['name'])}.srt", cl["srt_path"]))
         if short_zip_items:
             st.download_button(
-                f"📦 Download All Clips & SRTs (.ZIP)",
+                "📦 Download All Clips & SRTs (.ZIP)",
                 build_zip_bytes(short_zip_items),
                 file_name=f"{safe_name(st.session_state.project_name)}_clips_srt.zip",
                 mime="application/zip",
