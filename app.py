@@ -6,6 +6,7 @@ import io
 import ipaddress
 import json
 import os
+import random
 import re
 import shutil
 import socket
@@ -215,6 +216,81 @@ def render_fast_voice_reader(text: str, label: str = "🔊 Fast Readout (Zero Da
         height=46,
     )
 
+# ----------------------------- NON-REPEATING WINDOW PICKER --------------
+def overlaps_used(start: float, end: float, used_windows: list[list[float]], min_gap: float = 2.0) -> bool:
+    for u_start, u_end in used_windows:
+        if start < (u_end + min_gap) and end > (u_start - min_gap):
+            return True
+    return False
+
+def pick_fresh_windows(
+    duration: float,
+    clip_seconds: float,
+    count: int,
+    used_windows: list[list[float]],
+    prefer_8s_hook: bool = False,
+    transcript: dict | None = None,
+) -> list[tuple[float, float, str]]:
+    """Pick 1-2 windows of desired length without repeating previously used ranges when possible."""
+    if duration <= 0:
+        return []
+    count = max(1, min(2, int(count)))
+    target_len = 8.0 if prefer_8s_hook else max(2.0, min(duration, float(clip_seconds)))
+    target_len = min(duration, target_len)
+
+    max_start = max(0.0, duration - target_len)
+    # Build varied candidate start anchors across the video (not just 0.0s)
+    if max_start <= 0.0:
+        anchors = [0.0]
+    else:
+        fractions = [0.12, 0.34, 0.58, 0.78, 0.22, 0.68, 0.0, 0.90]
+        random.shuffle(fractions)
+        anchors = [round(max(0.0, min(max_start, f * max_start)), 1) for f in fractions]
+        # Add jittered points so repeated runs keep finding fresh spots
+        for _ in range(8):
+            anchors.append(round(random.uniform(0.0, max_start), 1))
+
+    segs = (transcript or {}).get("segments") or []
+    picked: list[tuple[float, float, str]] = []
+
+    def spoken_at(s_sec: float, e_sec: float) -> str:
+        txt = " ".join(
+            str(sg.get("text", "")).strip()
+            for sg in segs
+            if float(sg.get("end", 0)) >= s_sec and float(sg.get("start", 0)) <= e_sec
+        ).strip()
+        return txt
+
+    # Pass 1: find windows that do not overlap previously used windows or each other
+    combined_used = list(used_windows)
+    for anc in anchors:
+        if len(picked) >= count:
+            break
+        s_val = round(max(0.0, min(max_start, anc)), 1)
+        e_val = round(min(duration, s_val + target_len), 1)
+        if e_val <= s_val:
+            continue
+        if not overlaps_used(s_val, e_val, combined_used, min_gap=2.0):
+            sp = spoken_at(s_val, e_val)
+            picked.append((s_val, e_val, sp))
+            combined_used.append([s_val, e_val])
+
+    # Pass 2: if video is short and all windows overlapped, still return distinct windows if possible
+    if len(picked) < count:
+        for anc in anchors:
+            if len(picked) >= count:
+                break
+            s_val = round(max(0.0, min(max_start, anc)), 1)
+            e_val = round(min(duration, s_val + target_len), 1)
+            if e_val <= s_val:
+                continue
+            if any(abs(s_val - ps) < 1.5 and abs(e_val - pe) < 1.5 for ps, pe, _ in picked):
+                continue
+            sp = spoken_at(s_val, e_val)
+            picked.append((s_val, e_val, sp))
+
+    return picked[:count]
+
 # ----------------------------- CAMPAIGN & CLIP INTELLIGENCE -------------
 def heuristic_campaign_analysis(brief: str, project_name: str) -> dict:
     low = brief.lower()
@@ -253,7 +329,7 @@ def heuristic_campaign_analysis(brief: str, project_name: str) -> dict:
             f"On-screen captions: {'Required' if wants_onscreen_captions else 'Optional'}. "
             f"Hook rule: {'8-second hook' if wants_8s_hook else ('Video hook' if wants_video_hook else 'Standard opening')}."
         ),
-        "deliverables": ["1 to 2 high-impact clips tailored to target platform"],
+        "deliverables": ["1 to 2 clips of custom length tailored to target platform"],
         "platforms": platforms,
         "requires_onscreen_captions": wants_onscreen_captions,
         "requires_8s_hook": wants_8s_hook,
@@ -341,7 +417,7 @@ def evaluate_video_against_campaign(analysis: dict, video_info: dict, transcript
             else:
                 gaps.append(f"Verify spoken/visual coverage for requirement: {req}")
     else:
-        gaps.append("No speech transcript yet—you can still enter custom hook/caption text directly.")
+        gaps.append("No speech transcript yet—you can still pick fresh video segments of your chosen length and add custom hook/caption text.")
 
     return {
         "ready": True,
@@ -415,116 +491,72 @@ def make_contact_sheet(video_path: str, duration: float, max_frames: int = 12) -
         p.unlink(missing_ok=True)
     return out
 
-def heuristic_highlights(
-    brief: str,
-    transcript: dict | None,
-    duration: float,
-    target_platform: str,
-    clip_count: int = 2,
-    hook_mode: str = "Auto (8s if requested by campaign)",
-) -> list[dict]:
-    count = max(1, min(2, int(clip_count)))
-    if duration <= 0:
-        return []
-
-    use_8s = ("8s" in hook_mode) or ("8s hook" in brief.lower() or "8-second hook" in brief.lower())
-    if use_8s:
-        first_len = min(duration, 8.0)
-    else:
-        base_len = 25.0 if ("Shorts" in target_platform or "Instagram" in target_platform or "TikTok" in target_platform) else 45.0
-        first_len = min(duration, max(8.0, base_len))
-
-    windows = [(0.0, first_len)]
-    if count == 2 and duration > first_len + 5.0:
-        second_len = min(duration - first_len, 8.0 if use_8s else max(12.0, first_len))
-        second_start = max(first_len, min(duration - second_len, duration * 0.45))
-        second_end = min(duration, second_start + second_len)
-        if second_end > second_start + 3.0:
-            windows.append((second_start, second_end))
-
-    segs = (transcript or {}).get("segments") or []
-    out = []
-    for idx, (s_sec, e_sec) in enumerate(windows):
-        spoken_slice = " ".join(
-            str(sg.get("text", "")).strip()
-            for sg in segs
-            if float(sg.get("end", 0)) >= s_sec and float(sg.get("start", 0)) <= e_sec
-        ).strip()
-        label_prefix = "8s Hook Clip" if use_8s else f"{target_platform} Hook Clip"
-        out.append({
-            "title": f"{label_prefix} {idx + 1}",
-            "start": round(s_sec, 1),
-            "end": round(e_sec, 1),
-            "target_platform": target_platform,
-            "reason": spoken_slice[:160] if spoken_slice else f"{e_sec - s_sec:.1f}s hook-focused clip for {target_platform}.",
-            "campaign_match": "Aligned to campaign hook & platform pacing",
-            "hook": spoken_slice[:85] if spoken_slice else "Watch this key moment right now!",
-            "risk": "",
-            "confidence": "medium",
-        })
-    return out
-
-def ai_find_highlights(
+def build_non_repeating_candidates(
     brief: str,
     transcript: dict | None,
     contact_sheet: Path | None,
     duration: float,
-    target_platform: str = "YouTube / Instagram",
-    clip_count: int = 2,
+    target_platform: str,
+    clip_count: int,
+    desired_minutes: float,
+    used_windows: list[list[float]],
     hook_mode: str = "Auto (8s if requested by campaign)",
 ) -> list[dict]:
     count = max(1, min(2, int(clip_count)))
+    prefer_8s = ("8s" in hook_mode) or ("8s hook" in brief.lower() or "8-second hook" in brief.lower())
+    clip_seconds = 8.0 if prefer_8s else max(3.0, float(desired_minutes) * 60.0)
+
+    fresh_slots = pick_fresh_windows(
+        duration=duration,
+        clip_seconds=clip_seconds,
+        count=count,
+        used_windows=used_windows,
+        prefer_8s_hook=prefer_8s,
+        transcript=transcript,
+    )
+
     client = get_openai_client()
-    if not client or contact_sheet is None:
-        return heuristic_highlights(brief, transcript, duration, target_platform, clip_count=count, hook_mode=hook_mode)
-
-    segments = (transcript or {}).get("segments", []) or []
-    transcript_lines = [
-        f"[{float(s.get('start',0)):.1f}-{float(s.get('end',0)):.1f}] {s.get('text','')}"
-        for s in segments
-    ]
-    transcript_text = "\n".join(transcript_lines)[:24000] or (transcript or {}).get("text", "")[:24000]
-    image_data = base64.b64encode(contact_sheet.read_bytes()).decode("utf-8")
-
-    hook_rule = (
-        "CRITICAL: Campaign requires an 8-SECOND HOOK! Make each clip ~8.0 seconds long (e.g. 8s window) starting at the strongest hook moment."
-        if ("8s" in hook_mode or "8s hook" in brief.lower() or "8-second hook" in brief.lower())
-        else "Focus on strong opening video hooks and high-retention moments."
-    )
-
-    prompt = f"""You are a sharp short-form and social video editor.
-Target platform: {target_platform}. Recommend EXACTLY {count} clip(s) (1 or 2 clips) that best satisfy the campaign brief.
-{hook_rule}
-Return ONLY JSON: {{"highlights":[{{"title":"short title","start":0.0,"end":8.0,"target_platform":"{target_platform}","reason":"why it fits","campaign_match":"which requirement it satisfies","hook":"short punchy hook banner text for top of screen","risk":"any compliance concern or empty string","confidence":"high|medium|low"}}]}}
-Rules: times must be within 0 and {duration:.1f}; end > start; do not fabricate scenes or dialogue; rank best first.
-CAMPAIGN BRIEF:
-{brief[:14000]}
-TIMESTAMPED TRANSCRIPT:
-{transcript_text}
-"""
-    response = client.chat.completions.create(
-        model="gpt-4o-mini", temperature=0.2,
-        response_format={"type": "json_object"},
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + image_data}},
-            ]
-        }]
-    )
-    data = parse_json_response(response.choices[0].message.content or "{}")
-    highlights = data.get("highlights", [])
-    cleaned = []
-    for item in highlights:
+    ai_meta_list: list[dict] = []
+    if client and contact_sheet is not None:
         try:
-            start = max(0.0, float(item["start"]))
-            end = min(float(duration), float(item["end"]))
-            if end > start and start < duration:
-                cleaned.append({**item, "start": round(start, 1), "end": round(end, 1), "target_platform": item.get("target_platform") or target_platform})
+            segs = (transcript or {}).get("segments", []) or []
+            t_lines = [f"[{float(s.get('start',0)):.1f}-{float(s.get('end',0)):.1f}] {s.get('text','')}" for s in segs]
+            t_text = "\n".join(t_lines)[:18000] or (transcript or {}).get("text", "")[:18000]
+            img_b64 = base64.b64encode(contact_sheet.read_bytes()).decode("utf-8")
+            prompt = f"""Given target platform {target_platform}, clip duration ~{clip_seconds:.1f}s ({desired_minutes:.2f} min), and previously used ranges {used_windows},
+write short titles and hooks for {count} fresh clip(s). Return ONLY JSON:
+{{"items":[{{"title":"short title","reason":"why it fits","campaign_match":"brief match","hook":"short hook banner text","confidence":"high|medium|low"}}]}}
+BRIEF: {brief[:8000]}
+TRANSCRIPT: {t_text}
+"""
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini", temperature=0.35,
+                response_format={"type": "json_object"},
+                messages=[{"role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + img_b64}}
+                ]}]
+            )
+            ai_meta_list = parse_json_response(resp.choices[0].message.content or "{}").get("items", []) or []
         except Exception:
-            continue
-    return cleaned[:count] if cleaned else heuristic_highlights(brief, transcript, duration, target_platform, clip_count=count, hook_mode=hook_mode)
+            ai_meta_list = []
+
+    results = []
+    for idx, (s_sec, e_sec, spoken_txt) in enumerate(fresh_slots):
+        ai_m = ai_meta_list[idx] if idx < len(ai_meta_list) else {}
+        dur_actual = max(0.5, e_sec - s_sec)
+        results.append({
+            "title": ai_m.get("title") or f"{target_platform} Pick #{len(used_windows) + idx + 1} ({dur_actual/60:.2f}m)",
+            "start": s_sec,
+            "end": e_sec,
+            "target_platform": target_platform,
+            "reason": spoken_txt[:150] if spoken_txt else (ai_m.get("reason") or f"Fresh {dur_actual:.1f}s segment starting at {s_sec:.1f}s (no prior overlap)."),
+            "campaign_match": ai_m.get("campaign_match") or "Non-repeating segment matched to requested length",
+            "hook": ai_m.get("hook") or (spoken_txt[:80] if spoken_txt else "Don't miss this part!"),
+            "risk": "",
+            "confidence": ai_m.get("confidence") or "high",
+        })
+    return results
 
 def generate_social_copy(
     platform: str,
@@ -588,7 +620,6 @@ def build_lower_third_srt(
     end: float,
     fallback_caption_text: str = "",
 ) -> str:
-    """Build SRT subtitles strictly for lower-third visible caption reading (not the top hook banner)."""
     def stamp(sec):
         ms = int(round(max(0.0, sec) * 1000))
         h, rem = divmod(ms, 3600000)
@@ -631,7 +662,6 @@ def resolve_sharp_dimensions(
     src_w: int,
     src_h: int,
 ) -> tuple[str | None, str | None, int, int]:
-    """Return (crop_filter, target_WxH_str, out_w, out_h) ensuring output is sharp (source-or-better)."""
     aspect_crops = {
         "9:16 Vertical": "crop=ih*9/16:ih",
         "16:9 Landscape": "crop=iw:iw*9/16",
@@ -722,7 +752,6 @@ def render_video(
     graph = [f"[0:v]{vf}[v0]"]
     current = "v0"
 
-    # Dedicated TOP hook banner (separate from lower-third captions)
     clean_hook = escape_drawtext(hook_banner_text)
     if clean_hook:
         hook_font_px = max(22, int(out_h * 0.032))
@@ -745,7 +774,6 @@ def render_video(
         graph += ["[1:v]scale=iw*0.16:-1:flags=lanczos[logo]", f"[{current}][logo]overlay=W-w-24:24:format=auto[vlogo]"]
         current = "vlogo"
 
-    # Dedicated LOWER-THIRD visible captions
     if srt:
         srt_path = Path(srt).resolve().as_posix().replace(":", "\\:")
         style = (
@@ -781,6 +809,8 @@ def init_state():
         "go_ahead_clips": False,
         "target_platform_choice": "YouTube Shorts / Reels",
         "desired_clip_count": 2,
+        "desired_clip_minutes": 0.50,
+        "used_clip_windows": [],
         "hook_mode_choice": "Auto (8s if requested by campaign)",
         "hook_banner_scope": "8-Second Top Banner (0–8s)",
         "burn_onscreen_captions": True,
@@ -808,12 +838,12 @@ init_state()
 
 # ----------------------------- HEADER & NAV -----------------------------
 st.markdown(f"""<div class="hero">
-<div style="color:#a5b4fc;font-weight:750;font-size:.76rem;letter-spacing:.13em">CAMPAIGN INTELLIGENCE · TOP HOOK BANNER · LOWER-THIRD CAPTIONS · SHARP RENDER</div>
+<div style="color:#a5b4fc;font-weight:750;font-size:.76rem;letter-spacing:.13em">CAMPAIGN INTELLIGENCE · CUSTOM MINUTE LENGTHS · NON-REPEATING PICKS · TOP HOOK & LOWER-THIRD CAPTIONS</div>
 <h1>🎬 {APP_NAME}</h1>
-<p class="muted">Upload video + campaign rules $\rightarrow$ campaign feedback & go-ahead $\rightarrow$ 1–2 sharp clips (top hook banner + lower-third captions) $\rightarrow$ caption/description + fast readout.</p>
-<span class="pill">Top hook banner (8s or full clip)</span>
-<span class="pill">Lower-third captions</span>
-<span class="pill">Source-or-better sharpness</span>
+<p class="muted">Pick desired clip length in minutes + varied start points with zero repeat picks across runs $\rightarrow$ top hook banner + lower-third captions $\rightarrow$ caption/description + fast readout.</p>
+<span class="pill">Length in minutes</span>
+<span class="pill">No repeat picks</span>
+<span class="pill">Top hook + lower-third captions</span>
 <span class="pill">Fast voice readout</span>
 </div>""", unsafe_allow_html=True)
 
@@ -830,6 +860,7 @@ with st.sidebar:
     ], label_visibility="collapsed")
     st.divider()
     st.metric("Go-Ahead Status", "Approved" if st.session_state.go_ahead_clips else "Pending Review")
+    st.metric("Used Clip Ranges", len(st.session_state.used_clip_windows))
     st.metric("Generated Clips", len(st.session_state.clips))
 
 # ----------------------------- PAGE 1: CAMPAIGN & CLIP WORKFLOW ---------
@@ -852,6 +883,7 @@ if page == "Campaign & Clip Workflow":
                     st.session_state.video_info = vinfo
                     st.session_state.transcript = None
                     st.session_state.highlights = []
+                    st.session_state.used_clip_windows = []
                     st.session_state.campaign_feedback = None
                     st.session_state.go_ahead_clips = False
                 st.success(f"Loaded {video_up.name} ({fmt_time(vinfo['duration'])})")
@@ -887,19 +919,27 @@ if page == "Campaign & Clip Workflow":
         st.text_area(
             "Paste campaign requirements",
             key="brief",
-            height=180,
+            height=175,
             placeholder="Example: Post on YouTube and Instagram. Include an 8-second hook, visible caption reading on screen, and CTA to check the link."
         )
 
-        p_col, c_col = st.columns(2)
+        p_col, c_col, min_col = st.columns(3)
         with p_col:
             st.selectbox(
-                "Target platform for clips & copy",
+                "Target platform",
                 ["YouTube Shorts / Reels", "YouTube Standard", "Instagram Feed / Reels", "TikTok"],
                 key="target_platform_choice"
             )
         with c_col:
-            st.radio("Number of clips to extract", [1, 2], horizontal=True, key="desired_clip_count")
+            st.radio("Clips count", [1, 2], horizontal=True, key="desired_clip_count")
+        with min_col:
+            st.number_input(
+                "Clip length (minutes)",
+                min_value=0.10,
+                max_value=15.0,
+                step=0.25,
+                key="desired_clip_minutes"
+            )
 
         h_col, cap_col = st.columns(2)
         with h_col:
@@ -944,13 +984,15 @@ if page == "Campaign & Clip Workflow":
                             except Exception:
                                 tr = None
                             sheet = make_contact_sheet(st.session_state.source_video, st.session_state.video_info["duration"], max_frames=9)
-                            st.session_state.highlights = ai_find_highlights(
-                                json.dumps(analysis, ensure_ascii=False),
-                                tr,
-                                sheet,
-                                st.session_state.video_info["duration"],
+                            st.session_state.highlights = build_non_repeating_candidates(
+                                brief=json.dumps(analysis, ensure_ascii=False),
+                                transcript=tr,
+                                contact_sheet=sheet,
+                                duration=st.session_state.video_info["duration"],
                                 target_platform=st.session_state.target_platform_choice,
                                 clip_count=st.session_state.desired_clip_count,
+                                desired_minutes=st.session_state.desired_clip_minutes,
+                                used_windows=st.session_state.used_clip_windows,
                                 hook_mode=st.session_state.hook_mode_choice,
                             )
                             st.session_state.campaign_feedback = evaluate_video_against_campaign(
@@ -1004,13 +1046,16 @@ if page == "Campaign & Clip Workflow":
                 use_container_width=True,
                 key="wf_go_ahead_btn"
             ):
-                if not st.session_state.highlights and st.session_state.video_info:
-                    st.session_state.highlights = heuristic_highlights(
-                        st.session_state.brief,
-                        st.session_state.transcript,
-                        st.session_state.video_info["duration"],
-                        st.session_state.target_platform_choice,
+                if st.session_state.video_info:
+                    st.session_state.highlights = build_non_repeating_candidates(
+                        brief=st.session_state.brief,
+                        transcript=st.session_state.transcript,
+                        contact_sheet=None,
+                        duration=st.session_state.video_info["duration"],
+                        target_platform=st.session_state.target_platform_choice,
                         clip_count=st.session_state.desired_clip_count,
+                        desired_minutes=st.session_state.desired_clip_minutes,
+                        used_windows=st.session_state.used_clip_windows,
                         hook_mode=st.session_state.hook_mode_choice,
                     )
                 st.session_state.go_ahead_clips = True
@@ -1018,20 +1063,69 @@ if page == "Campaign & Clip Workflow":
 
         with go_col2:
             if st.session_state.go_ahead_clips:
-                st.success("Go-ahead granted! Top hook banners and lower-third captions stay cleanly separated on screen.")
+                st.success(f"Go-ahead granted! Target clip length: {st.session_state.desired_clip_minutes:.2f} min ({st.session_state.desired_clip_minutes*60:.0f}s).")
 
-    # Step 3: 1-2 Clip Extraction
+    # Step 3: 1-2 Non-Repeating Clip Extraction
     if st.session_state.go_ahead_clips and st.session_state.video_info and ffmpeg_ready():
         st.divider()
-        st.subheader(f"Step 3 · Extract 1–2 Sharp Clips ({st.session_state.target_platform_choice})")
+        st.subheader(f"Step 3 · Extract 1–2 Fresh Clips ({st.session_state.target_platform_choice})")
         vi = st.session_state.video_info
         dur = float(vi["duration"])
-        cands = st.session_state.highlights or heuristic_highlights(
-            st.session_state.brief,
-            st.session_state.transcript,
-            dur,
-            st.session_state.target_platform_choice,
+
+        ctrl1, ctrl2, ctrl3 = st.columns([1.2, 1.2, 1])
+        with ctrl1:
+            clip_min_live = st.number_input(
+                "Desired clip length (minutes)",
+                min_value=0.10,
+                max_value=15.0,
+                value=float(st.session_state.desired_clip_minutes),
+                step=0.25,
+                key="live_clip_minutes"
+            )
+        with ctrl2:
+            if st.button("🔄 Pick Fresh Non-Repeating Spots", use_container_width=True, key="pick_fresh_spots_btn"):
+                st.session_state.desired_clip_minutes = float(clip_min_live)
+                st.session_state.highlights = build_non_repeating_candidates(
+                    brief=st.session_state.brief,
+                    transcript=st.session_state.transcript,
+                    contact_sheet=None,
+                    duration=dur,
+                    target_platform=st.session_state.target_platform_choice,
+                    clip_count=st.session_state.desired_clip_count,
+                    desired_minutes=float(clip_min_live),
+                    used_windows=st.session_state.used_clip_windows,
+                    hook_mode=st.session_state.hook_mode_choice,
+                )
+                st.rerun()
+        with ctrl3:
+            if st.button("🧹 Reset Used Ranges", use_container_width=True, key="reset_used_ranges_btn"):
+                st.session_state.used_clip_windows = []
+                st.session_state.highlights = build_non_repeating_candidates(
+                    brief=st.session_state.brief,
+                    transcript=st.session_state.transcript,
+                    contact_sheet=None,
+                    duration=dur,
+                    target_platform=st.session_state.target_platform_choice,
+                    clip_count=st.session_state.desired_clip_count,
+                    desired_minutes=float(clip_min_live),
+                    used_windows=[],
+                    hook_mode=st.session_state.hook_mode_choice,
+                )
+                st.rerun()
+
+        if st.session_state.used_clip_windows:
+            used_str = ", ".join(f"{w[0]:.1f}s–{w[1]:.1f}s" for w in st.session_state.used_clip_windows)
+            st.caption(f"Already used ranges avoided automatically: {used_str}")
+
+        cands = st.session_state.highlights or build_non_repeating_candidates(
+            brief=st.session_state.brief,
+            transcript=st.session_state.transcript,
+            contact_sheet=None,
+            duration=dur,
+            target_platform=st.session_state.target_platform_choice,
             clip_count=st.session_state.desired_clip_count,
+            desired_minutes=float(clip_min_live),
+            used_windows=st.session_state.used_clip_windows,
             hook_mode=st.session_state.hook_mode_choice,
         )
         cands = cands[:int(st.session_state.desired_clip_count)]
@@ -1049,27 +1143,42 @@ if page == "Campaign & Clip Workflow":
             cap_size = st.slider("Lower-third caption size", 18, 40, int(st.session_state.onscreen_caption_size), key="wf_cap_size")
 
         chosen_windows = []
+        run_tag = len(st.session_state.used_clip_windows)
         for idx, cand in enumerate(cands):
             with st.container(border=True):
                 st.markdown(f"**Clip {idx + 1}: {cand.get('title', f'Highlight {idx+1}')}**")
                 st.caption(f"AI Reason: {cand.get('reason', '')}")
                 wc1, wc2, wc3 = st.columns([1, 1, 1.4])
                 with wc1:
-                    s_val = st.number_input(f"Start (sec) — Clip {idx+1}", 0.0, max(0.5, dur - 0.5), float(cand["start"]), step=0.5, key=f"c_start_{idx}")
+                    s_val = st.number_input(
+                        f"Start (sec) — Clip {idx+1}",
+                        0.0,
+                        max(0.5, dur - 0.5),
+                        float(cand["start"]),
+                        step=0.5,
+                        key=f"c_start_{run_tag}_{idx}"
+                    )
                 with wc2:
-                    default_end = min(dur, float(s_val) + 8.0) if "8-Second Hook" in st.session_state.hook_mode_choice else float(cand["end"])
-                    e_val = st.number_input(f"End (sec) — Clip {idx+1}", 0.5, max(0.5, dur), max(float(s_val) + 1.0, float(default_end)), step=0.5, key=f"c_end_{idx}")
+                    calc_end = min(dur, float(s_val) + float(clip_min_live) * 60.0)
+                    e_val = st.number_input(
+                        f"End (sec) — Clip {idx+1}",
+                        0.5,
+                        max(0.5, dur),
+                        max(float(s_val) + 1.0, float(calc_end)),
+                        step=0.5,
+                        key=f"c_end_{run_tag}_{idx}"
+                    )
                 with wc3:
                     asp_val = st.selectbox(
                         f"Aspect — Clip {idx+1}",
                         ["9:16 Vertical", "16:9 Landscape", "1:1 Square", "4:5 Portrait", "Keep original"],
                         index=0 if ("Shorts" in st.session_state.target_platform_choice or "Reels" in st.session_state.target_platform_choice or "TikTok" in st.session_state.target_platform_choice) else 1,
-                        key=f"c_asp_{idx}"
+                        key=f"c_asp_{run_tag}_{idx}"
                     )
                 hook_txt = st.text_input(
                     f"Top hook banner text — Clip {idx+1}",
                     value=str(cand.get("hook") or ""),
-                    key=f"c_hook_txt_{idx}"
+                    key=f"c_hook_txt_{run_tag}_{idx}"
                 )
                 chosen_windows.append((idx + 1, cand.get("title", f"Clip_{idx+1}"), float(s_val), float(e_val), asp_val, hook_txt, cand))
 
@@ -1110,6 +1219,7 @@ if page == "Campaign & Clip Workflow":
                         src_h=int(vi.get("height") or 1080),
                         caption_font_size=int(cap_size),
                     )
+                st.session_state.used_clip_windows.append([round(s_v, 1), round(e_v, 1)])
                 rec = {
                     "name": f"{title} ({st.session_state.target_platform_choice})",
                     "path": str(out_file),
@@ -1123,6 +1233,18 @@ if page == "Campaign & Clip Workflow":
                 rendered_now.append(rec)
 
             if rendered_now:
+                # Advance candidate picks automatically for the next round without repeating used ranges
+                st.session_state.highlights = build_non_repeating_candidates(
+                    brief=st.session_state.brief,
+                    transcript=st.session_state.transcript,
+                    contact_sheet=None,
+                    duration=dur,
+                    target_platform=st.session_state.target_platform_choice,
+                    clip_count=st.session_state.desired_clip_count,
+                    desired_minutes=float(clip_min_live),
+                    used_windows=st.session_state.used_clip_windows,
+                    hook_mode=st.session_state.hook_mode_choice,
+                )
                 copy_pack = generate_social_copy(
                     platform=st.session_state.target_platform_choice,
                     brief=st.session_state.brief,
@@ -1133,7 +1255,7 @@ if page == "Campaign & Clip Workflow":
                 )
                 st.session_state.social_caption = copy_pack["caption"]
                 st.session_state.social_description = copy_pack["description"]
-                st.success(f"Extracted {len(rendered_now)} sharp clip(s) and drafted social caption + description.")
+                st.success(f"Extracted {len(rendered_now)} sharp clip(s) and queued fresh non-repeating picks for your next run.")
 
     if st.session_state.clips:
         st.divider()
@@ -1169,7 +1291,7 @@ elif page == "Editor & Templates":
         a, b = st.columns(2)
         with a:
             start = st.number_input("Start (seconds)", 0.0, float(max(vi["duration"], 0.1)), 0.0, step=0.5)
-            end = st.number_input("End (seconds)", 0.1, float(max(vi["duration"], 0.1)), min(8.0, float(max(vi["duration"], 0.1))), step=0.5)
+            end = st.number_input("End (seconds)", 0.1, float(max(vi["duration"], 0.1)), min(30.0, float(max(vi["duration"], 0.1))), step=0.5)
             clip_name = st.text_input("Clip name", value=safe_name(Path(st.session_state.video_name or "clip").stem + "_edit"))
             hook_line = st.text_input("Top hook banner text", value="")
             hook_dur_opt = st.selectbox("Top hook duration", ["8s Banner", "Full Clip Banner"])
@@ -1207,6 +1329,7 @@ elif page == "Editor & Templates":
                         src_w=int(vi.get("width") or 1920),
                         src_h=int(vi.get("height") or 1080),
                     )
+                st.session_state.used_clip_windows.append([round(start, 1), round(end, 1)])
                 st.session_state.clips.append({
                     "name": clip_name, "path": str(out), "start": start,
                     "end": end, "aspect": aspect, "resolution": resolution
@@ -1234,7 +1357,7 @@ elif page == "Caption & Description Studio":
         "What do you want in the caption & description?",
         key="caption_instructions",
         height=95,
-        placeholder="Example: Highlight the 8s top hook, mention lower-third captions, include a clear CTA, and add campaign hashtags."
+        placeholder="Example: Highlight the clip takeaway, mention lower-third captions, include a clear CTA, and add campaign hashtags."
     )
 
     if st.button("✨ Generate / Update Caption & Description", type="primary", use_container_width=True, key="gen_copy_btn"):
@@ -1289,4 +1412,4 @@ elif page == "Brand Kit & Settings":
     if get_openai_client():
         st.success("OPENAI_API_KEY active — full AI campaign + video analysis & copy generation enabled.")
     else:
-        st.info("No OPENAI_API_KEY detected — smart local fallback mode is active for campaign triage, top hook banners, lower-third captions, 1–2 clip windows, and captions/descriptions.")
+        st.info("No OPENAI_API_KEY detected — smart local fallback mode is active for campaign triage, non-repeating picks, top hook banners, lower-third captions, and captions/descriptions.")
