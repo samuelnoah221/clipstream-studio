@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import gc
+import hashlib
 import html
 import io
 import json
@@ -23,6 +24,8 @@ APP_NAME = "ClipStream Studio"
 MAX_UPLOAD_MB = 2048
 WORK_DIR = Path(tempfile.gettempdir()) / "clipstream_studio"
 WORK_DIR.mkdir(parents=True, exist_ok=True)
+WORKSPACES_ROOT = WORK_DIR / "workspaces"
+WORKSPACES_ROOT.mkdir(parents=True, exist_ok=True)
 
 st.set_page_config(page_title=APP_NAME, page_icon="🎬", layout="wide")
 
@@ -32,13 +35,13 @@ st.markdown("""
 :root{color-scheme:dark}
 .stApp{background:#090c13;color:#f4f5fa}
 [data-testid="stHeader"]{background:rgba(9,12,19,.92)}
-.block-container{max-width:1550px;padding-top:1.2rem;padding-bottom:3rem}
+.block-container{max-width:1550px;padding-top:1.1rem;padding-bottom:3rem}
 [data-testid="stMetric"]{background:#151b29;border:1px solid #2b354b;padding:13px;border-radius:14px}
 [data-testid="stVerticalBlockBorderWrapper"]{background:#111827;border:1px solid #293449;border-radius:15px}
 .stButton>button,.stDownloadButton>button{border-radius:10px;font-weight:650;min-height:2.45rem}
 [data-testid="stSidebar"]{background:#0f1623}
-.hero{padding:24px;border:1px solid #34405a;border-radius:20px;background:linear-gradient(115deg,#211d3b,#141c2d 58%,#30203b);margin-bottom:1.1rem}
-.hero h1{margin:0;letter-spacing:-1.2px;font-size:2.2rem}
+.hero{padding:22px;border:1px solid #34405a;border-radius:20px;background:linear-gradient(115deg,#211d3b,#141c2d 58%,#30203b);margin-bottom:1.1rem}
+.hero h1{margin:0;letter-spacing:-1.2px;font-size:2.1rem}
 .muted{color:#a5b0c4;font-size:.9rem}
 .pill{display:inline-block;border:1px solid #46516d;color:#c7d2fe;border-radius:30px;padding:4px 10px;font-size:.78rem;margin:4px 5px 0 0}
 </style>
@@ -96,7 +99,7 @@ def minutes_to_seconds(minutes: float) -> float:
 
 def default_aspect_for_platform(platform: str) -> str:
     p = (platform or "").lower()
-    if any(k in p for k in ["shorts", "reels", "tiktok", "vertical"]):
+    if any(k in p for k in ["shorts", "reels", "tiktok", "vertical", "ig", "instagram"]):
         return "9:16 Vertical"
     return "16:9 Landscape"
 
@@ -141,6 +144,127 @@ def build_zip_bytes(items: list[tuple[str, str]]) -> bytes:
             used_names.add(clean_arc)
             zf.write(src, arcname=clean_arc)
     return buf.getvalue()
+
+
+# ----------------------------- WORKSPACE & IP / ACCOUNT SAVE ---------
+def detect_client_ip() -> str:
+    """Best-effort client IP from Streamlit headers or query/env fallback."""
+    try:
+        headers = getattr(st.context, "headers", None)
+        if headers:
+            for h_name in ("x-forwarded-for", "x-real-ip", "cf-connecting-ip", "remote-addr"):
+                raw_val = headers.get(h_name)
+                if raw_val:
+                    first_ip = str(raw_val).split(",")[0].strip()
+                    if first_ip:
+                        return first_ip
+    except Exception:
+        pass
+    return "local-demo-ip"
+
+
+def compute_workspace_key(account_handle: str, client_ip: str) -> str:
+    clean_acct = re.sub(r"[^a-zA-Z0-9@._-]+", "_", (account_handle or "").strip().lower()).strip("_")
+    clean_ip = re.sub(r"[^a-zA-Z0-9._:-]+", "_", (client_ip or "demo").strip())
+    seed = clean_acct if clean_acct else f"ip_{clean_ip}"
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:12]
+    prefix = safe_name(clean_acct or clean_ip)[:24]
+    return f"{prefix}_{digest}"
+
+
+def workspace_dir(ws_key: str) -> Path:
+    d = WORKSPACES_ROOT / safe_name(ws_key)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def save_workspace_state(ws_key: str | None = None) -> Path:
+    key = ws_key or st.session_state.get("workspace_key") or compute_workspace_key(
+        st.session_state.get("account_handle", ""),
+        st.session_state.get("detected_ip", "local-demo-ip"),
+    )
+    wdir = workspace_dir(key)
+    state_file = wdir / "workspace_state.json"
+
+    serializable_clips = []
+    for cl in st.session_state.get("clips") or []:
+        item = dict(cl)
+        serializable_clips.append(item)
+
+    payload = {
+        "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "workspace_key": key,
+        "account_handle": st.session_state.get("account_handle", ""),
+        "detected_ip": st.session_state.get("detected_ip", "local-demo-ip"),
+        "project_name": st.session_state.get("project_name", "My campaign"),
+        "brief": st.session_state.get("brief", ""),
+        "brief_analysis": st.session_state.get("brief_analysis"),
+        "campaign_feedback": st.session_state.get("campaign_feedback"),
+        "go_ahead_clips": bool(st.session_state.get("go_ahead_clips", False)),
+        "target_platform_choice": st.session_state.get("target_platform_choice", "YouTube + IG + Facebook"),
+        "auto_clip_count": int(st.session_state.get("auto_clip_count", 2)),
+        "desired_clip_minutes": float(st.session_state.get("desired_clip_minutes", 0.50)),
+        "auto_clip_minutes": float(st.session_state.get("auto_clip_minutes", 0.50)),
+        "used_clip_windows": st.session_state.get("used_clip_windows", []),
+        "hook_banner_scope": st.session_state.get("hook_banner_scope", "8-Second Top Banner (0–8s)"),
+        "burn_subtitles_chk_v2": bool(st.session_state.get("burn_subtitles_chk_v2", True)),
+        "onscreen_caption_size": int(st.session_state.get("onscreen_caption_size", 30)),
+        "source_video": st.session_state.get("source_video"),
+        "video_name": st.session_state.get("video_name"),
+        "video_info": st.session_state.get("video_info"),
+        "broken_parts": st.session_state.get("broken_parts", []),
+        "transcript": st.session_state.get("transcript"),
+        "auto_candidates": st.session_state.get("auto_candidates", []),
+        "clips": serializable_clips,
+        "logo_path": st.session_state.get("logo_path"),
+        "logo_name": st.session_state.get("logo_name"),
+        "brand_name": st.session_state.get("brand_name", ""),
+        "brand_colour": st.session_state.get("brand_colour", "#FFFFFF"),
+        "caption_instructions": st.session_state.get("caption_instructions", ""),
+    }
+    state_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return state_file
+
+
+def load_workspace_state(ws_key: str) -> bool:
+    state_file = workspace_dir(ws_key) / "workspace_state.json"
+    if not state_file.exists():
+        return False
+    try:
+        data = json.loads(state_file.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+
+    for field in [
+        "project_name", "brief", "brief_analysis", "campaign_feedback",
+        "go_ahead_clips", "target_platform_choice", "desired_clip_minutes",
+        "auto_clip_minutes", "used_clip_windows", "hook_banner_scope",
+        "burn_subtitles_chk_v2", "onscreen_caption_size", "video_name",
+        "video_info", "broken_parts", "transcript", "auto_candidates",
+        "logo_name", "brand_name", "brand_colour", "caption_instructions",
+    ]:
+        if field in data and data[field] is not None:
+            st.session_state[field] = data[field]
+
+    cnt = max(1, min(6, int(data.get("auto_clip_count", 2))))
+    st.session_state["auto_clip_count"] = cnt
+    st.session_state["auto_clip_count_top"] = cnt
+    st.session_state["auto_clip_count_step3"] = cnt
+
+    src_v = data.get("source_video")
+    st.session_state["source_video"] = src_v if (src_v and Path(src_v).exists()) else None
+
+    logo_p = data.get("logo_path")
+    st.session_state["logo_path"] = logo_p if (logo_p and Path(logo_p).exists()) else None
+
+    valid_clips = []
+    for cl in data.get("clips") or []:
+        p = cl.get("path")
+        if p and Path(p).exists():
+            valid_clips.append(cl)
+    st.session_state["clips"] = valid_clips
+    st.session_state["last_saved_at"] = data.get("saved_at", "Restored")
+    return True
 
 
 def attach_uploader_percentage_bar(max_mb: int = 2048):
@@ -234,8 +358,9 @@ def attach_uploader_percentage_bar(max_mb: int = 2048):
 
 
 def save_upload(uploaded, suffix: str | None = None, show_progress: bool = False) -> Path:
+    ws_dir = workspace_dir(st.session_state.get("workspace_key", "default"))
     ext = suffix or Path(uploaded.name).suffix.lower() or ".bin"
-    path = WORK_DIR / f"{next(tempfile._get_candidate_names())}_{int(time.time())}{ext}"
+    path = ws_dir / f"{next(tempfile._get_candidate_names())}_{int(time.time())}{ext}"
     total_bytes = max(1, int(getattr(uploaded, "size", 0) or 0))
     written = 0
     chunk_size = 16 * 1024 * 1024
@@ -294,6 +419,7 @@ def break_video_into_parts(source: str, duration: float, num_parts: int) -> list
     if not src_path.exists():
         raise RuntimeError("Source video file is missing.")
 
+    ws_dir = workspace_dir(st.session_state.get("workspace_key", "default"))
     n = 5 if int(num_parts) >= 5 else 3
     dur = max(1.0, float(duration))
     seg_len = dur / n
@@ -309,13 +435,13 @@ def break_video_into_parts(source: str, duration: float, num_parts: int) -> list
         if i > 0 and start_s >= dur - 0.25:
             continue
 
-        out_p = WORK_DIR / f"{stem}_part{i+1}of{n}_{next(tempfile._get_candidate_names())}{ext}"
+        out_p = ws_dir / f"{stem}_part{i+1}of{n}_{next(tempfile._get_candidate_names())}{ext}"
         cmd = [
             "ffmpeg", "-y", "-ss", str(start_s), "-i", str(src_path),
             "-t", str(chunk_dur), "-c", "copy", "-avoid_negative_ts", "make_zero",
             str(out_p),
         ]
-        res = run_cmd(cmd, timeout=600)
+        res = run_cmd(cmd, timeout=300)
 
         needs_fallback = (
             res.returncode != 0
@@ -334,10 +460,10 @@ def break_video_into_parts(source: str, duration: float, num_parts: int) -> list
             out_p.unlink(missing_ok=True)
             res = run_cmd([
                 "ffmpeg", "-y", "-ss", str(start_s), "-i", str(src_path),
-                "-t", str(chunk_dur), "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22",
+                "-t", str(chunk_dur), "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
                 "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
                 "-movflags", "+faststart", str(out_p),
-            ], timeout=1800)
+            ], timeout=600)
             if res.returncode or not out_p.exists():
                 raise RuntimeError(res.stderr[-1500:] or f"Failed creating Part {i+1}.")
 
@@ -525,20 +651,14 @@ def build_stitched_peak_moments(
     transcript: dict | None = None,
     seed_offset: int = 0,
 ) -> list[dict]:
-    """Picks multiple short peak sub-moments across the video whose durations sum to desired_minutes."""
+    """Picks 3-4 short peak sub-moments across the video whose durations sum to desired_minutes."""
     total_target = round(max(1.0, min(duration, minutes_to_seconds(desired_minutes))), 1)
     if duration <= 1.0 or total_target <= 0:
         end_s = round(max(0.5, duration), 1)
         return [{"start": 0.0, "end": end_s, "text": transcript_slice(transcript, 0.0, end_s)}]
 
-    if total_target <= 15.0:
-        num_parts = 3
-    elif total_target <= 45.0:
-        num_parts = 4
-    else:
-        num_parts = 5
-
-    raw_weights = [1.4, 0.85, 0.9, 1.35, 0.8][:num_parts]
+    num_parts = 3 if total_target <= 30.0 else 4
+    raw_weights = [1.3, 0.85, 0.95, 1.1][:num_parts]
     w_sum = sum(raw_weights)
     part_durs = [max(2.0, round((w / w_sum) * total_target, 1)) for w in raw_weights]
     diff = round(total_target - sum(part_durs), 1)
@@ -546,7 +666,7 @@ def build_stitched_peak_moments(
 
     max_start_for_each = [max(0.0, duration - d) for d in part_durs]
     rng = random.Random(int(time.time() * 100) + seed_offset * 37)
-    base_fracs = [0.12, 0.34, 0.58, 0.78, 0.91][:num_parts]
+    base_fracs = [0.12, 0.36, 0.62, 0.84][:num_parts]
     rng.shuffle(base_fracs)
 
     moments: list[dict] = []
@@ -564,7 +684,7 @@ def build_stitched_peak_moments(
             round(max(0.0, min(max_s, base_fracs[idx] * max_s)), 1),
             round(max(0.0, min(max_s, ((idx + 0.35 + (seed_offset * 0.19)) % 0.96) * max_s)), 1),
         ]
-        for _ in range(8):
+        for _ in range(6):
             candidate_starts.append(round(rng.uniform(0.0, max_s), 1))
 
         chosen_s = None
@@ -576,13 +696,6 @@ def build_stitched_peak_moments(
             if not already_in_clip and not overlaps_used(cs, ce, combined_used, min_gap=1.5):
                 chosen_s = cs
                 break
-
-        if chosen_s is None:
-            for cs in candidate_starts:
-                ce = round(min(duration, cs + p_dur), 1)
-                if ce > cs and not any(abs(cs - m["start"]) < 1.0 and abs(ce - m["end"]) < 1.0 for m in moments):
-                    chosen_s = cs
-                    break
 
         if chosen_s is None:
             chosen_s = round(max(0.0, min(max_s, (idx / max(1, num_parts)) * max_s)), 1)
@@ -659,15 +772,14 @@ def heuristic_campaign_analysis(brief: str, project_name: str) -> dict:
     low = brief.lower()
     platforms = []
     for p_label, keys in [
-        ("YouTube Shorts", ["youtube", "yt", "shorts"]),
-        ("Instagram Reels", ["instagram", "ig", "reels"]),
-        ("TikTok", ["tiktok"]),
+        ("YouTube", ["youtube", "yt", "shorts"]),
+        ("Instagram", ["instagram", "ig", "reels"]),
         ("Facebook", ["facebook", "fb"]),
     ]:
         if any(k in low for k in keys):
             platforms.append(p_label)
     if not platforms:
-        platforms = ["YouTube Shorts", "Instagram Reels"]
+        platforms = ["YouTube", "Instagram", "Facebook"]
 
     wants_onscreen_captions = any(
         k in low for k in ["caption reading", "on-screen caption", "on screen caption", "subtitles", "captions", "text on screen", "writing on screen"]
@@ -688,11 +800,11 @@ def heuristic_campaign_analysis(brief: str, project_name: str) -> dict:
     return {
         "campaign_name": project_name.strip() or "Campaign Brief",
         "plain_english_summary": (
-            f"Campaign targeting {', '.join(platforms)} based on {len(lines)} brief line(s). "
+            f"Campaign across {', '.join(platforms)} ({len(lines)} brief line(s)). "
             f"Full-frame 9:16 + multi-moment peak stitching ready. "
             f"Hook rule: {'8-second hook' if wants_8s_hook else ('Video hook' if wants_video_hook else 'Standard opening')}."
         ),
-        "deliverables": ["Auto-stitched peak moment clips or manual start-to-end clips"],
+        "deliverables": ["Multi-moment peak stitch clips for YouTube, Instagram & Facebook"],
         "platforms": platforms,
         "requires_onscreen_captions": wants_onscreen_captions,
         "requires_8s_hook": wants_8s_hook,
@@ -710,7 +822,7 @@ def heuristic_campaign_analysis(brief: str, project_name: str) -> dict:
         "pre_publish_checklist": [
             "Confirm full-frame 9:16 visibility (no cropped sides)",
             "Verify peak moments are stitched cleanly into one clip",
-            "Confirm caption & description include required campaign elements/tags",
+            "Check YouTube, Instagram, and Facebook captions/tags",
         ],
     }
 
@@ -763,7 +875,7 @@ def evaluate_video_against_campaign(analysis: dict, video_info: dict, transcript
     if dur > 0:
         strengths.append(f"Video duration is {dur:.1f}s ({fmt_time(dur)}) at {w}x{h} — full video stays visible in 9:16.")
     if analysis.get("caption_requirements") or analysis.get("hashtags"):
-        strengths.append("Campaign caption/tag requirements detected—each clip's caption generator will incorporate them.")
+        strengths.append("Campaign caption/tag requirements detected—YouTube, IG & Facebook copy will incorporate them.")
     if analysis.get("requires_8s_hook"):
         strengths.append("8-second hook banner rule detected.")
     elif analysis.get("requires_video_hook"):
@@ -797,10 +909,11 @@ def evaluate_video_against_campaign(analysis: dict, video_info: dict, transcript
 
 
 def extract_audio(video_path: str) -> Path:
-    audio_path = WORK_DIR / f"audio_{next(tempfile._get_candidate_names())}.mp3"
+    ws_dir = workspace_dir(st.session_state.get("workspace_key", "default"))
+    audio_path = ws_dir / f"audio_{next(tempfile._get_candidate_names())}.mp3"
     p = run_cmd([
         "ffmpeg", "-y", "-i", video_path, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "48k", str(audio_path),
-    ], timeout=900)
+    ], timeout=600)
     if p.returncode:
         raise RuntimeError(p.stderr[-1800:] or "Audio extraction failed.")
     if audio_path.stat().st_size > 24 * 1024 * 1024:
@@ -830,17 +943,18 @@ def transcribe_video(video_path: str) -> dict:
 
 def make_contact_sheet(video_path: str, duration: float, max_frames: int = 6) -> Path:
     from PIL import Image, ImageDraw
+    ws_dir = workspace_dir(st.session_state.get("workspace_key", "default"))
     count = max(1, min(max_frames, int(duration // 20) + 1))
     interval = max(1.0, duration / count)
     paths: list[tuple[float, Path]] = []
     try:
         for i in range(count):
             ts = min(max(0.0, duration - 0.1), i * interval)
-            frame = WORK_DIR / f"frame_{next(tempfile._get_candidate_names())}.jpg"
+            frame = ws_dir / f"frame_{next(tempfile._get_candidate_names())}.jpg"
             p = run_cmd([
                 "ffmpeg", "-y", "-ss", str(ts), "-i", video_path,
                 "-frames:v", "1", "-vf", "scale=240:-1", "-q:v", "6", str(frame),
-            ], timeout=90)
+            ], timeout=60)
             if p.returncode == 0 and frame.exists():
                 paths.append((ts, frame))
         if not paths:
@@ -863,7 +977,7 @@ def make_contact_sheet(video_path: str, duration: float, max_frames: int = 6) ->
             y = (i // cols) * (h + 24)
             sheet.paste(im, (x, y))
             draw.text((x + 6, y + h + 4), f"Frame {i+1}", fill=(220, 225, 240))
-        out = WORK_DIR / f"contact_{next(tempfile._get_candidate_names())}.jpg"
+        out = ws_dir / f"contact_{next(tempfile._get_candidate_names())}.jpg"
         sheet.save(out, quality=80)
         return out
     finally:
@@ -893,8 +1007,7 @@ def build_campaign_caption_context(analysis: dict | None, brief: str) -> str:
     return "\n".join(parts)
 
 
-def generate_social_copy(
-    platform: str,
+def generate_multi_platform_copy(
     brief: str,
     analysis: dict | None,
     clip_info: dict | None,
@@ -902,12 +1015,12 @@ def generate_social_copy(
     custom_instructions: str = "",
     clip_index: int = 0,
 ) -> dict:
+    """Generates tailored copy for YouTube, Instagram, and Facebook for a single clip."""
     client = get_openai_client()
     tags = (analysis or {}).get("hashtags") or []
     clean_tags = " ".join(t if t.startswith("#") else f"#{t.replace(' ', '')}" for t in tags[:6])
     if not clean_tags:
-        p_slug = re.sub(r"[^A-Za-z0-9]", "", platform) or "Shorts"
-        clean_tags = f"#Campaign #{p_slug} #Clip{clip_index + 1}"
+        clean_tags = f"#Shorts #Reels #Campaign #Clip{clip_index + 1}"
 
     clip_title = (clip_info or {}).get("title") or f"Clip #{clip_index + 1}"
     clip_hook = (clip_info or {}).get("hook") or ""
@@ -922,28 +1035,46 @@ def generate_social_copy(
     req_note = custom_instructions.strip()
     camp_ctx = build_campaign_caption_context(analysis, brief)
     camp_reqs_list = (analysis or {}).get("caption_requirements") or (analysis or {}).get("must_include") or []
-    camp_req_line = f"Campaign requirements: {'; '.join(str(x) for x in camp_reqs_list[:4])}." if camp_reqs_list else ""
+    camp_req_line = f"Campaign rules: {'; '.join(str(x) for x in camp_reqs_list[:4])}." if camp_reqs_list else ""
+    moment_line = transcript_text[:150].strip() if transcript_text.strip() else f"Peak highlights #{clip_index + 1}"
 
     if not client:
-        angle_lines = [
-            f"{clip_hook or clip_title}{window_label}",
-            f"Peak moments: {transcript_text[:140].strip()}" if transcript_text.strip() else f"Stitched peak moments #{clip_index + 1} for {platform}.",
-            camp_req_line,
-            f"Custom note: {req_note}" if req_note else "",
-            clean_tags,
-        ]
-        caption = "\n".join(x for x in angle_lines if x).strip()
-        description = (
-            f"{clip_title}{window_label} — {platform}\n\n"
-            f"{camp_ctx[:900]}\n\n"
-            f"Moment Notes: {transcript_text[:300].strip() if transcript_text.strip() else clip_hook}\n"
-            f"{'Extra Instructions: ' + req_note + chr(10) if req_note else ''}\n"
+        yt_title = f"{clip_hook or clip_title}{window_label} #Shorts"[:95]
+        yt_desc = (
+            f"{clip_hook or clip_title}{window_label}\n\n"
+            f"Highlights: {moment_line}\n"
+            f"{camp_req_line}\n"
+            f"{'Note: ' + req_note + chr(10) if req_note else ''}\n"
             f"{clean_tags}"
         ).strip()
-        return {"caption": caption, "description": description}
 
-    prompt = f"""You are writing a UNIQUE social media CAPTION and DESCRIPTION specifically for ONE video clip (Clip #{clip_index + 1}) on {platform}.
-Make sure this clip's caption is distinct from other clips in the same batch, reflects this clip's stitched moments/transcript/hook, and satisfies every relevant campaign brief caption/content requirement.
+        ig_caption = (
+            f"{clip_hook or clip_title}\n"
+            f"{moment_line}\n"
+            f"{camp_req_line}\n"
+            f"{'Note: ' + req_note + chr(10) if req_note else ''}\n"
+            f"{clean_tags}"
+        ).strip()
+
+        fb_post = (
+            f"{clip_hook or clip_title}{window_label} — {moment_line}\n\n"
+            f"{camp_req_line}\n"
+            f"{'Note: ' + req_note + chr(10) if req_note else ''}\n"
+            f"{clean_tags}"
+        ).strip()
+
+        return {
+            "youtube": f"{yt_title}\n\n{yt_desc}",
+            "instagram": ig_caption,
+            "facebook": fb_post,
+            "caption": ig_caption,
+            "description": yt_desc,
+        }
+
+    prompt = f"""You are writing tailored social copy for ONE video clip (Clip #{clip_index + 1}) across THREE platforms:
+1) YouTube (Shorts/Video title + description with searchable keywords & hashtags)
+2) Instagram (Reels/Feed caption with hook, engagement line, and hashtags)
+3) Facebook (Reels/Post caption with conversational framing & hashtags)
 
 THIS CLIP DETAILS:
 {json.dumps(clip_info or {}, ensure_ascii=False)}
@@ -957,21 +1088,31 @@ EXTRA USER INSTRUCTIONS:
 {req_note or "None"}
 
 Return ONLY valid JSON:
-{{"caption": "unique platform-ready caption for THIS clip incorporating campaign caption requirements and hashtags", "description": "clear full description tailored to THIS clip and campaign brief requirements"}}
+{{
+  "youtube": "YouTube title + description ready to paste",
+  "instagram": "Instagram caption ready to paste",
+  "facebook": "Facebook post/reel caption ready to paste"
+}}
 """
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
         temperature=0.55,
         response_format={"type": "json_object"},
         messages=[
-            {"role": "system", "content": "You write distinct, campaign-compliant social captions and descriptions for individual video clips."},
+            {"role": "system", "content": "You write distinct, platform-native social copy for YouTube, Instagram, and Facebook."},
             {"role": "user", "content": prompt},
         ],
     )
     parsed = parse_json_response(resp.choices[0].message.content or "{}")
+    yt = str(parsed.get("youtube", "")).strip()
+    ig = str(parsed.get("instagram", "")).strip()
+    fb = str(parsed.get("facebook", "")).strip()
     return {
-        "caption": str(parsed.get("caption", "")).strip(),
-        "description": str(parsed.get("description", "")).strip(),
+        "youtube": yt,
+        "instagram": ig,
+        "facebook": fb,
+        "caption": ig or yt,
+        "description": yt or fb,
     }
 
 
@@ -1057,7 +1198,7 @@ def build_caption_cues(
                 if wrapped and b_end > b_start + 0.12:
                     cues.append((b_start, b_end, wrapped))
 
-    return cues[:64]
+    return cues[:48]
 
 
 def build_stitched_caption_cues(
@@ -1086,7 +1227,7 @@ def build_stitched_caption_cues(
                 c_txt,
             ))
         timeline_offset = round(timeline_offset + m_dur, 2)
-    return stitched_cues[:64]
+    return stitched_cues[:48]
 
 
 def write_srt_file(cues: list[tuple[float, float, str]], clip_duration: float, srt_path: Path) -> Path:
@@ -1115,36 +1256,30 @@ def resolve_target_dimensions(
     resolution: str,
     src_w: int,
     src_h: int,
-) -> tuple[int, int, bool]:
-    """Returns (out_w, out_h, use_full_frame_fit_canvas)."""
-    src_w = max(2, int(src_w or 1920))
-    src_h = max(2, int(src_h or 1080))
+) -> tuple[int, int]:
+    src_w = max(2, int(src_w or 1280))
+    src_h = max(2, int(src_h or 720))
 
     if aspect == "9:16 Vertical":
         default_4k = (2160, 3840)
         default_1k = (1080, 1920)
         default_720 = (720, 1280)
-        fit_canvas = True
     elif aspect == "16:9 Landscape":
         default_4k = (3840, 2160)
         default_1k = (1920, 1080)
         default_720 = (1280, 720)
-        fit_canvas = (src_w / src_h) < (16 / 9)
     elif aspect == "1:1 Square":
         default_4k = (2160, 2160)
         default_1k = (1080, 1080)
         default_720 = (720, 720)
-        fit_canvas = True
     elif aspect == "4:5 Portrait":
         default_4k = (2160, 2700)
         default_1k = (1080, 1350)
         default_720 = (720, 900)
-        fit_canvas = True
     else:
         default_4k = (max(src_w, 3840), max(src_h, 2160))
         default_1k = (max(src_w, 1920), max(src_h, 1080))
         default_720 = (max(src_w, 1280), max(src_h, 720))
-        fit_canvas = False
 
     if resolution == "Match Source (Zero Resize Loss)" and aspect == "Keep original":
         tw, th = src_w, src_h
@@ -1155,31 +1290,22 @@ def resolve_target_dimensions(
     elif resolution == "720p HD":
         tw, th = default_720
     else:
-        tw, th = default_1k if aspect != "Keep original" else (src_w, src_h)
+        tw, th = default_720 if aspect != "Keep original" else (src_w, src_h)
 
     tw = max(2, int(tw) - (int(tw) % 2))
     th = max(2, int(th) - (int(th) % 2))
-    return tw, th, fit_canvas
+    return tw, th
 
 
 def build_frame_stage_filter(
     in_label: str,
     out_w: int,
     out_h: int,
-    fit_canvas: bool,
     out_label: str,
 ) -> str:
-    """Renders the full video frame cleanly without cutting off edges on 9:16."""
-    if fit_canvas:
-        return (
-            f"[{in_label}]split=2[bg_src][fg_src];"
-            f"[bg_src]scale={out_w}:{out_h}:force_original_aspect_ratio=increase,"
-            f"crop={out_w}:{out_h},boxblur=20:10,eq=brightness=-0.18,setsar=1[bg_ready];"
-            f"[fg_src]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease:flags=lanczos,setsar=1[fg_ready];"
-            f"[bg_ready][fg_ready]overlay=(W-w)/2:(H-h)/2:format=auto[{out_label}]"
-        )
+    """Renders the full video frame cleanly without side cropping and with fast CPU speed."""
     return (
-        f"[{in_label}]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease:flags=lanczos,"
+        f"[{in_label}]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease:flags=bilinear,"
         f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:color=#090c13,setsar=1[{out_label}]"
     )
 
@@ -1230,7 +1356,7 @@ def append_overlays_and_subs(
     has_logo = bool(logo and Path(logo).exists())
     if has_logo:
         graph += [
-            "[1:v]scale=iw*0.14:-1:flags=lanczos[logo]",
+            "[1:v]scale=iw*0.14:-1:flags=bilinear[logo]",
             f"[{current}][logo]overlay=W-w-20:20:format=auto[vlogo]",
         ]
         current = "vlogo"
@@ -1245,7 +1371,7 @@ def append_overlays_and_subs(
         line_step = int(sub_px * 1.32)
         sub_filters: list[str] = []
 
-        for c_start, c_end, c_text in cues[:64]:
+        for c_start, c_end, c_text in cues[:48]:
             c_a = max(0.0, min(clip_duration, float(c_start)))
             c_b = max(c_a + 0.15, min(clip_duration, float(c_end)))
             lines_list = [
@@ -1292,7 +1418,7 @@ def render_video(
     src_w: int = 1920,
     src_h: int = 1080,
     caption_font_size: int = 30,
-    encode_preset: str = "veryfast",
+    encode_preset: str = "ultrafast",
     normalize_audio: bool = False,
     clip_index: int = 0,
     srt_output_path: str | None = None,
@@ -1301,12 +1427,9 @@ def render_video(
         raise RuntimeError("Source or broken-part video file is missing. Load or break the video again.")
 
     clip_duration = max(0.5, round(float(end) - float(start), 1))
-    out_w, out_h, fit_canvas = resolve_target_dimensions(aspect, resolution, src_w, src_h)
+    out_w, out_h = resolve_target_dimensions(aspect, resolution, src_w, src_h)
 
-    graph: list[str] = []
-    stage_filter = build_frame_stage_filter("0:v", out_w, out_h, fit_canvas, "vstage")
-    graph.append(stage_filter)
-
+    graph: list[str] = [build_frame_stage_filter("0:v", out_w, out_h, "vstage")]
     temp_text_files: list[Path] = []
     try:
         current, saved_srt = append_overlays_and_subs(
@@ -1342,11 +1465,11 @@ def render_video(
             "-crf", str(int(crf)),
             "-pix_fmt", "yuv420p",
             "-c:a", "aac",
-            "-b:a", "160k",
+            "-b:a", "128k",
             "-movflags", "+faststart",
             output,
         ]
-        p = run_cmd(args, timeout=1800)
+        p = run_cmd(args, timeout=600)
         if p.returncode or not Path(output).exists():
             raise RuntimeError(p.stderr[-2500:] or "FFmpeg render failed.")
         return saved_srt
@@ -1370,7 +1493,7 @@ def render_stitched_clip(
     src_w: int = 1920,
     src_h: int = 1080,
     caption_font_size: int = 30,
-    encode_preset: str = "veryfast",
+    encode_preset: str = "ultrafast",
     srt_output_path: str | None = None,
 ) -> str | None:
     """Trims multiple peak moments from source and concatenates them into ONE single clip."""
@@ -1379,7 +1502,7 @@ def render_stitched_clip(
     if not moments:
         raise RuntimeError("No peak moments selected to stitch.")
 
-    out_w, out_h, fit_canvas = resolve_target_dimensions(aspect, resolution, src_w, src_h)
+    out_w, out_h = resolve_target_dimensions(aspect, resolution, src_w, src_h)
     graph: list[str] = []
     concat_inputs: list[str] = []
     total_dur = 0.0
@@ -1396,7 +1519,7 @@ def render_stitched_clip(
         graph.append(
             f"[0:v]trim=start={s_v:.2f}:end={e_v:.2f},setpts=PTS-STARTPTS[{v_trim}]"
         )
-        graph.append(build_frame_stage_filter(v_trim, out_w, out_h, fit_canvas, v_stage))
+        graph.append(build_frame_stage_filter(v_trim, out_w, out_h, v_stage))
         graph.append(
             f"[0:a]atrim=start={s_v:.2f}:end={e_v:.2f},asetpts=PTS-STARTPTS,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[{a_trim}]"
         )
@@ -1438,11 +1561,11 @@ def render_stitched_clip(
             "-crf", str(int(crf)),
             "-pix_fmt", "yuv420p",
             "-c:a", "aac",
-            "-b:a", "160k",
+            "-b:a", "128k",
             "-movflags", "+faststart",
             output,
         ]
-        p = run_cmd(args, timeout=1800)
+        p = run_cmd(args, timeout=600)
         if p.returncode or not Path(output).exists():
             raise RuntimeError(p.stderr[-2500:] or "FFmpeg stitched render failed.")
         return saved_srt
@@ -1460,12 +1583,18 @@ def sync_auto_clip_count(source_key: str):
 
 
 def init_state():
+    ip_now = detect_client_ip()
     defaults = {
+        "detected_ip": ip_now,
+        "account_handle": "",
+        "workspace_key": compute_workspace_key("", ip_now),
+        "workspace_loaded_once": False,
+        "last_saved_at": None,
         "brief": "",
         "brief_analysis": None,
         "campaign_feedback": None,
         "go_ahead_clips": False,
-        "target_platform_choice": "YouTube Shorts / Reels",
+        "target_platform_choice": "YouTube + IG + Facebook",
         "auto_clip_count": 2,
         "auto_clip_count_top": 2,
         "auto_clip_count_step3": 2,
@@ -1496,18 +1625,22 @@ def init_state():
         if k not in st.session_state:
             st.session_state[k] = v
 
+    if not st.session_state.get("workspace_loaded_once"):
+        st.session_state["workspace_loaded_once"] = True
+        load_workspace_state(st.session_state["workspace_key"])
+
 
 init_state()
 
 # ----------------------------- HEADER & NAV -----------------------------
 st.markdown(f"""<div class="hero">
-<div style="color:#a5b4fc;font-weight:750;font-size:.76rem;letter-spacing:.13em">FULL-FRAME 9:16 · MULTI-MOMENT PEAK STITCH · MANUAL START→END · SRT</div>
+<div style="color:#a5b4fc;font-weight:750;font-size:.76rem;letter-spacing:.13em">YOUTUBE + IG + FACEBOOK · FULL-FRAME 9:16 · PEAK STITCH · SAVED WORKSPACE</div>
 <h1>🎬 {APP_NAME}</h1>
-<p class="muted">Auto-pick peak sub-moments across the video and stitch them into one clip at your target minutes, with full-frame 9:16 visibility.</p>
+<p class="muted">Stitch peak moments into single clips for YouTube, Instagram, and Facebook—with full-frame 9:16 visibility and saved work per IP / sign-in demo.</p>
+<span class="pill">YouTube + IG + Facebook</span>
 <span class="pill">Full-frame 9:16</span>
 <span class="pill">Multi-moment peak stitch</span>
-<span class="pill">Manual start → end clipper</span>
-<span class="pill">Subtitles + .SRT</span>
+<span class="pill">Saved work (IP / Sign-in)</span>
 </div>""", unsafe_allow_html=True)
 
 if not ffmpeg_ready():
@@ -1520,6 +1653,39 @@ with st.sidebar:
         "Manual Clipper (Start → End)",
         "Brand Kit & Settings",
     ], label_visibility="collapsed", key="nav_page_radio")
+
+    st.divider()
+    st.markdown("**Saved Work (IP / Sign-In Demo)**")
+    st.caption(f"Detected IP: `{st.session_state.get('detected_ip', 'local-demo-ip')}`")
+    st.text_input(
+        "Google / Demo Sign-In ID (optional)",
+        key="account_handle",
+        placeholder="e.g. demo@gmail.com or client-a",
+    )
+    active_ws_key = compute_workspace_key(
+        st.session_state.get("account_handle", ""),
+        st.session_state.get("detected_ip", "local-demo-ip"),
+    )
+    st.session_state["workspace_key"] = active_ws_key
+    st.caption(f"Workspace ID: `{active_ws_key}`")
+
+    ws_b1, ws_b2 = st.columns(2)
+    with ws_b1:
+        if st.button("💾 Save Work", use_container_width=True, key="save_ws_btn"):
+            save_workspace_state(active_ws_key)
+            st.session_state["last_saved_at"] = time.strftime("%H:%M:%S")
+            st.success("Saved!")
+    with ws_b2:
+        if st.button("📂 Load Saved", use_container_width=True, key="load_ws_btn"):
+            if load_workspace_state(active_ws_key):
+                st.success("Loaded!")
+                st.rerun()
+            else:
+                st.info("No saved work for this ID/IP yet.")
+
+    if st.session_state.get("last_saved_at"):
+        st.caption(f"Last saved: `{st.session_state['last_saved_at']}`")
+
     st.divider()
     st.metric("Go-Ahead Status", "Approved" if st.session_state.go_ahead_clips else "Pending Review")
     st.metric("Broken Parts Ready", len(st.session_state.broken_parts))
@@ -1550,6 +1716,7 @@ if page == "Campaign & Auto-Clipper":
                     st.session_state.used_clip_windows = []
                     st.session_state.campaign_feedback = None
                     st.session_state.go_ahead_clips = False
+                    save_workspace_state()
                 st.success(f"Loaded {video_up.name} ({fmt_time(vinfo['duration'])})")
             except Exception as exc:
                 st.error(f"Video error: {exc}")
@@ -1575,6 +1742,7 @@ if page == "Campaign & Auto-Clipper":
                             float(vi["duration"]),
                             int(st.session_state.breaker_part_count),
                         )
+                        save_workspace_state()
                         st.success(f"Created {len(st.session_state.broken_parts)} parts! Clip any part in Manual Clipper anytime.")
                     except Exception as exc:
                         st.error(f"Break error: {exc}")
@@ -1617,19 +1785,20 @@ if page == "Campaign & Auto-Clipper":
                     st.warning(f"{bf.name}: {exc}")
             if extracted:
                 st.session_state.brief = (st.session_state.brief + "\n\n" + "\n\n".join(extracted)).strip()
+                save_workspace_state()
 
         st.text_area(
             "Paste campaign requirements",
             key="brief",
             height=175,
-            placeholder="Example: Post vertical YouTube Shorts & Instagram Reels. Stitch peak moments, show full frame in 9:16, include hooks & hashtags.",
+            placeholder="Example: Post across YouTube Shorts, Instagram Reels & Facebook. Stitch peak moments, keep full frame visible in 9:16, include hooks & hashtags.",
         )
 
         p_col, c_col, min_col = st.columns(3)
         with p_col:
             st.selectbox(
-                "Target platform",
-                ["YouTube Shorts / Reels", "Instagram Feed / Reels", "TikTok", "YouTube Standard"],
+                "Target channels",
+                ["YouTube + IG + Facebook", "YouTube Shorts / Video", "Instagram Reels / Feed", "Facebook Reels / Post"],
                 key="target_platform_choice",
             )
         with c_col:
@@ -1723,7 +1892,8 @@ if page == "Campaign & Auto-Clipper":
                                 "gaps": ["Upload a campaign video on the left to pick peak moments and stitch clips."],
                                 "warnings": analysis.get("prohibited_content", []) or [],
                             }
-                    st.success("Campaign feedback ready.")
+                    save_workspace_state()
+                    st.success("Campaign feedback ready and saved.")
                 except Exception as exc:
                     st.error(f"Analysis failed: {exc}")
 
@@ -1746,7 +1916,7 @@ if page == "Campaign & Auto-Clipper":
             for s_item in (fb.get("strengths") or [])[:4]:
                 st.caption(f"✓ {s_item}")
         with f2:
-            st.markdown("**Caption & Content Requirements**")
+            st.markdown("**YouTube · IG · Facebook Requirements**")
             cap_reqs = (an.get("caption_requirements") or []) + [f"Tag: {t}" for t in (an.get("hashtags") or [])[:5]]
             for c_item in cap_reqs[:5]:
                 st.markdown(f"- {c_item}")
@@ -1779,13 +1949,14 @@ if page == "Campaign & Auto-Clipper":
                         used_windows=st.session_state.used_clip_windows,
                     )
                 st.session_state.go_ahead_clips = True
+                save_workspace_state()
 
         with go_col2:
             if st.session_state.go_ahead_clips:
                 exact_s = minutes_to_seconds(float(st.session_state.auto_clip_minutes))
                 st.success(f"Go-ahead granted! Each stitched clip totals ~{float(st.session_state.auto_clip_minutes):.2f} min ({exact_s:.1f}s) across multiple peak moments.")
 
-    # Step 3: Auto-Clipper (Multi-moment peak stitch + full-frame 9:16)
+    # Step 3: Auto-Clipper (Multi-moment peak stitch + full-frame 9:16 + timeout-safe defaults)
     if st.session_state.go_ahead_clips and st.session_state.video_info and ffmpeg_ready():
         st.divider()
         st.subheader("Step 3 · Auto-Clipper (Peak Moment Stitch + Full-Frame 9:16)")
@@ -1828,6 +1999,7 @@ if page == "Campaign & Auto-Clipper":
                     desired_minutes=active_minutes,
                     used_windows=st.session_state.used_clip_windows,
                 )
+                save_workspace_state()
         with ctrl4:
             if st.button("🧹 Reset Used Spots", use_container_width=True, key="reset_used_ranges_btn"):
                 st.session_state.used_clip_windows = []
@@ -1841,10 +2013,11 @@ if page == "Campaign & Auto-Clipper":
                     desired_minutes=active_minutes,
                     used_windows=[],
                 )
+                save_workspace_state()
 
         default_asp = default_aspect_for_platform(st.session_state.target_platform_choice)
         st.caption(
-            f"Each clip stitches multiple peak sub-moments summing to **{active_minutes:.2f} min ({exact_target_sec:.1f}s)** · "
+            f"Each clip stitches peak sub-moments summing to **{active_minutes:.2f} min ({exact_target_sec:.1f}s)** · "
             f"Default aspect: **{default_asp}** (full video kept visible without side cropping)."
         )
 
@@ -1864,13 +2037,13 @@ if page == "Campaign & Auto-Clipper":
         with q_col1:
             sharp_res = st.selectbox(
                 "Output Resolution",
-                ["1080p Full HD", "720p HD", "4K Ultra Sharp", "Source or Better (Auto Sharp)", "Match Source (Zero Resize Loss)"],
+                ["720p HD", "1080p Full HD", "4K Ultra Sharp", "Match Source (Zero Resize Loss)"],
                 key="wf_sharp_res",
             )
         with q_col2:
-            sharp_crf = st.slider("Quality CRF (15 = crispest)", 15, 22, 18, key="wf_sharp_crf")
+            sharp_crf = st.slider("Quality CRF (18–26, 22 = fast & crisp)", 18, 26, 22, key="wf_sharp_crf")
         with q_col3:
-            encode_preset = st.selectbox("Encode speed/quality", ["veryfast", "fast", "ultrafast"], key="wf_encode_preset")
+            encode_preset = st.selectbox("Encode speed", ["ultrafast", "veryfast", "fast"], key="wf_encode_preset")
         with q_col4:
             cap_size = st.slider("Subtitle size", 22, 44, int(st.session_state.onscreen_caption_size), key="wf_cap_size")
 
@@ -1902,8 +2075,10 @@ if page == "Campaign & Auto-Clipper":
                     except Exception:
                         pass
 
+                ws_dir = workspace_dir(st.session_state.get("workspace_key", "default"))
                 rendered_now = []
                 banner_dur = 8.0 if st.session_state.hook_banner_scope.startswith("8-Second") else 9999.0
+                render_prog = st.progress(0, text=f"Rendering stitched clips: 0/{len(cands)}")
 
                 for idx, cand in enumerate(cands):
                     moments = cand.get("moments") or []
@@ -1911,8 +2086,8 @@ if page == "Campaign & Auto-Clipper":
                         continue
                     clip_num_global = len(st.session_state.clips) + 1
                     base_stem = f"{safe_name(cand.get('title', f'Peak_Stitch_{clip_num_global}'))}_stitch{clip_num_global}"
-                    out_file = WORK_DIR / f"{base_stem}.mp4"
-                    srt_file = WORK_DIR / f"{base_stem}.srt"
+                    out_file = ws_dir / f"{base_stem}.mp4"
+                    srt_file = ws_dir / f"{base_stem}.srt"
 
                     stitched_sec = round(sum(max(0.1, float(m["end"]) - float(m["start"])) for m in moments), 1)
                     all_spoken = " ".join(
@@ -1940,8 +2115,8 @@ if page == "Campaign & Auto-Clipper":
                             cues=cues if cues else None,
                             hook_banner_text=final_hook,
                             hook_banner_duration=banner_dur,
-                            src_w=int(vi.get("width") or 1920),
-                            src_h=int(vi.get("height") or 1080),
+                            src_w=int(vi.get("width") or 1280),
+                            src_h=int(vi.get("height") or 720),
                             caption_font_size=int(cap_size),
                             encode_preset=encode_preset,
                             srt_output_path=str(srt_file),
@@ -1961,8 +2136,7 @@ if page == "Campaign & Auto-Clipper":
                         "hook": final_hook,
                         "transcript_excerpt": all_spoken,
                     }
-                    init_copy = generate_social_copy(
-                        platform=st.session_state.target_platform_choice,
+                    copy_pack = generate_multi_platform_copy(
                         brief=st.session_state.brief,
                         analysis=st.session_state.brief_analysis,
                         clip_info=clip_meta,
@@ -1979,11 +2153,18 @@ if page == "Campaign & Auto-Clipper":
                         "aspect": default_asp,
                         "resolution": sharp_res,
                         "meta": clip_meta,
-                        "caption": init_copy["caption"],
-                        "description": init_copy["description"],
+                        "youtube": copy_pack["youtube"],
+                        "instagram": copy_pack["instagram"],
+                        "facebook": copy_pack["facebook"],
+                        "caption": copy_pack["caption"],
+                        "description": copy_pack["description"],
                     }
                     st.session_state.clips.append(rec)
                     rendered_now.append(rec)
+                    render_prog.progress(
+                        int(((idx + 1) / max(1, len(cands))) * 100),
+                        text=f"Rendering stitched clips: {idx + 1}/{len(cands)}",
+                    )
 
                 if rendered_now:
                     st.session_state.auto_candidates = build_auto_clip_candidates(
@@ -1996,7 +2177,8 @@ if page == "Campaign & Auto-Clipper":
                         desired_minutes=active_minutes,
                         used_windows=st.session_state.used_clip_windows,
                     )
-                    st.success(f"Stitched {len(rendered_now)} peak-moment clip(s) at ~{active_minutes:.2f} min each in full-frame {default_asp}.")
+                    save_workspace_state()
+                    st.success(f"Stitched {len(rendered_now)} peak-moment clip(s) at ~{active_minutes:.2f} min each in full-frame {default_asp} and saved workspace.")
             except Exception as exc:
                 st.error(f"Auto-clip stitch error: {exc}")
 
@@ -2014,8 +2196,8 @@ elif page == "Manual Clipper (Start → End)":
                     f"{bp['label']} ({fmt_time(bp_info.get('duration', 0))} · {round((bp_info.get('size') or 0)/(1024*1024), 1)} MB)",
                     bp["path"],
                     max(1.0, float(bp_info.get("duration") or 1.0)),
-                    int(bp_info.get("width") or 1920),
-                    int(bp_info.get("height") or 1080),
+                    int(bp_info.get("width") or 1280),
+                    int(bp_info.get("height") or 720),
                 ))
         if st.session_state.source_video and Path(st.session_state.source_video).exists() and st.session_state.video_info:
             vi_ed = st.session_state.video_info
@@ -2023,8 +2205,8 @@ elif page == "Manual Clipper (Start → End)":
                 f"Full Video: {st.session_state.video_name or 'Source'} ({fmt_time(vi_ed.get('duration', 0))})",
                 st.session_state.source_video,
                 max(1.0, float(vi_ed.get("duration") or 1.0)),
-                int(vi_ed.get("width") or 1920),
-                int(vi_ed.get("height") or 1080),
+                int(vi_ed.get("width") or 1280),
+                int(vi_ed.get("height") or 720),
             ))
 
         sel_src_idx = st.selectbox(
@@ -2046,8 +2228,8 @@ elif page == "Manual Clipper (Start → End)":
             hook_dur_opt = st.selectbox("Top hook duration", ["8s Banner", "Full Clip Banner"], key="ed_hook_dur")
         with b:
             aspect = st.selectbox("Aspect ratio", ["9:16 Vertical", "16:9 Landscape", "1:1 Square", "4:5 Portrait", "Keep original"], key="ed_aspect")
-            resolution = st.selectbox("Output Resolution", ["1080p Full HD", "720p HD", "4K Ultra Sharp", "Source or Better (Auto Sharp)", "Match Source (Zero Resize Loss)"], key="ed_resolution")
-            crf = st.slider("Quality CRF (15 = crispest)", 15, 22, 18, key="ed_crf")
+            resolution = st.selectbox("Output Resolution", ["720p HD", "1080p Full HD", "4K Ultra Sharp", "Match Source (Zero Resize Loss)"], key="ed_resolution")
+            crf = st.slider("Quality CRF (18–26, 22 = fast & crisp)", 18, 26, 22, key="ed_crf")
             add_logo = st.checkbox("Include saved brand logo", value=bool(st.session_state.logo_path), key="ed_add_logo")
             add_sub = st.checkbox("Burn bottom subtitles + export .SRT", value=True, key="ed_add_sub")
 
@@ -2056,10 +2238,11 @@ elif page == "Manual Clipper (Start → End)":
                 st.error("End timestamp must be greater than start timestamp.")
             elif ffmpeg_ready():
                 try:
+                    ws_dir = workspace_dir(st.session_state.get("workspace_key", "default"))
                     clip_idx = len(st.session_state.clips) + 1
                     base_stem = f"{safe_name(clip_name)}_manual{clip_idx}"
-                    out = WORK_DIR / f"{base_stem}.mp4"
-                    srt_out = WORK_DIR / f"{base_stem}.srt"
+                    out = ws_dir / f"{base_stem}.mp4"
+                    srt_out = ws_dir / f"{base_stem}.srt"
                     spoken_now = transcript_slice(st.session_state.transcript, start, end)
                     final_hook = (hook_line or "").strip() or pick_good_hook(spoken_now, brief=st.session_state.brief, clip_index=clip_idx - 1)
                     wrap_chars = 26 if aspect in {"9:16 Vertical", "4:5 Portrait", "1:1 Square"} else 38
@@ -2098,8 +2281,7 @@ elif page == "Manual Clipper (Start → End)":
                         "hook": final_hook,
                         "transcript_excerpt": spoken_now,
                     }
-                    pack = generate_social_copy(
-                        platform=st.session_state.target_platform_choice,
+                    copy_pack = generate_multi_platform_copy(
                         brief=st.session_state.brief,
                         analysis=st.session_state.brief_analysis,
                         clip_info=c_meta,
@@ -2110,21 +2292,28 @@ elif page == "Manual Clipper (Start → End)":
                     st.session_state.clips.append({
                         "name": f"{clip_name} ({aspect})", "path": str(out), "srt_path": saved_srt,
                         "start": start, "end": end, "aspect": aspect, "resolution": resolution,
-                        "meta": c_meta, "caption": pack["caption"], "description": pack["description"],
+                        "meta": c_meta,
+                        "youtube": copy_pack["youtube"],
+                        "instagram": copy_pack["instagram"],
+                        "facebook": copy_pack["facebook"],
+                        "caption": copy_pack["caption"],
+                        "description": copy_pack["description"],
                     })
-                    st.success("Manual clip rendered.")
+                    save_workspace_state()
+                    st.success("Manual clip rendered and saved.")
                     st.video(str(out))
                 except Exception as exc:
                     st.error(f"Render error: {exc}")
 
 # ----------------------------- PAGE 3: BRAND KIT & SETTINGS ------------
 elif page == "Brand Kit & Settings":
-    st.subheader("Brand Kit & AI Settings")
+    st.subheader("Brand Kit, Saved Workspaces & AI Settings")
     logo = st.file_uploader("Upload brand logo (PNG/JPG/WEBP)", type=["png", "jpg", "jpeg", "webp"], key="bk_logo_up")
     if logo and st.button("Save Logo", key="bk_save_logo"):
         st.session_state.logo_path = str(save_upload(logo))
         st.session_state.logo_name = logo.name
-        st.success("Brand logo saved for this session.")
+        save_workspace_state()
+        st.success("Brand logo saved for this workspace.")
     if st.session_state.logo_path and Path(st.session_state.logo_path).exists():
         st.image(st.session_state.logo_path, caption=st.session_state.logo_name or "Brand Logo", width=200)
 
@@ -2139,7 +2328,7 @@ elif page == "Brand Kit & Settings":
 # ----------------------------- SHARED GENERATED CLIPS SECTION --------
 if st.session_state.clips:
     st.divider()
-    st.subheader("Generated Clips (Peak Stitch & Manual) + Per-Clip Campaign Captions")
+    st.subheader("Generated Clips · YouTube + IG + Facebook Copy Pack")
     st.text_area(
         "Optional extra caption/CTA note for clips",
         key="caption_instructions",
@@ -2148,13 +2337,12 @@ if st.session_state.clips:
 
     act_col1, act_col2 = st.columns([1.4, 1])
     with act_col1:
-        if st.button("✨ Generate Unique Campaign Captions for All Clips", key="gen_all_short_captions_btn", use_container_width=True):
-            with st.spinner("Generating tailored campaign captions for each clip..."):
+        if st.button("✨ Generate YouTube + IG + Facebook Copy for All Clips", key="gen_all_short_captions_btn", use_container_width=True):
+            with st.spinner("Generating YouTube, Instagram & Facebook copy for each clip..."):
                 for i, cl in enumerate(st.session_state.clips):
                     c_meta = cl.get("meta") or {"title": cl["name"], "start": cl["start"], "end": cl["end"]}
                     t_seg = c_meta.get("transcript_excerpt") or transcript_slice(st.session_state.transcript, cl["start"], cl["end"])
-                    pack = generate_social_copy(
-                        platform=st.session_state.target_platform_choice,
+                    pack = generate_multi_platform_copy(
                         brief=st.session_state.brief,
                         analysis=st.session_state.brief_analysis,
                         clip_info=c_meta,
@@ -2162,9 +2350,9 @@ if st.session_state.clips:
                         custom_instructions=st.session_state.caption_instructions,
                         clip_index=i,
                     )
-                    st.session_state.clips[i]["caption"] = pack["caption"]
-                    st.session_state.clips[i]["description"] = pack["description"]
-            st.success("Updated unique campaign captions for every clip.")
+                    st.session_state.clips[i].update(pack)
+            save_workspace_state()
+            st.success("Updated YouTube, Instagram & Facebook copy for every clip.")
     with act_col2:
         short_zip_items = []
         for i, cl in enumerate(st.session_state.clips):
@@ -2184,7 +2372,7 @@ if st.session_state.clips:
 
     for idx, cl in enumerate(st.session_state.clips):
         with st.container(border=True):
-            c_vid, c_cap = st.columns([1.25, 1.35], gap="large")
+            c_vid, c_cap = st.columns([1.2, 1.4], gap="large")
             actual_sec = round(float(cl["end"]) - float(cl["start"]), 1)
             c_meta = cl.get("meta") or {}
             clip_mode = c_meta.get("mode") or "Clip"
@@ -2221,17 +2409,16 @@ if st.session_state.clips:
                                     use_container_width=True,
                                 )
             with c_cap:
-                st.markdown("**Caption & Description for This Clip**")
+                st.markdown("**YouTube · Instagram · Facebook Copy**")
                 if st.button(
-                    f"✨ Get Caption for Clip {idx+1} (Campaign-Matched)",
+                    f"✨ Refresh YT + IG + FB Copy for Clip {idx+1}",
                     type="primary",
                     use_container_width=True,
                     key=f"get_cap_short_{idx}",
                 ):
                     t_seg = c_meta.get("transcript_excerpt") or transcript_slice(st.session_state.transcript, cl["start"], cl["end"])
-                    with st.spinner(f"Writing campaign-matched caption for Clip {idx+1}..."):
-                        pack = generate_social_copy(
-                            platform=st.session_state.target_platform_choice,
+                    with st.spinner(f"Writing YT, IG & FB copy for Clip {idx+1}..."):
+                        pack = generate_multi_platform_copy(
                             brief=st.session_state.brief,
                             analysis=st.session_state.brief_analysis,
                             clip_info=c_meta,
@@ -2239,26 +2426,39 @@ if st.session_state.clips:
                             custom_instructions=st.session_state.caption_instructions,
                             clip_index=idx,
                         )
-                        st.session_state.clips[idx]["caption"] = pack["caption"]
-                        st.session_state.clips[idx]["description"] = pack["description"]
+                        st.session_state.clips[idx].update(pack)
+                        save_workspace_state()
 
-                edited_cap = st.text_area(
-                    f"Clip {idx+1} Caption",
-                    value=cl.get("caption", ""),
-                    height=110,
-                    key=f"short_cap_area_{idx}",
-                )
-                edited_desc = st.text_area(
-                    f"Clip {idx+1} Description",
-                    value=cl.get("description", ""),
-                    height=135,
-                    key=f"short_desc_area_{idx}",
-                )
-                st.session_state.clips[idx]["caption"] = edited_cap
-                st.session_state.clips[idx]["description"] = edited_desc
+                t_yt, t_ig, t_fb = st.tabs(["YouTube", "Instagram", "Facebook"])
+                with t_yt:
+                    yt_val = st.text_area(
+                        f"YouTube Title & Description (Clip {idx+1})",
+                        value=cl.get("youtube") or cl.get("description", ""),
+                        height=145,
+                        key=f"yt_area_{idx}",
+                    )
+                    st.session_state.clips[idx]["youtube"] = yt_val
+                    st.session_state.clips[idx]["description"] = yt_val
+                with t_ig:
+                    ig_val = st.text_area(
+                        f"Instagram Caption (Clip {idx+1})",
+                        value=cl.get("instagram") or cl.get("caption", ""),
+                        height=145,
+                        key=f"ig_area_{idx}",
+                    )
+                    st.session_state.clips[idx]["instagram"] = ig_val
+                    st.session_state.clips[idx]["caption"] = ig_val
+                with t_fb:
+                    fb_val = st.text_area(
+                        f"Facebook Caption (Clip {idx+1})",
+                        value=cl.get("facebook") or cl.get("caption", ""),
+                        height=145,
+                        key=f"fb_area_{idx}",
+                    )
+                    st.session_state.clips[idx]["facebook"] = fb_val
 
                 render_fast_voice_reader(
-                    f"{edited_cap}\n\n{edited_desc}".strip(),
+                    f"YouTube: {cl.get('youtube', '')}\nInstagram: {cl.get('instagram', '')}\nFacebook: {cl.get('facebook', '')}".strip(),
                     label=f"🔊 Fast Read Clip {idx+1} Copy",
                     uid=f"short_{idx}",
                 )
