@@ -624,7 +624,7 @@ def heuristic_campaign_analysis(brief: str, project_name: str) -> dict:
         "unclear_or_conflicting_points": [] if len(brief.strip()) >= 30 else ["Brief is short—add more details on hooks, captions, or rules for sharper campaign alignment."],
         "pre_publish_checklist": [
             "Confirm vertical 9:16 framing for Shorts/Reels/TikTok",
-            "Verify burned-in SRT subtitles fit cleanly inside the frame",
+            "Verify burned-in bottom subtitles fit cleanly inside the frame",
             "Confirm caption & description include required campaign elements/tags",
         ],
     }
@@ -691,7 +691,7 @@ def evaluate_video_against_campaign(analysis: dict, video_info: dict, transcript
     t_text = ((transcript or {}).get("text") or "").lower()
 
     if transcript and t_text.strip():
-        strengths.append(f"Speech transcript captured ({len(t_text.split())} words) for SRT subtitles & hooks.")
+        strengths.append(f"Speech transcript captured ({len(t_text.split())} words) for SRT & bottom subtitles.")
         for req in (must_items + req_scenes)[:5]:
             key_words = [
                 kw for kw in re.findall(r"[a-z]{4,}", req.lower())
@@ -702,7 +702,7 @@ def evaluate_video_against_campaign(analysis: dict, video_info: dict, transcript
             else:
                 gaps.append(f"Verify spoken/visual coverage for requirement: {req}")
     else:
-        gaps.append("No speech transcript yet—add OPENAI_API_KEY in Streamlit Secrets/env so SRT subtitles transcribe exact spoken words.")
+        gaps.append("No speech transcript yet—add OPENAI_API_KEY in Streamlit Secrets/env so subtitles transcribe exact spoken words.")
 
     return {
         "ready": True,
@@ -1205,31 +1205,43 @@ def render_video(
             current = "vlogo"
 
         if cues:
-            target_srt = Path(srt_output_path) if srt_output_path else (WORK_DIR / f"subs_{next(tempfile._get_candidate_names())}.srt")
-            srt_file = write_srt_file(cues, clip_duration, target_srt)
-            srt_esc = escape_ffmpeg_path(srt_file)
+            if srt_output_path:
+                srt_file = write_srt_file(cues, clip_duration, Path(srt_output_path))
 
-            # Scale font & bottom margin proportionally to output height so subtitles fit cleanly inside the frame
             scale_ratio = out_h / 1080.0
-            sub_px = max(18, min(54, int(round(int(caption_font_size) * max(0.75, scale_ratio)))))
-            margin_v = max(48, min(int(out_h * 0.22), int(round(out_h * 0.085))))
-            margin_lr = max(24, int(round(out_w * 0.06)))
+            sub_px = max(20, min(52, int(round(int(caption_font_size) * max(0.85, scale_ratio)))))
+            bottom_margin = max(68, min(int(out_h * 0.22), int(round(out_h * 0.095))))
+            line_step = int(sub_px * 1.32)
+            sub_filters: list[str] = []
 
-            style_parts = [
-                f"FontSize={sub_px}",
-                f"MarginV={margin_v}",
-                f"MarginL={margin_lr}",
-                f"MarginR={margin_lr}",
-                "Alignment=2",
-                "PrimaryColour=&H00FFFFFF",
-                "BackColour=&HC0000000",
-                "BorderStyle=4",
-                "Outline=1",
-                "Shadow=0",
-            ]
-            force_style = ",".join(style_parts)
-            graph.append(f"[{current}]subtitles='{srt_esc}':force_style='{force_style}'[vsub]")
-            current = "vsub"
+            for c_start, c_end, c_text in cues[:64]:
+                c_a = max(0.0, min(clip_duration, float(c_start)))
+                c_b = max(c_a + 0.15, min(clip_duration, float(c_end)))
+                lines_list = [
+                    re.sub(r"\s+", " ", ln).strip()
+                    for ln in (c_text or "").splitlines()
+                    if ln.strip()
+                ][:2]
+                if not lines_list:
+                    continue
+                total_block_h = line_step * len(lines_list)
+                base_y = out_h - bottom_margin - total_block_h
+                for l_i, raw_ln in enumerate(lines_list):
+                    cue_file = WORK_DIR / f"cue_{next(tempfile._get_candidate_names())}.txt"
+                    cue_file.write_text(raw_ln, encoding="utf-8")
+                    temp_text_files.append(cue_file)
+                    cue_file_esc = escape_ffmpeg_path(cue_file)
+                    y_pos = max(16, base_y + (l_i * line_step))
+                    sub_filters.append(
+                        f"drawtext=textfile='{cue_file_esc}'{font_opt}:fontcolor=white:fontsize={sub_px}:"
+                        f"x=(w-text_w)/2:y={y_pos}:"
+                        f"box=1:boxcolor=black@0.82:boxborderw=10:"
+                        f"enable='between(t,{c_a:.2f},{c_b:.2f})'"
+                    )
+
+            if sub_filters:
+                graph.append(f"[{current}]{','.join(sub_filters)}[vsub]")
+                current = "vsub"
 
         args = ["ffmpeg", "-y", "-ss", str(round(float(start), 2)), "-i", source]
         if has_logo:
@@ -1263,8 +1275,6 @@ def render_video(
     finally:
         for tf in temp_text_files:
             tf.unlink(missing_ok=True)
-        if not srt_output_path and srt_file:
-            srt_file.unlink(missing_ok=True)
         gc.collect()
 
 
@@ -1282,7 +1292,7 @@ def init_state():
         "hook_mode_choice": "Standard Clip Length (Exact Minutes)",
         "hook_banner_scope": "8-Second Top Banner (0–8s)",
         "burn_onscreen_captions": True,
-        "onscreen_caption_size": 28,
+        "onscreen_caption_size": 30,
         "source_video": None,
         "video_name": None,
         "video_info": None,
@@ -1307,13 +1317,13 @@ init_state()
 
 # ----------------------------- HEADER & NAV -----------------------------
 st.markdown(f"""<div class="hero">
-<div style="color:#a5b4fc;font-weight:750;font-size:.76rem;letter-spacing:.13em">3 OR 5 PART BREAKER · CLIP LATER · BURNED-IN SRT SUBTITLES</div>
+<div style="color:#a5b4fc;font-weight:750;font-size:.76rem;letter-spacing:.13em">3 OR 5 PART BREAKER · CLIP LATER · BURNED-IN BOTTOM SUBTITLES + SRT</div>
 <h1>🎬 {APP_NAME}</h1>
-<p class="muted">Break into 3 or 5 parts first, clip any part later, with frame-fitted SRT subtitles and unique campaign captions per short.</p>
+<p class="muted">Break into 3 or 5 parts first, clip any part later, with burned-in bottom subtitles, downloadable SRTs, and unique campaign captions per short.</p>
 <span class="pill">3 or 5 part breaker</span>
 <span class="pill">Clip later anytime</span>
-<span class="pill">SRT subtitles fit cleanly</span>
-<span class="pill">Unique caption per short</span>
+<span class="pill">Burned-in bottom subtitles</span>
+<span class="pill">Downloadable .SRT + unique captions</span>
 </div>""", unsafe_allow_html=True)
 
 if not ffmpeg_ready():
@@ -1428,7 +1438,7 @@ if page == "Campaign & Clip Workflow":
             "Paste campaign requirements",
             key="brief",
             height=175,
-            placeholder="Example: Post vertical YouTube Shorts & Instagram Reels for GTA + Puffco stream. Include hooks, SRT subtitles, and hashtags.",
+            placeholder="Example: Post vertical YouTube Shorts & Instagram Reels. Include hooks, bottom subtitles + SRT file, and hashtags.",
         )
 
         p_col, c_col, min_col = st.columns(3)
@@ -1458,7 +1468,7 @@ if page == "Campaign & Clip Workflow":
             )
         with cap_col:
             st.checkbox(
-                "Burn in SRT subtitles (fitted to frame)",
+                "Burn bottom subtitles + export .SRT",
                 key="burn_onscreen_captions",
             )
 
@@ -1489,7 +1499,7 @@ if page == "Campaign & Clip Workflow":
                             tr = None
                             if get_openai_client():
                                 try:
-                                    with st.spinner("Transcribing spoken words for SRT subtitles..."):
+                                    with st.spinner("Transcribing spoken words for bottom subtitles & SRT..."):
                                         tr = transcribe_video(st.session_state.source_video)
                                         st.session_state.transcript = tr
                                 except Exception as t_exc:
@@ -1586,7 +1596,7 @@ if page == "Campaign & Clip Workflow":
         dur = max(1.0, float(vi["duration"]))
 
         if st.session_state.burn_onscreen_captions and not st.session_state.transcript and not get_openai_client():
-            st.warning("No transcript available because `OPENAI_API_KEY` is not set—SRT subtitles will use transcript text only if available rather than live word-by-word speech.")
+            st.warning("No transcript available because `OPENAI_API_KEY` is not set—bottom subtitles will use transcript text only if available rather than live word-by-word speech.")
 
         ctrl1, ctrl2, ctrl3 = st.columns([1.2, 1.2, 1])
         with ctrl1:
@@ -1652,7 +1662,7 @@ if page == "Campaign & Clip Workflow":
         with q_col3:
             encode_preset = st.selectbox("Encode speed/quality", ["veryfast", "fast", "ultrafast"], key="wf_encode_preset")
         with q_col4:
-            cap_size = st.slider("SRT subtitle size", 20, 42, int(st.session_state.onscreen_caption_size), key="wf_cap_size")
+            cap_size = st.slider("Bottom subtitle size", 22, 44, int(st.session_state.onscreen_caption_size), key="wf_cap_size")
 
         asp_choices = ["9:16 Vertical", "16:9 Landscape", "1:1 Square", "4:5 Portrait", "Keep original"]
         default_asp = default_aspect_for_platform(st.session_state.target_platform_choice)
@@ -1708,7 +1718,7 @@ if page == "Campaign & Clip Workflow":
             try:
                 if st.session_state.burn_onscreen_captions and not st.session_state.transcript and get_openai_client():
                     try:
-                        with st.spinner("Transcribing speech for SRT subtitles..."):
+                        with st.spinner("Transcribing speech for bottom subtitles & SRT..."):
                             st.session_state.transcript = transcribe_video(st.session_state.source_video)
                     except Exception:
                         pass
@@ -1737,7 +1747,7 @@ if page == "Campaign & Clip Workflow":
                             max_chars=wrap_chars,
                         )
 
-                    with st.spinner(f"Rendering {asp_v} Short {num} with SRT subtitles ({s_v:.1f}s – {e_v:.1f}s)..."):
+                    with st.spinner(f"Rendering {asp_v} Short {num} with burned-in bottom subtitles ({s_v:.1f}s – {e_v:.1f}s)..."):
                         saved_srt = render_video(
                             st.session_state.source_video,
                             str(out_file),
@@ -1793,7 +1803,7 @@ if page == "Campaign & Clip Workflow":
                     rendered_now.append(rec)
 
                 if rendered_now:
-                    st.success(f"Extracted {len(rendered_now)} sharp short(s) with burned-in SRT subtitles and unique campaign captions ready below.")
+                    st.success(f"Extracted {len(rendered_now)} sharp short(s) with burned-in bottom subtitles, .SRT files, and unique campaign captions ready below.")
             except Exception as exc:
                 st.error(f"Clip render error: {exc}")
 
@@ -1966,7 +1976,7 @@ elif page == "Editor & Templates":
             resolution = st.selectbox("Output Resolution", ["1080p Full HD", "720p HD", "4K Ultra Sharp", "Source or Better (Auto Sharp)", "Match Source (Zero Resize Loss)"], key="ed_resolution")
             crf = st.slider("Quality CRF (15 = crispest)", 15, 22, 18, key="ed_crf")
             add_logo = st.checkbox("Include saved brand logo", value=bool(st.session_state.logo_path), key="ed_add_logo")
-            add_sub = st.checkbox("Burn in SRT subtitles (fitted to frame)", value=True, key="ed_add_sub")
+            add_sub = st.checkbox("Burn bottom subtitles + export .SRT", value=True, key="ed_add_sub")
 
         if st.button("Render Sharp Clip", type="primary", use_container_width=True, key="ed_render_btn"):
             if end <= start:
@@ -2028,7 +2038,7 @@ elif page == "Editor & Templates":
                         "start": start, "end": end, "aspect": aspect, "resolution": resolution,
                         "meta": c_meta, "caption": pack["caption"], "description": pack["description"],
                     })
-                    st.success("Sharp clip with SRT subtitles rendered.")
+                    st.success("Sharp clip with burned-in bottom subtitles & .SRT rendered.")
                     st.video(str(out))
                 except Exception as exc:
                     st.error(f"Render error: {exc}")
