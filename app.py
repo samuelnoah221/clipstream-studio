@@ -101,62 +101,93 @@ def find_system_font() -> str | None:
             return Path(p).resolve().as_posix().replace(":", "\\:")
     return None
 
-def render_browser_file_meter(max_mb: int = 2048):
+def attach_uploader_percentage_bar(max_mb: int = 2048):
+    """Attaches a live 0-100% file-read meter directly to Streamlit's st.file_uploader input."""
     components.html(
         f"""
-        <div style="font-family:system-ui,-apple-system,sans-serif;background:#151b29;border:1px solid #2b354b;border-radius:12px;padding:12px;color:#f4f5fa;">
+        <div id="cs_pct_box" style="font-family:system-ui,-apple-system,sans-serif;background:#151b29;border:1px solid #2b354b;border-radius:12px;padding:11px 13px;color:#f4f5fa;">
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;font-size:13px;">
-            <span id="f_lbl">Pick a video to see local file read %</span>
-            <strong id="f_pct" style="color:#a5b4fc;">0%</strong>
+            <span id="cs_pct_lbl">Waiting for file selection in uploader below...</span>
+            <strong id="cs_pct_val" style="color:#a5b4fc;">0%</strong>
           </div>
-          <div style="width:100%;height:10px;background:#090c13;border-radius:999px;overflow:hidden;border:1px solid #293449;">
-            <div id="f_bar" style="width:0%;height:100%;background:linear-gradient(90deg,#6366f1,#22c55e);transition:width 0.1s ease;"></div>
+          <div style="width:100%;height:9px;background:#090c13;border-radius:999px;overflow:hidden;border:1px solid #293449;">
+            <div id="cs_pct_fill" style="width:0%;height:100%;background:linear-gradient(90deg,#6366f1,#22c55e);transition:width 0.1s ease;"></div>
           </div>
-          <div id="f_meta" style="margin-top:6px;font-size:12px;color:#94a3b8;">Max size: {max_mb} MB</div>
-          <input id="f_input" type="file" accept="video/*" style="margin-top:8px;font-size:12px;color:#cbd5e1;" />
+          <div id="cs_pct_meta" style="margin-top:5px;font-size:12px;color:#94a3b8;">Max size: {max_mb} MB</div>
         </div>
         <script>
-          const input = document.getElementById("f_input");
-          const bar = document.getElementById("f_bar");
-          const pct = document.getElementById("f_pct");
-          const lbl = document.getElementById("f_lbl");
-          const meta = document.getElementById("f_meta");
+          (function() {{
+            const parentDoc = window.parent ? window.parent.document : document;
+            let boundInput = null;
+            let activeJob = 0;
 
-          input.addEventListener("change", () => {{
-            const file = input.files && input.files[0];
-            if (!file) return;
-            const total = file.size || 1;
-            const totalMb = (total / (1024 * 1024)).toFixed(1);
-            let offset = 0;
-            const step = 8 * 1024 * 1024;
-            lbl.textContent = "Reading " + file.name + "...";
+            function scanFile(file) {{
+              if (!file) return;
+              const jobId = ++activeJob;
+              const lbl = document.getElementById("cs_pct_lbl");
+              const val = document.getElementById("cs_pct_val");
+              const fill = document.getElementById("cs_pct_fill");
+              const meta = document.getElementById("cs_pct_meta");
 
-            function nextSlice() {{
-              if (offset >= total) {{
-                bar.style.width = "100%";
-                pct.textContent = "100%";
-                meta.textContent = totalMb + " / " + totalMb + " MB";
-                lbl.textContent = "Ready: " + file.name + " (use uploader below & click Load Video)";
-                return;
+              const total = Math.max(1, file.size || 1);
+              const totalMb = (total / (1024 * 1024)).toFixed(1);
+              const step = 8 * 1024 * 1024;
+              let offset = 0;
+
+              lbl.textContent = "Reading " + file.name + "...";
+              meta.textContent = "0.0 / " + totalMb + " MB";
+
+              function readNext() {{
+                if (jobId !== activeJob) return;
+                if (offset >= total) {{
+                  fill.style.width = "100%";
+                  val.textContent = "100%";
+                  meta.textContent = totalMb + " / " + totalMb + " MB ready — click Load Video";
+                  lbl.textContent = "Selected: " + file.name;
+                  return;
+                }}
+                const slice = file.slice(offset, offset + step);
+                const reader = new FileReader();
+                reader.onload = function(ev) {{
+                  if (jobId !== activeJob) return;
+                  const got = (ev.target && ev.target.result && ev.target.result.byteLength) || slice.size;
+                  offset = Math.min(total, offset + got);
+                  const pct = Math.min(100, Math.round((offset / total) * 100));
+                  fill.style.width = pct + "%";
+                  val.textContent = pct + "%";
+                  meta.textContent = (offset / (1024 * 1024)).toFixed(1) + " / " + totalMb + " MB";
+                  requestAnimationFrame(readNext);
+                }};
+                reader.readAsArrayBuffer(slice);
               }}
-              const slice = file.slice(offset, offset + step);
-              const reader = new FileReader();
-              reader.onload = (ev) => {{
-                const bytes = (ev.target.result && ev.target.result.byteLength) || slice.size;
-                offset += bytes;
-                const p = Math.min(100, Math.round((offset / total) * 100));
-                bar.style.width = p + "%";
-                pct.textContent = p + "%";
-                meta.textContent = (offset / (1024 * 1024)).toFixed(1) + " / " + totalMb + " MB";
-                requestAnimationFrame(nextSlice);
-              }};
-              reader.readAsArrayBuffer(slice);
+              readNext();
             }}
-            nextSlice();
-          }});
+
+            function bindUploader() {{
+              const inputs = parentDoc.querySelectorAll('[data-testid="stFileUploader"] input[type="file"]');
+              if (!inputs || inputs.length === 0) return;
+              const target = inputs[0];
+              if (target !== boundInput) {{
+                boundInput = target;
+                target.addEventListener("change", function() {{
+                  if (target.files && target.files[0]) {{
+                    scanFile(target.files[0]);
+                  }}
+                }});
+              }}
+              if (target.files && target.files[0] && document.getElementById("cs_pct_val").textContent === "0%") {{
+                scanFile(target.files[0]);
+              }}
+            }}
+
+            bindUploader();
+            const observer = new MutationObserver(bindUploader);
+            observer.observe(parentDoc.body, {{ childList: true, subtree: true }});
+            setInterval(bindUploader, 800);
+          }})();
         </script>
         """,
-        height=125,
+        height=96,
     )
 
 def save_upload(uploaded, suffix: str | None = None, show_progress: bool = False) -> Path:
@@ -166,7 +197,7 @@ def save_upload(uploaded, suffix: str | None = None, show_progress: bool = False
     written = 0
     chunk_size = 4 * 1024 * 1024
 
-    bar = st.progress(0, text="Saving file to disk: 0%") if show_progress else None
+    bar = st.progress(0, text="Loading video to disk: 0%") if show_progress else None
     uploaded.seek(0)
     with path.open("wb") as handle:
         while True:
@@ -179,10 +210,10 @@ def save_upload(uploaded, suffix: str | None = None, show_progress: bool = False
                 pct = min(100, int((written / total_bytes) * 100))
                 bar.progress(
                     pct,
-                    text=f"Saving file to disk: {pct}% ({written / (1024*1024):.1f} / {total_bytes / (1024*1024):.1f} MB)",
+                    text=f"Loading video to disk: {pct}% ({written / (1024*1024):.1f} / {total_bytes / (1024*1024):.1f} MB)",
                 )
     if bar is not None:
-        bar.progress(100, text="Saved file to disk: 100%")
+        bar.progress(100, text="Video loaded to disk: 100%")
     gc.collect()
     return path
 
@@ -1209,10 +1240,10 @@ init_state()
 
 # ----------------------------- HEADER & NAV -----------------------------
 st.markdown(f"""<div class="hero">
-<div style="color:#a5b4fc;font-weight:750;font-size:.76rem;letter-spacing:.13em">UPLOAD % METER · 2-PART SPLIT & MIX · CHANGING BOTTOM CAPTIONS</div>
+<div style="color:#a5b4fc;font-weight:750;font-size:.76rem;letter-spacing:.13em">SINGLE UPLOADER + LIVE % · 2-PART SPLIT & MIX · CHANGING BOTTOM CAPTIONS</div>
 <h1>🎬 {APP_NAME}</h1>
-<p class="muted">Upload percentage meter + 2-part split & mix into one sharp short/video + changing speech-synced bottom captions + unique campaign captions per short.</p>
-<span class="pill">Upload % meter</span>
+<p class="muted">Single video uploader with live % progress + 2-part split & mix into one sharp short/video + changing speech-synced bottom captions + unique campaign captions per short.</p>
+<span class="pill">Single uploader + %</span>
 <span class="pill">Split 2 parts & mix</span>
 <span class="pill">Changing bottom captions</span>
 <span class="pill">Unique caption per short</span>
@@ -1235,7 +1266,7 @@ with st.sidebar:
 
 # ----------------------------- PAGE 1: CAMPAIGN & CLIP WORKFLOW ---------
 if page == "Campaign & Clip Workflow":
-    st.subheader("Step 1 · Video (with Upload % & 2-Part Split/Mix) + Campaign Requirements")
+    st.subheader("Step 1 · Video (Single Uploader + Live %) + Campaign Requirements")
     left_col, right_col = st.columns([1.15, 1], gap="large")
 
     with left_col:
@@ -1244,7 +1275,7 @@ if page == "Campaign & Clip Workflow":
             "Enable 2-part split & mix (recommended for large files)",
             key="split_mode_enabled"
         )
-        render_browser_file_meter(MAX_UPLOAD_MB)
+        attach_uploader_percentage_bar(MAX_UPLOAD_MB)
         video_up = st.file_uploader("Upload campaign video", type=["mp4", "mov", "mkv", "webm", "m4v"], key="wf_video_up")
         if video_up and video_up.size > MAX_UPLOAD_MB * 1024 * 1024:
             st.error(f"File exceeds {MAX_UPLOAD_MB} MB limit.")
