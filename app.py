@@ -134,6 +134,105 @@ def probe_video(path: str) -> dict:
         "fps": v.get("r_frame_rate", "unknown"),
     }
 
+def split_video_into_two_parts(source: str, duration: float, split_sec: float | None = None) -> tuple[dict, dict]:
+    """Losslessly split a large video into 2 parts using stream copy (-c copy) to avoid heavy re-encode RAM spikes."""
+    src_path = Path(source)
+    if not src_path.exists():
+        raise RuntimeError("Source video file is missing.")
+    dur = max(2.0, float(duration))
+    mid = round(split_sec if split_sec is not None else (dur / 2.0), 1)
+    mid = max(1.0, min(dur - 1.0, mid))
+
+    stem = safe_name(src_path.stem)
+    part1_path = WORK_DIR / f"{stem}_part1_{next(tempfile._get_candidate_names())}{src_path.suffix or '.mp4'}"
+    part2_path = WORK_DIR / f"{stem}_part2_{next(tempfile._get_candidate_names())}{src_path.suffix or '.mp4'}"
+
+    p1 = run_cmd([
+        "ffmpeg", "-y", "-i", str(src_path),
+        "-t", str(mid), "-c", "copy", "-avoid_negative_ts", "make_zero",
+        str(part1_path)
+    ], timeout=600)
+    if p1.returncode or not part1_path.exists():
+        raise RuntimeError(p1.stderr[-1500:] or "Failed creating Part 1.")
+
+    p2 = run_cmd([
+        "ffmpeg", "-y", "-ss", str(mid), "-i", str(src_path),
+        "-c", "copy", "-avoid_negative_ts", "make_zero",
+        str(part2_path)
+    ], timeout=600)
+    if p2.returncode or not part2_path.exists():
+        raise RuntimeError(p2.stderr[-1500:] or "Failed creating Part 2.")
+
+    info1 = probe_video(str(part1_path))
+    info2 = probe_video(str(part2_path))
+    return (
+        {"label": "Part 1", "path": str(part1_path), "start_in_source": 0.0, "end_in_source": mid, "info": info1},
+        {"label": "Part 2", "path": str(part2_path), "start_in_source": mid, "end_in_source": dur, "info": info2},
+    )
+
+def mix_two_parts_into_one(
+    part1_path: str,
+    part2_path: str,
+    output_path: str,
+    aspect: str,
+    resolution: str,
+    crf: int,
+    cues: list[tuple[float, float, str]] | None = None,
+    hook_banner_text: str = "",
+    hook_banner_duration: float = 8.0,
+    src_w: int = 1920,
+    src_h: int = 1080,
+    caption_font_size: int = 28,
+    encode_preset: str = "medium",
+    normalize_audio: bool = True,
+    max_duration: float | None = None,
+):
+    """Combine Part 1 and Part 2 into a single sharp short or video with optional hook & changing bottom captions."""
+    if not Path(part1_path).exists() or not Path(part2_path).exists():
+        raise RuntimeError("One or both split parts are missing.")
+
+    list_file = WORK_DIR / f"concat_{next(tempfile._get_candidate_names())}.txt"
+    p1_posix = Path(part1_path).resolve().as_posix().replace("'", "'\\''")
+    p2_posix = Path(part2_path).resolve().as_posix().replace("'", "'\\''")
+    list_file.write_text(f"file '{p1_posix}'\nfile '{p2_posix}'\n", encoding="utf-8")
+
+    merged_raw = WORK_DIR / f"merged_raw_{next(tempfile._get_candidate_names())}.mp4"
+    try:
+        m_cmd = [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "256k", str(merged_raw)
+        ]
+        pm = run_cmd(m_cmd, timeout=1800)
+        if pm.returncode or not merged_raw.exists():
+            raise RuntimeError(pm.stderr[-2000:] or "Failed joining Part 1 and Part 2.")
+
+        m_info = probe_video(str(merged_raw))
+        total_dur = max(0.5, float(m_info.get("duration") or 1.0))
+        final_dur = round(min(total_dur, float(max_duration)), 1) if max_duration else round(total_dur, 1)
+
+        render_video(
+            source=str(merged_raw),
+            output=output_path,
+            start=0.0,
+            end=final_dur,
+            aspect=aspect,
+            resolution=resolution,
+            crf=crf,
+            cues=cues,
+            hook_banner_text=hook_banner_text,
+            hook_banner_duration=hook_banner_duration,
+            src_w=int(m_info.get("width") or src_w),
+            src_h=int(m_info.get("height") or src_h),
+            caption_font_size=caption_font_size,
+            encode_preset=encode_preset,
+            normalize_audio=normalize_audio,
+            clip_index=0,
+        )
+    finally:
+        list_file.unlink(missing_ok=True)
+        merged_raw.unlink(missing_ok=True)
+
 def get_openai_client():
     key = None
     try:
@@ -244,7 +343,6 @@ def transcript_slice(transcript: dict | None, start: float, end: float) -> str:
     return full_txt[:350]
 
 def pick_good_hook(spoken_text: str, brief: str = "", clip_index: int = 0) -> str:
-    """Pick a strong campaign-matched hook tailored to what happens/is said in the segment."""
     low_all = f"{spoken_text} {brief}".lower()
 
     if any(w in low_all for w in ["butler", "rayquan", "tray"]):
@@ -295,7 +393,6 @@ def pick_fresh_windows(
     used_windows: list[list[float]],
     transcript: dict | None = None,
 ) -> list[tuple[float, float, str]]:
-    """Pick 1-2 windows matching the exact requested minute length without repeating prior ranges."""
     if duration <= 0:
         return []
     count = max(1, min(2, int(count)))
@@ -727,7 +824,6 @@ def build_caption_cues(
     end: float,
     fallback_text: str = "",
 ) -> list[tuple[float, float, str]]:
-    """Build changing, time-synced bottom caption cues across [start, end] so captions always advance."""
     clip_dur = max(0.5, round(end - start, 2))
     cues: list[tuple[float, float, str]] = []
 
@@ -762,7 +858,6 @@ def build_caption_cues(
             if wrapped:
                 cues.append((rel_a, rel_b, wrapped))
 
-    # If no transcript segments exist for this window, create distinct changing beats across the clip
     if not cues:
         beats = [
             "First reaction & setup",
@@ -804,14 +899,10 @@ def resolve_sharp_dimensions(
 ) -> tuple[str | None, str | None, int, int]:
     src_w = max(2, int(src_w or 1920))
     src_h = max(2, int(src_h or 1080))
-    dur_safe = max(1.0, float(clip_duration))
-
-    # Slight horizontal/vertical crop offset shift across shorts so different parts of the scene are captured
-    pan_phase = (clip_index % 3) * 0.5  # 0.0, 0.5, 1.0
+    pan_phase = (clip_index % 3) * 0.5
 
     if aspect == "9:16 Vertical":
         if src_w / src_h > 9 / 16:
-            # Horizontal scan across available width so different parts of the shot are captured
             crop = f"crop=ih*9/16:ih:(iw-ih*9/16)*({pan_phase:.2f}+0.15*sin(t*0.6)):0"
         else:
             crop = f"crop=iw:min(ih\\,iw*16/9):0:(ih-min(ih\\,iw*16/9))*{pan_phase:.2f}"
@@ -1017,6 +1108,8 @@ def init_state():
         "source_video": None,
         "video_name": None,
         "video_info": None,
+        "split_parts": [],
+        "split_mode_enabled": True,
         "transcript": None,
         "highlights": [],
         "clips": [],
@@ -1035,12 +1128,12 @@ init_state()
 
 # ----------------------------- HEADER & NAV -----------------------------
 st.markdown(f"""<div class="hero">
-<div style="color:#a5b4fc;font-weight:750;font-size:.76rem;letter-spacing:.13em">UP TO 2GB UPLOAD · DYNAMIC BOTTOM CAPTIONS · MULTI-ANGLE SHORT PICKS · CAMPAIGN HOOKS</div>
+<div style="color:#a5b4fc;font-weight:750;font-size:.76rem;letter-spacing:.13em">UP TO 2GB UPLOAD · SPLIT INTO 2 PARTS & MIX INTO ONE · CHANGING BOTTOM CAPTIONS · SHARP OUTPUT</div>
 <h1>🎬 {APP_NAME}</h1>
-<p class="muted">Up to 2GB video uploads + 9:16 vertical shorts + changing speech-synced bottom captions + campaign hook lines + unique caption/description per short.</p>
+<p class="muted">Up to 2GB video uploads + split large videos into 2 parts & mix both into one sharp short/video + changing speech-synced bottom captions + unique campaign captions per short.</p>
 <span class="pill">Up to 2GB upload</span>
+<span class="pill">Split 2 parts & mix</span>
 <span class="pill">Changing bottom captions</span>
-<span class="pill">Dynamic scene hooks</span>
 <span class="pill">Unique caption per short</span>
 </div>""", unsafe_allow_html=True)
 
@@ -1056,27 +1149,32 @@ with st.sidebar:
     ], label_visibility="collapsed", key="nav_page_radio")
     st.divider()
     st.metric("Go-Ahead Status", "Approved" if st.session_state.go_ahead_clips else "Pending Review")
-    st.metric("Used Clip Ranges", len(st.session_state.used_clip_windows))
+    st.metric("Split Parts Ready", len(st.session_state.split_parts))
     st.metric("Generated Shorts", len(st.session_state.clips))
 
 # ----------------------------- PAGE 1: CAMPAIGN & CLIP WORKFLOW ---------
 if page == "Campaign & Clip Workflow":
-    st.subheader("Step 1 · Video + Campaign Requirements & Fit Feedback")
+    st.subheader("Step 1 · Video (with 2-Part Split & Mix Option) + Campaign Requirements")
     left_col, right_col = st.columns([1.15, 1], gap="large")
 
     with left_col:
         st.text_input("Project / Campaign Name", key="project_name")
+        st.checkbox(
+            "Enable 2-part split & mix (recommended for large 1GB–2GB files)",
+            key="split_mode_enabled"
+        )
         video_up = st.file_uploader("Upload campaign video (up to 2GB)", type=["mp4", "mov", "mkv", "webm", "m4v"], key="wf_video_up")
         if video_up and video_up.size > MAX_UPLOAD_MB * 1024 * 1024:
             st.error(f"File exceeds {MAX_UPLOAD_MB} MB (2GB) limit.")
         elif video_up and st.button("Load Video", type="primary", key="wf_load_video"):
             try:
-                with st.spinner("Inspecting video..."):
+                with st.spinner("Saving and inspecting video..."):
                     vpath = save_upload(video_up)
                     vinfo = probe_video(str(vpath))
                     st.session_state.source_video = str(vpath)
                     st.session_state.video_name = video_up.name
                     st.session_state.video_info = vinfo
+                    st.session_state.split_parts = []
                     st.session_state.transcript = None
                     st.session_state.highlights = []
                     st.session_state.used_clip_windows = []
@@ -1088,11 +1186,101 @@ if page == "Campaign & Clip Workflow":
 
         if st.session_state.video_info and st.session_state.source_video and Path(st.session_state.source_video).exists():
             vi = st.session_state.video_info
-            st.video(st.session_state.source_video)
+            size_mb = round((vi.get("size") or Path(st.session_state.source_video).stat().st_size) / (1024 * 1024), 1)
+            if size_mb < 600:
+                st.video(st.session_state.source_video)
+            else:
+                st.info(f"Large file ({size_mb} MB) loaded on disk—preview skipped to save memory. Use **Break Video into 2 Parts** below for smooth processing.")
             m1, m2, m3 = st.columns(3)
             m1.metric("Duration", fmt_time(vi["duration"]))
             m2.metric("Resolution", f"{vi['width']}x{vi['height']}")
-            m3.metric("Audio", vi["audio_codec"])
+            m3.metric("File Size", f"{size_mb} MB")
+
+            if st.session_state.split_mode_enabled and ffmpeg_ready() and float(vi["duration"]) >= 2.0:
+                if st.button("✂️ Break Video into 2 Parts (Lossless)", use_container_width=True, key="split_2_parts_btn"):
+                    try:
+                        with st.spinner("Splitting video cleanly into Part 1 and Part 2..."):
+                            p1_obj, p2_obj = split_video_into_two_parts(st.session_state.source_video, float(vi["duration"]))
+                            st.session_state.split_parts = [p1_obj, p2_obj]
+                        st.success("Created Part 1 and Part 2! You can now mix both parts into one sharp short/video below.")
+                    except Exception as exc:
+                        st.error(f"Split error: {exc}")
+
+            if len(st.session_state.split_parts) == 2:
+                sp1, sp2 = st.session_state.split_parts
+                st.markdown("**2 Split Parts Ready:**")
+                sc1, sc2 = st.columns(2)
+                sc1.caption(f"Part 1: {fmt_time(sp1['info']['duration'])} ({round(sp1['info']['size']/(1024*1024), 1)} MB)")
+                sc2.caption(f"Part 2: {fmt_time(sp2['info']['duration'])} ({round(sp2['info']['size']/(1024*1024), 1)} MB)")
+
+                mix_asp_opts = ["9:16 Vertical", "16:9 Landscape", "1:1 Square", "4:5 Portrait", "Keep original"]
+                mix_asp = st.selectbox("Mixed output aspect", mix_asp_opts, index=0, key="mix_parts_aspect")
+                mix_res = st.selectbox("Mixed output sharpness", ["1080p Full HD", "4K Ultra Sharp", "720p HD", "Source or Better (Auto Sharp)"], index=0, key="mix_parts_res")
+                mix_hook = st.text_input("Top hook for mixed video (optional)", value=pick_good_hook("", brief=st.session_state.brief, clip_index=0), key="mix_parts_hook")
+                mix_cap = st.checkbox("Include changing bottom captions on mixed video", value=True, key="mix_parts_captions")
+
+                if st.button("🔀 Mix Part 1 + Part 2 into One Sharp Short / Video", type="primary", use_container_width=True, key="mix_2_parts_btn"):
+                    try:
+                        clip_num = len(st.session_state.clips) + 1
+                        mixed_out = WORK_DIR / f"{safe_name(st.session_state.project_name)}_mixed_{clip_num}.mp4"
+                        combined_dur = round(float(sp1["info"]["duration"]) + float(sp2["info"]["duration"]), 1)
+                        cues = build_caption_cues(
+                            transcript=st.session_state.transcript,
+                            start=0.0,
+                            end=combined_dur,
+                            fallback_text=st.session_state.brief or "Mixed two-part highlight",
+                        ) if mix_cap else None
+
+                        with st.spinner("Mixing Part 1 and Part 2 into one sharp output..."):
+                            mix_two_parts_into_one(
+                                part1_path=sp1["path"],
+                                part2_path=sp2["path"],
+                                output_path=str(mixed_out),
+                                aspect=mix_asp,
+                                resolution=mix_res,
+                                crf=16,
+                                cues=cues,
+                                hook_banner_text=mix_hook,
+                                hook_banner_duration=8.0,
+                                src_w=int(vi.get("width") or 1920),
+                                src_h=int(vi.get("height") or 1080),
+                                caption_font_size=int(st.session_state.onscreen_caption_size),
+                                encode_preset="medium",
+                                normalize_audio=True,
+                            )
+
+                        c_meta = {
+                            "title": f"Mixed Part 1 + Part 2 #{clip_num}",
+                            "start": 0.0,
+                            "end": combined_dur,
+                            "aspect": mix_asp,
+                            "hook": mix_hook,
+                            "transcript_excerpt": transcript_slice(st.session_state.transcript, 0.0, combined_dur),
+                        }
+                        copy_pack = generate_social_copy(
+                            platform=st.session_state.target_platform_choice,
+                            brief=st.session_state.brief,
+                            analysis=st.session_state.brief_analysis,
+                            clip_info=c_meta,
+                            transcript_text=c_meta["transcript_excerpt"],
+                            custom_instructions=st.session_state.caption_instructions,
+                            clip_index=clip_num - 1,
+                        )
+                        st.session_state.clips.append({
+                            "name": f"Mixed Part 1 + Part 2 #{clip_num} ({mix_asp})",
+                            "path": str(mixed_out),
+                            "start": 0.0,
+                            "end": combined_dur,
+                            "aspect": mix_asp,
+                            "resolution": mix_res,
+                            "meta": c_meta,
+                            "caption": copy_pack["caption"],
+                            "description": copy_pack["description"],
+                        })
+                        st.success("Mixed Part 1 + Part 2 into one sharp short/video! Scroll down to preview, download, or generate its caption.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Mix error: {exc}")
 
     with right_col:
         brief_files = st.file_uploader(
@@ -1594,7 +1782,9 @@ elif page == "Editor & Templates":
         vi = st.session_state.video_info
         dur_ed = max(1.0, float(vi["duration"]))
         if st.session_state.source_video and Path(st.session_state.source_video).exists():
-            st.video(st.session_state.source_video)
+            size_ed_mb = round((vi.get("size") or Path(st.session_state.source_video).stat().st_size) / (1024 * 1024), 1)
+            if size_ed_mb < 600:
+                st.video(st.session_state.source_video)
         a, b = st.columns(2)
         with a:
             start = st.number_input("Start (seconds)", min_value=0.0, max_value=max(0.5, dur_ed - 0.5), value=0.0, step=0.5, key="ed_start_sec")
