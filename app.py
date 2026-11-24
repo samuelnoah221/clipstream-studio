@@ -75,6 +75,13 @@ FIT_MODES = [
     "Letterbox Fit",
 ]
 
+CAPTION_STYLES = [
+    "Hook / Viral",
+    "Engaging / Story",
+    "Short & Punchy",
+    "Campaign / CTA",
+]
+
 
 # ----------------------------- CORE HELPERS -----------------------------
 def run_cmd(args: list[str], timeout: int | None = None) -> subprocess.CompletedProcess[str]:
@@ -155,7 +162,6 @@ def build_zip_bytes(items: list[tuple[str, str]]) -> bytes:
 
 # ----------------------------- WORKSPACE & IP / ACCOUNT SAVE ---------
 def detect_client_ip() -> str:
-    """Best-effort client IP from Streamlit headers with demo fallback."""
     try:
         headers = getattr(st.context, "headers", None)
         if headers:
@@ -343,7 +349,6 @@ def load_workspace_state(ws_key: str) -> bool:
 
 
 def attach_uploader_percentage_bar(max_mb: int = 2048):
-    """Attaches a live 0-100% file-read meter directly to Streamlit's st.file_uploader input."""
     components.html(
         f"""
         <div id="cs_pct_box" style="font-family:system-ui,-apple-system,sans-serif;background:#151b29;border:1px solid #2b354b;border-radius:12px;padding:11px 13px;color:#f4f5fa;">
@@ -489,7 +494,6 @@ def probe_video(path: str) -> dict:
 
 
 def break_video_into_parts(source: str, duration: float, num_parts: int) -> list[dict]:
-    """Breaks a video into 3 or 5 parts quickly via stream copy with safe re-encode fallback."""
     src_path = Path(source)
     if not src_path.exists():
         raise RuntimeError("Source video file is missing.")
@@ -575,7 +579,6 @@ def get_openai_client():
 
 
 def synthesize_voiceover_file(script_text: str) -> Path | None:
-    """Generates a voiceover audio file inside the active workspace if a voice engine or API is available."""
     clean_txt = re.sub(r"\s+", " ", (script_text or "").strip())
     if not clean_txt:
         return None
@@ -765,7 +768,6 @@ def build_stitched_peak_moments(
     transcript: dict | None = None,
     seed_offset: int = 0,
 ) -> list[dict]:
-    """Picks 3-4 short peak sub-moments across the video whose durations sum to desired_minutes."""
     total_target = round(max(1.0, min(duration, minutes_to_seconds(desired_minutes))), 1)
     if duration <= 1.0 or total_target <= 0:
         end_s = round(max(0.5, duration), 1)
@@ -838,7 +840,6 @@ def build_auto_clip_candidates(
     desired_minutes: float,
     used_windows: list[list[float]],
 ) -> list[dict]:
-    """Builds stitched multi-moment auto clip candidates (each clip joins multiple peak spots)."""
     count = max(1, min(6, int(clip_count)))
     results: list[dict] = []
     combined_used = list(used_windows)
@@ -915,9 +916,9 @@ def heuristic_campaign_analysis(brief: str, project_name: str) -> dict:
         "campaign_name": project_name.strip() or "Campaign Brief",
         "plain_english_summary": (
             f"Campaign across {', '.join(platforms)} ({len(lines)} brief line(s)). "
-            f"Full-frame 9:16 fit + multi-moment peak stitching + optional Section 5 English burn-in subtitles + Stage 6 voiceover ready."
+            f"Section 3 stitches clips → Section 4 gives instant download & multi-style captions → Section 5 optional English subtitles & Stage 6 voiceover."
         ),
-        "deliverables": ["Multi-moment peak stitch clips with optional English subtitles & voiceover for YouTube, IG & Facebook"],
+        "deliverables": ["Multi-moment peak stitch clips with multi-style captions & instant download"],
         "platforms": platforms,
         "requires_onscreen_captions": wants_onscreen_captions,
         "requires_8s_hook": wants_8s_hook,
@@ -933,8 +934,8 @@ def heuristic_campaign_analysis(brief: str, project_name: str) -> dict:
         "assets_to_request": [],
         "unclear_or_conflicting_points": [] if len(brief.strip()) >= 30 else ["Brief is short—add more details on hooks, captions, or rules for sharper campaign alignment."],
         "pre_publish_checklist": [
-            "Confirm full video fits inside 9:16 cleanly with non-blocking English subtitles & hook",
-            "Verify peak moments are stitched cleanly into one clip",
+            "Download extracted clips in Section 4 or generate style-specific captions",
+            "Optionally burn Section 5 English subtitles or add Stage 6 voiceover",
             "Check YouTube, Instagram, and Facebook captions/tags",
         ],
     }
@@ -988,7 +989,7 @@ def evaluate_video_against_campaign(analysis: dict, video_info: dict, transcript
     if dur > 0:
         strengths.append(f"Video duration is {dur:.1f}s ({fmt_time(dur)}) at {w}x{h} — clean 9:16 fit + multi-moment stitch ready.")
     if analysis.get("caption_requirements") or analysis.get("hashtags"):
-        strengths.append("Campaign caption/tag requirements detected—YouTube, IG & Facebook copy will incorporate them.")
+        strengths.append("Campaign caption/tag requirements detected—Section 4 copy pack will incorporate them.")
     if analysis.get("requires_8s_hook"):
         strengths.append("8-second hook banner rule detected.")
     elif analysis.get("requires_video_hook"):
@@ -1014,7 +1015,7 @@ def evaluate_video_against_campaign(analysis: dict, video_info: dict, transcript
 
     return {
         "ready": True,
-        "verdict": "Ready for Go-Ahead — 9:16 Fit, Optional English Subtitles & Stage 6 Voiceover Ready",
+        "verdict": "Ready for Go-Ahead — Section 3 Stitch, Section 4 Download & Captions, Section 5 & Stage 6 Ready",
         "strengths": strengths,
         "gaps": gaps,
         "warnings": warnings,
@@ -1127,8 +1128,9 @@ def generate_multi_platform_copy(
     transcript_text: str,
     custom_instructions: str = "",
     clip_index: int = 0,
+    caption_style: str = "Hook / Viral",
 ) -> dict:
-    """Generates tailored copy for YouTube, Instagram, and Facebook for a single clip."""
+    """Generates tailored copy for YouTube, Instagram, and Facebook in the requested caption style."""
     client = get_openai_client()
     tags = (analysis or {}).get("hashtags") or []
     clean_tags = " ".join(t if t.startswith("#") else f"#{t.replace(' ', '')}" for t in tags[:6])
@@ -1152,31 +1154,26 @@ def generate_multi_platform_copy(
     moment_line = transcript_text[:150].strip() if transcript_text.strip() else f"Peak highlights #{clip_index + 1}"
 
     if not client:
-        yt_title = f"{clip_hook or clip_title}{window_label} #Shorts"[:95]
-        yt_desc = (
-            f"{clip_hook or clip_title}{window_label}\n\n"
-            f"Highlights: {moment_line}\n"
-            f"{camp_req_line}\n"
-            f"{'Note: ' + req_note + chr(10) if req_note else ''}\n"
-            f"{clean_tags}"
-        ).strip()
+        if caption_style == "Engaging / Story":
+            lead = f"Story behind {clip_title}{window_label}: {moment_line}"
+            cta_line = "What part stood out most to you? Drop a comment below."
+        elif caption_style == "Short & Punchy":
+            lead = f"{clip_hook or clip_title}{window_label}"
+            cta_line = ""
+        elif caption_style == "Campaign / CTA":
+            lead = f"{clip_hook or clip_title}{window_label} — {camp_req_line or moment_line}"
+            cta_line = "Check the brief link/details and share with someone who needs to see this."
+        else:  # Hook / Viral
+            lead = f"WAIT FOR IT: {clip_hook or clip_title}{window_label} — {moment_line}"
+            cta_line = "Watch till the end and tag your crew."
 
-        ig_caption = (
-            f"{clip_hook or clip_title}\n"
-            f"{moment_line}\n"
-            f"{camp_req_line}\n"
-            f"{'Note: ' + req_note + chr(10) if req_note else ''}\n"
-            f"{clean_tags}"
-        ).strip()
-
-        fb_post = (
-            f"{clip_hook or clip_title}{window_label} — {moment_line}\n\n"
-            f"{camp_req_line}\n"
-            f"{'Note: ' + req_note + chr(10) if req_note else ''}\n"
-            f"{clean_tags}"
-        ).strip()
+        yt_title = f"{clip_hook or clip_title} [{caption_style}] #Shorts"[:95]
+        yt_desc = "\n\n".join([p for p in [lead, cta_line, req_note, clean_tags] if p]).strip()
+        ig_caption = "\n\n".join([p for p in [lead, cta_line, req_note, clean_tags] if p]).strip()
+        fb_post = "\n\n".join([p for p in [lead, cta_line, camp_req_line, req_note, clean_tags] if p]).strip()
 
         return {
+            "caption_style": caption_style,
             "youtube": f"{yt_title}\n\n{yt_desc}",
             "instagram": ig_caption,
             "facebook": fb_post,
@@ -1184,11 +1181,12 @@ def generate_multi_platform_copy(
             "description": yt_desc,
         }
 
-    prompt = f"""You are writing tailored social copy for ONE video clip (Clip #{clip_index + 1}) across THREE platforms:
+    prompt = f"""You are writing tailored social copy for ONE video clip (Clip #{clip_index + 1}) in style "{caption_style}" across THREE platforms:
 1) YouTube (Shorts/Video title + description with searchable keywords & hashtags)
 2) Instagram (Reels/Feed caption with hook, engagement line, and hashtags)
 3) Facebook (Reels/Post caption with conversational framing & hashtags)
 
+CAPTION STYLE: {caption_style}
 THIS CLIP DETAILS:
 {json.dumps(clip_info or {}, ensure_ascii=False)}
 THIS CLIP'S TRANSCRIPT SEGMENTS:
@@ -1209,7 +1207,7 @@ Return ONLY valid JSON:
 """
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
-        temperature=0.55,
+        temperature=0.6,
         response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": "You write distinct, platform-native social copy for YouTube, Instagram, and Facebook."},
@@ -1221,6 +1219,7 @@ Return ONLY valid JSON:
     ig = str(parsed.get("instagram", "")).strip()
     fb = str(parsed.get("facebook", "")).strip()
     return {
+        "caption_style": caption_style,
         "youtube": yt,
         "instagram": ig,
         "facebook": fb,
@@ -1230,7 +1229,6 @@ Return ONLY valid JSON:
 
 
 def normalize_english_subtitle_text(text: str) -> str:
-    """Cleans spoken or scripted text into crisp, readable English subtitle text."""
     cleaned = re.sub(r"[^\x20-\x7E\u2014\u2013\u2018\u2019\u201c\u201d]", " ", str(text or ""))
     cleaned = cleaned.replace("\u2014", " — ").replace("\u2013", " - ")
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
@@ -1238,7 +1236,6 @@ def normalize_english_subtitle_text(text: str) -> str:
 
 
 def wrap_text_lines(text: str, max_chars: int = 26, max_lines: int = 2) -> list[str]:
-    """Wraps text cleanly into bounded lines so neither hooks nor subtitles overflow frame width."""
     words = normalize_english_subtitle_text(text).split()
     if not words:
         return []
@@ -1271,7 +1268,6 @@ def build_caption_cues(
     fallback_text: str = "",
     max_chars: int = 26,
 ) -> list[tuple[float, float, str]]:
-    """Builds time-synced English on-screen subtitle cues matching spoken words inside [start, end]."""
     clip_dur = max(0.5, round(end - start, 2))
     cues: list[tuple[float, float, str]] = []
 
@@ -1333,7 +1329,6 @@ def build_stitched_caption_cues(
     moments: list[dict],
     max_chars: int = 26,
 ) -> list[tuple[float, float, str]]:
-    """Maps spoken English cues across each stitched sub-moment onto the unified concatenated timeline."""
     stitched_cues: list[tuple[float, float, str]] = []
     timeline_offset = 0.0
     for m in moments:
@@ -1358,7 +1353,6 @@ def build_stitched_caption_cues(
 
 
 def write_srt_file(cues: list[tuple[float, float, str]], clip_duration: float, srt_path: Path) -> Path:
-    """Writes valid SRT subtitle blocks clamped cleanly inside [0, clip_duration]."""
     blocks: list[str] = []
     idx = 1
     for c_start, c_end, c_text in cues:
@@ -1432,13 +1426,6 @@ def build_frame_stage_filter(
     out_label: str,
     fit_mode: str = "Fit All (Full Frame + Ambient Blur)",
 ) -> str:
-    """
-    - 'Fit All (Full Frame + Ambient Blur)': fills the full out_w x out_h canvas with a softly blurred
-      background version of the video and overlays 100% of the uncropped frame centered with zero black bars.
-    - 'Fit All (Pure Full Frame)': scales 100% of the frame cleanly to out_w x out_h with zero cropping.
-    - 'Fill & Crop (9:16 Zoom)': scales to fill out_w x out_h and center-crops excess width/height.
-    - 'Letterbox Fit': scales to fit inside out_w x out_h with a dark charcoal pad.
-    """
     if fit_mode == "Fill & Crop (9:16 Zoom)":
         return (
             f"[{in_label}]scale={out_w}:{out_h}:force_original_aspect_ratio=increase:flags=lanczos,"
@@ -1453,7 +1440,6 @@ def build_frame_stage_filter(
         return (
             f"[{in_label}]scale={out_w}:{out_h}:flags=lanczos,setsar=1[{out_label}]"
         )
-    # Default: Fit All (Full Frame + Ambient Blur)
     bg_lbl = f"{out_label}_bg"
     fg_lbl = f"{out_label}_fg"
     return (
@@ -1486,7 +1472,6 @@ def append_overlays_and_subs(
     if sys_font:
         font_opt = f":fontfile='{sys_font}'"
 
-    # Section 5: Non-blocking top hook banner placed high in upper margin
     hook_lines = wrap_text_lines(hook_banner_text, max_chars=24, max_lines=2)
     if hook_lines:
         hook_font_px = max(20, min(36, int(out_h * 0.025)))
@@ -1519,7 +1504,6 @@ def append_overlays_and_subs(
         ]
         current = "vlogo"
 
-    # Section 5: Optional English burn-in subtitles parked cleanly at bottom without blocking action
     if cues:
         if srt_output_path:
             srt_file = write_srt_file(cues, clip_duration, Path(srt_output_path))
@@ -1567,11 +1551,6 @@ def build_audio_stage(
     voiceover_path: str | None = None,
     normalize_audio: bool = False,
 ) -> tuple[str, bool]:
-    """
-    Stage 6 audio builder:
-    - If mute_original is True: silences original video audio and uses voiceover audio (or clean silent track).
-    - If mute_original is False: keeps original video audio and mixes in voiceover if provided.
-    """
     has_vo = bool(voiceover_path and Path(voiceover_path).exists())
     vo_idx = len(inputs)
     if has_vo:
@@ -1717,7 +1696,6 @@ def render_stitched_clip(
     mute_original: bool = False,
     voiceover_path: str | None = None,
 ) -> str | None:
-    """Trims multiple peak moments from source and concatenates them into ONE single clip."""
     if not source or not Path(source).exists():
         raise RuntimeError("Source video file is missing.")
     if not moments:
@@ -1874,13 +1852,13 @@ init_state()
 
 # ----------------------------- HEADER & NAV -----------------------------
 st.markdown(f"""<div class="hero">
-<div style="color:#a5b4fc;font-weight:750;font-size:.76rem;letter-spacing:.13em">YOUTUBE + IG + FACEBOOK · CLEAN 9:16 FIT · SECTION 5 ENGLISH SUBTITLES · STAGE 6 MUTE & VOICEOVER</div>
+<div style="color:#a5b4fc;font-weight:750;font-size:.76rem;letter-spacing:.13em">SECTION 3 STITCH · SECTION 4 CAPTIONS & DOWNLOAD · SECTION 5 ENGLISH SUBTITLES · STAGE 6 VOICEOVER</div>
 <h1>🎬 {APP_NAME}</h1>
-<p class="muted">Full-frame 9:16 fit without black bars or sloppy stretching, multi-moment peak stitching, optional Section 5 English burn-in subtitles, and Stage 6 mute + voiceover inside.</p>
+<p class="muted">Generate stitched clips in Section 3, download right away or generate different kinds of captions in Section 4, and optionally burn English subtitles (Section 5) or add voiceover (Stage 6).</p>
 <span class="pill">Clean 9:16 Fit</span>
+<span class="pill">Section 4: Multi-Style Captions & Download</span>
 <span class="pill">Section 5: Optional English Subtitles</span>
 <span class="pill">Stage 6: Mute & Voiceover Inside</span>
-<span class="pill">Clear & Manage Saved Work</span>
 </div>""", unsafe_allow_html=True)
 
 if not ffmpeg_ready():
@@ -2083,18 +2061,11 @@ if page == "Campaign & Auto-Clipper":
                 key="desired_clip_minutes",
             )
 
-        h_col, cap_col = st.columns(2)
-        with h_col:
-            st.selectbox(
-                "Hook strategy",
-                ["Standard Clip Length (Exact Minutes)", "8-Second Hook Banner (0–8s)", "Video Hook (Opening / Highlight)"],
-                key="hook_mode_choice",
-            )
-        with cap_col:
-            burn_captions_enabled = st.checkbox(
-                "Section 5: Burn-in English subtitles (Optional)",
-                key="burn_subtitles_chk_v2",
-            )
+        st.selectbox(
+            "Hook strategy",
+            ["Standard Clip Length (Exact Minutes)", "8-Second Hook Banner (0–8s)", "Video Hook (Opening / Highlight)"],
+            key="hook_mode_choice",
+        )
 
         pending_scope = st.session_state.get("pending_hook_banner_scope")
         if pending_scope in {"8-Second Top Banner (0–8s)", "Full Clip Top Banner"}:
@@ -2128,7 +2099,7 @@ if page == "Campaign & Auto-Clipper":
                             tr = None
                             if get_openai_client():
                                 try:
-                                    with st.spinner("Transcribing spoken words for optional English subtitles..."):
+                                    with st.spinner("Transcribing spoken words..."):
                                         tr = transcribe_video(st.session_state.source_video)
                                         st.session_state.transcript = tr
                                 except Exception as t_exc:
@@ -2217,15 +2188,14 @@ if page == "Campaign & Auto-Clipper":
         with go_col2:
             if st.session_state.go_ahead_clips:
                 exact_s = minutes_to_seconds(float(st.session_state.auto_clip_minutes))
-                st.success(f"Go-ahead granted! Each stitched clip totals ~{float(st.session_state.auto_clip_minutes):.2f} min ({exact_s:.1f}s) with clean 9:16 fit.")
+                st.success(f"Go-ahead granted! Section 3 will stitch clips totaling ~{float(st.session_state.auto_clip_minutes):.2f} min ({exact_s:.1f}s) with clean 9:16 fit.")
 
-    # Step 3: Auto-Clipper + Section 5 (Optional English Subtitles) + Stage 6 (Mute & Voiceover Inside)
+    # Section 3: Auto-Clipper (Generate / Stitch Clips)
     if st.session_state.go_ahead_clips and st.session_state.video_info and ffmpeg_ready():
         st.divider()
-        st.subheader("Step 3 · Auto-Clipper (Peak Stitch + Clean 9:16 Fit)")
+        st.subheader("Section 3 · Generate & Stitch Peak-Moment Clips")
         vi = st.session_state.video_info
         dur = max(1.0, float(vi["duration"]))
-        use_subs = bool(st.session_state.get("burn_subtitles_chk_v2", False))
 
         ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([1.1, 1.0, 1.2, 1.0])
         with ctrl1:
@@ -2281,7 +2251,7 @@ if page == "Campaign & Auto-Clipper":
         default_asp = default_aspect_for_platform(st.session_state.target_platform_choice)
         st.caption(
             f"Each clip stitches peak sub-moments summing to **{active_minutes:.2f} min ({exact_target_sec:.1f}s)** · "
-            f"Aspect: **{default_asp}**."
+            f"Aspect: **{default_asp}**. Extracted clips appear in **Section 4** right below for instant download & captions."
         )
 
         cands = st.session_state.auto_candidates or build_auto_clip_candidates(
@@ -2314,72 +2284,6 @@ if page == "Campaign & Auto-Clipper":
         with q_col4:
             encode_preset = st.selectbox("Encode speed", ["ultrafast", "veryfast", "fast"], key="wf_encode_preset")
 
-        # Section 5: Optional English Burn-In Subtitles
-        with st.container(border=True):
-            st.markdown("### Section 5 · Optional English Burn-In Subtitles (Non-Blocking)")
-            s5_c1, s5_c2, s5_c3 = st.columns([1.3, 1.0, 1.2])
-            with s5_c1:
-                use_subs = st.checkbox(
-                    "Enable Burn-In Subtitles (Optional)",
-                    key="burn_subtitles_chk_v2",
-                )
-            with s5_c2:
-                st.selectbox(
-                    "Subtitle Language",
-                    ["English (Default)"],
-                    key="subtitle_language",
-                )
-            with s5_c3:
-                cap_size = st.slider(
-                    "Subtitle size (non-blocking lower zone)",
-                    20, 36, int(st.session_state.onscreen_caption_size),
-                    key="wf_cap_size",
-                )
-            st.caption(
-                "When enabled, English subtitles are generated and burned cleanly in the lower margin without blocking the video or top hook. Leave unchecked for clean un-subtitled clips."
-            )
-
-        # Stage 6: Mute Original Video Override + Voiceover Inside
-        with st.container(border=True):
-            st.markdown("### Stage 6 · Mute Video Override & Voiceover Inside")
-            s6_c1, s6_c2 = st.columns([1.0, 1.4])
-            with s6_c1:
-                mute_orig_wf = st.checkbox(
-                    "Mute original video audio",
-                    key="mute_original_audio",
-                )
-                vo_mode_wf = st.radio(
-                    "Voiceover source inside video",
-                    ["Uploaded Voice Track", "Readout Script / Hook Voiceover"],
-                    key="voiceover_source_mode",
-                )
-            with s6_c2:
-                if vo_mode_wf == "Uploaded Voice Track":
-                    vo_up = st.file_uploader(
-                        "Upload voiceover audio (MP3, WAV, M4A, AAC, OGG)",
-                        type=["mp3", "wav", "m4a", "aac", "ogg"],
-                        key="wf_voiceover_up",
-                    )
-                    if vo_up:
-                        saved_vo = save_upload(vo_up)
-                        st.session_state["voiceover_audio_path"] = str(saved_vo)
-                        st.session_state["voiceover_audio_name"] = vo_up.name
-                    if st.session_state.get("voiceover_audio_path") and Path(st.session_state["voiceover_audio_path"]).exists():
-                        st.caption(f"Active voiceover file: **{st.session_state.get('voiceover_audio_name') or Path(st.session_state['voiceover_audio_path']).name}**")
-                        st.audio(st.session_state["voiceover_audio_path"])
-                else:
-                    vo_script = st.text_area(
-                        "Voiceover script to read inside the video",
-                        key="voiceover_script_text",
-                        height=80,
-                        placeholder="Type what you want read over the muted/clipped video...",
-                    )
-                    render_fast_voice_reader(
-                        vo_script or (st.session_state.brief[:500]),
-                        label="🔊 Preview Voiceover Readout",
-                        uid="stage6_wf_vo",
-                    )
-
         for idx, cand in enumerate(cands):
             moments = cand.get("moments") or build_stitched_peak_moments(
                 duration=dur,
@@ -2399,9 +2303,10 @@ if page == "Campaign & Auto-Clipper":
                 f"Fitted Hook: *{cand.get('hook', '')}*\n\nStitched spots: {chain_str}"
             )
 
-        if st.button("⚡ Run Auto Peak Stitch & Render Clips", type="primary", use_container_width=True, key="wf_extract_clips_btn"):
+        if st.button("⚡ Generate / Stitch Clips in Section 3", type="primary", use_container_width=True, key="wf_extract_clips_btn"):
             try:
-                if use_subs and not st.session_state.transcript and get_openai_client():
+                use_subs_now = bool(st.session_state.get("burn_subtitles_chk_v2", False))
+                if use_subs_now and not st.session_state.transcript and get_openai_client():
                     try:
                         with st.spinner("Transcribing spoken audio for optional English subtitles..."):
                             st.session_state.transcript = transcribe_video(st.session_state.source_video)
@@ -2419,13 +2324,12 @@ if page == "Campaign & Auto-Clipper":
                         gen_vo = synthesize_voiceover_file(script_src)
                         if gen_vo and gen_vo.exists():
                             active_vo_path = str(gen_vo)
-                        else:
-                            st.info("No local/API TTS voice engine found on server—muted/audio mix applied; use Fast Readout button for instant browser voice playback.")
 
                 ws_dir = workspace_dir(st.session_state.get("workspace_key", "default"))
                 rendered_now = []
                 banner_dur = 8.0 if st.session_state.hook_banner_scope.startswith("8-Second") else 9999.0
-                render_prog = st.progress(0, text=f"Rendering stitched clips: 0/{len(cands)}")
+                render_prog = st.progress(0, text=f"Generating clips in Section 3: 0/{len(cands)}")
+                cap_font = int(st.session_state.get("onscreen_caption_size", 28))
 
                 for idx, cand in enumerate(cands):
                     moments = cand.get("moments") or []
@@ -2448,7 +2352,7 @@ if page == "Campaign & Auto-Clipper":
                         transcript=st.session_state.transcript,
                         moments=moments,
                         max_chars=wrap_chars,
-                    ) if use_subs else []
+                    ) if use_subs_now else []
 
                     with st.spinner(f"Stitching {len(moments)} peak moments into Clip {clip_num_global} ({stitched_sec:.1f}s) in {default_asp}..."):
                         saved_srt = render_stitched_clip(
@@ -2464,9 +2368,9 @@ if page == "Campaign & Auto-Clipper":
                             hook_banner_duration=banner_dur,
                             src_w=int(vi.get("width") or 1280),
                             src_h=int(vi.get("height") or 720),
-                            caption_font_size=int(cap_size),
+                            caption_font_size=cap_font,
                             encode_preset=encode_preset,
-                            srt_output_path=str(srt_file) if use_subs else None,
+                            srt_output_path=str(srt_file) if use_subs_now else None,
                             fit_mode=fit_mode,
                             mute_original=bool(st.session_state.get("mute_original_audio", False)),
                             voiceover_path=active_vo_path,
@@ -2495,6 +2399,7 @@ if page == "Campaign & Auto-Clipper":
                         transcript_text=all_spoken,
                         custom_instructions=st.session_state.caption_instructions,
                         clip_index=clip_num_global - 1,
+                        caption_style="Hook / Viral",
                     )
                     rec = {
                         "name": f"{clip_meta['title']} ({default_asp})",
@@ -2515,7 +2420,7 @@ if page == "Campaign & Auto-Clipper":
                     rendered_now.append(rec)
                     render_prog.progress(
                         int(((idx + 1) / max(1, len(cands))) * 100),
-                        text=f"Rendering stitched clips: {idx + 1}/{len(cands)}",
+                        text=f"Generating clips in Section 3: {idx + 1}/{len(cands)}",
                     )
 
                 if rendered_now:
@@ -2530,9 +2435,9 @@ if page == "Campaign & Auto-Clipper":
                         used_windows=st.session_state.used_clip_windows,
                     )
                     save_workspace_state()
-                    st.success(f"Stitched {len(rendered_now)} peak-moment clip(s) at ~{active_minutes:.2f} min each in {default_asp} ({fit_mode}).")
+                    st.success(f"Generated {len(rendered_now)} clip(s) in Section 3. Download directly or generate captions in Section 4 below.")
             except Exception as exc:
-                st.error(f"Auto-clip stitch error: {exc}")
+                st.error(f"Section 3 clip generation error: {exc}")
 
 # ----------------------------- PAGE 2: MANUAL CLIPPER (START -> END) --
 elif page == "Manual Clipper (Start → End)":
@@ -2648,6 +2553,7 @@ elif page == "Manual Clipper (Start → End)":
                         transcript_text=c_meta["transcript_excerpt"],
                         custom_instructions=st.session_state.caption_instructions,
                         clip_index=clip_idx - 1,
+                        caption_style="Hook / Viral",
                     )
                     st.session_state.clips.append({
                         "name": f"{clip_name} ({aspect})", "path": str(out), "srt_path": saved_srt,
@@ -2685,20 +2591,28 @@ elif page == "Brand Kit & Settings":
     else:
         st.info("No OPENAI_API_KEY detected — local campaign/caption fallback mode active.")
 
-# ----------------------------- SHARED GENERATED CLIPS SECTION --------
+# ----------------------------- SECTION 4: EXTRACTED CLIPS & CAPTIONS ---
 if st.session_state.clips:
     st.divider()
-    st.subheader("Generated Clips · YouTube + IG + Facebook Copy Pack")
+    st.subheader("Section 4 · Extracted Clips (Download Now) & Different Kinds of Captions")
+    st.caption("Download any extracted clip right away here, or generate different kinds of captions (Hook / Viral, Engaging / Story, Short & Punchy, Campaign / CTA). Proceeding to Section 5 & Stage 6 is optional.")
+
     st.text_area(
-        "Optional extra caption/CTA note for clips",
+        "Optional extra caption/CTA note for Section 4 captions",
         key="caption_instructions",
-        height=75,
+        height=70,
     )
 
-    act_col1, act_col2, act_col3 = st.columns([1.4, 1.0, 0.8])
-    with act_col1:
-        if st.button("✨ Generate YouTube + IG + Facebook Copy for All Clips", key="gen_all_short_captions_btn", use_container_width=True):
-            with st.spinner("Generating YouTube, Instagram & Facebook copy for each clip..."):
+    sec4_style_col, sec4_gen_col, sec4_zip_col, sec4_clr_col = st.columns([1.0, 1.3, 1.0, 0.8])
+    with sec4_style_col:
+        batch_cap_style = st.selectbox(
+            "Caption kind",
+            CAPTION_STYLES,
+            key="sec4_batch_caption_style",
+        )
+    with sec4_gen_col:
+        if st.button(f"✨ Generate '{batch_cap_style}' Captions for All Clips", key="gen_all_short_captions_btn", use_container_width=True):
+            with st.spinner(f"Generating {batch_cap_style} captions for all clips..."):
                 for i, cl in enumerate(st.session_state.clips):
                     c_meta = cl.get("meta") or {"title": cl["name"], "start": cl["start"], "end": cl["end"]}
                     t_seg = c_meta.get("transcript_excerpt") or transcript_slice(st.session_state.transcript, cl["start"], cl["end"])
@@ -2709,11 +2623,12 @@ if st.session_state.clips:
                         transcript_text=t_seg,
                         custom_instructions=st.session_state.caption_instructions,
                         clip_index=i,
+                        caption_style=batch_cap_style,
                     )
                     st.session_state.clips[i].update(pack)
             save_workspace_state()
-            st.success("Updated YouTube, Instagram & Facebook copy for every clip.")
-    with act_col2:
+            st.success(f"Generated {batch_cap_style} captions for all clips.")
+    with sec4_zip_col:
         short_zip_items = []
         for i, cl in enumerate(st.session_state.clips):
             if Path(cl["path"]).exists():
@@ -2722,14 +2637,14 @@ if st.session_state.clips:
                 short_zip_items.append((f"clip_{i+1}_{safe_name(cl['name'])}.srt", cl["srt_path"]))
         if short_zip_items:
             st.download_button(
-                "📦 Download All Clips & SRTs (.ZIP)",
+                "📦 Download All Clips (.ZIP)",
                 build_zip_bytes(short_zip_items),
-                file_name=f"{safe_name(st.session_state.project_name)}_clips_srt.zip",
+                file_name=f"{safe_name(st.session_state.project_name)}_clips.zip",
                 mime="application/zip",
                 key="wf_dl_all_shorts_zip",
                 use_container_width=True,
             )
-    with act_col3:
+    with sec4_clr_col:
         if st.button("🗑️ Clear All Clips", key="clear_all_clips_btn", use_container_width=True):
             for cl in st.session_state.clips:
                 for k_f in ("path", "srt_path"):
@@ -2761,7 +2676,7 @@ if st.session_state.clips:
                     with dl_c1:
                         with open(cl["path"], "rb") as fh:
                             st.download_button(
-                                f"⬇ Clip {idx+1} (.MP4)",
+                                f"⬇ Download Clip {idx+1} (.MP4)",
                                 fh,
                                 file_name=Path(cl["path"]).name,
                                 mime="video/mp4",
@@ -2780,32 +2695,44 @@ if st.session_state.clips:
                                     use_container_width=True,
                                 )
             with c_cap:
-                st.markdown("**YouTube · Instagram · Facebook Copy**")
-                if st.button(
-                    f"✨ Refresh YT + IG + FB Copy for Clip {idx+1}",
-                    type="primary",
-                    use_container_width=True,
-                    key=f"get_cap_short_{idx}",
-                ):
-                    t_seg = c_meta.get("transcript_excerpt") or transcript_slice(st.session_state.transcript, cl["start"], cl["end"])
-                    with st.spinner(f"Writing YT, IG & FB copy for Clip {idx+1}..."):
-                        pack = generate_multi_platform_copy(
-                            brief=st.session_state.brief,
-                            analysis=st.session_state.brief_analysis,
-                            clip_info=c_meta,
-                            transcript_text=t_seg,
-                            custom_instructions=st.session_state.caption_instructions,
-                            clip_index=idx,
-                        )
-                        st.session_state.clips[idx].update(pack)
-                        save_workspace_state()
+                st.markdown(f"**Clip {idx+1} Captions** · Current kind: `{cl.get('caption_style', 'Hook / Viral')}`")
+                k_col, b_col = st.columns([1.2, 1.3])
+                with k_col:
+                    cur_style_idx = CAPTION_STYLES.index(cl["caption_style"]) if cl.get("caption_style") in CAPTION_STYLES else 0
+                    chosen_style = st.selectbox(
+                        f"Caption kind (Clip {idx+1})",
+                        CAPTION_STYLES,
+                        index=cur_style_idx,
+                        key=f"clip_cap_kind_{idx}",
+                    )
+                with b_col:
+                    st.write("")
+                    if st.button(
+                        f"✨ Generate {chosen_style}",
+                        type="primary",
+                        use_container_width=True,
+                        key=f"get_cap_short_{idx}",
+                    ):
+                        t_seg = c_meta.get("transcript_excerpt") or transcript_slice(st.session_state.transcript, cl["start"], cl["end"])
+                        with st.spinner(f"Writing {chosen_style} copy for Clip {idx+1}..."):
+                            pack = generate_multi_platform_copy(
+                                brief=st.session_state.brief,
+                                analysis=st.session_state.brief_analysis,
+                                clip_info=c_meta,
+                                transcript_text=t_seg,
+                                custom_instructions=st.session_state.caption_instructions,
+                                clip_index=idx,
+                                caption_style=chosen_style,
+                            )
+                            st.session_state.clips[idx].update(pack)
+                            save_workspace_state()
 
                 t_yt, t_ig, t_fb = st.tabs(["YouTube", "Instagram", "Facebook"])
                 with t_yt:
                     yt_val = st.text_area(
                         f"YouTube Title & Description (Clip {idx+1})",
                         value=cl.get("youtube") or cl.get("description", ""),
-                        height=145,
+                        height=135,
                         key=f"yt_area_{idx}",
                     )
                     st.session_state.clips[idx]["youtube"] = yt_val
@@ -2814,7 +2741,7 @@ if st.session_state.clips:
                     ig_val = st.text_area(
                         f"Instagram Caption (Clip {idx+1})",
                         value=cl.get("instagram") or cl.get("caption", ""),
-                        height=145,
+                        height=135,
                         key=f"ig_area_{idx}",
                     )
                     st.session_state.clips[idx]["instagram"] = ig_val
@@ -2823,7 +2750,7 @@ if st.session_state.clips:
                     fb_val = st.text_area(
                         f"Facebook Caption (Clip {idx+1})",
                         value=cl.get("facebook") or cl.get("caption", ""),
-                        height=145,
+                        height=135,
                         key=f"fb_area_{idx}",
                     )
                     st.session_state.clips[idx]["facebook"] = fb_val
@@ -2833,3 +2760,66 @@ if st.session_state.clips:
                     label=f"🔊 Fast Read Clip {idx+1} Copy",
                     uid=f"short_{idx}",
                 )
+
+# ----------------------------- SECTION 5 & STAGE 6 (OPTIONAL NEXT) -----
+st.divider()
+st.subheader("Section 5 · Optional English Burn-In Subtitles (Non-Blocking)")
+s5_c1, s5_c2, s5_c3 = st.columns([1.3, 1.0, 1.2])
+with s5_c1:
+    st.checkbox(
+        "Enable Burn-In Subtitles (Optional)",
+        key="burn_subtitles_chk_v2",
+    )
+with s5_c2:
+    st.selectbox(
+        "Subtitle Language",
+        ["English (Default)"],
+        key="subtitle_language",
+    )
+with s5_c3:
+    st.slider(
+        "Subtitle size (non-blocking lower zone)",
+        20, 36, int(st.session_state.get("onscreen_caption_size", 28)),
+        key="onscreen_caption_size",
+    )
+st.caption("Optional step: when checked, English subtitles are generated and burned cleanly in the lower margin without blocking the video or top hook.")
+
+st.divider()
+st.subheader("Stage 6 · Mute Video Override & Voiceover Inside")
+s6_c1, s6_c2 = st.columns([1.0, 1.4])
+with s6_c1:
+    st.checkbox(
+        "Mute original video audio",
+        key="mute_original_audio",
+    )
+    vo_mode_s6 = st.radio(
+        "Voiceover source inside video",
+        ["Uploaded Voice Track", "Readout Script / Hook Voiceover"],
+        key="voiceover_source_mode",
+    )
+with s6_c2:
+    if vo_mode_s6 == "Uploaded Voice Track":
+        vo_up_s6 = st.file_uploader(
+            "Upload voiceover audio (MP3, WAV, M4A, AAC, OGG)",
+            type=["mp3", "wav", "m4a", "aac", "ogg"],
+            key="s6_voiceover_up",
+        )
+        if vo_up_s6:
+            saved_vo = save_upload(vo_up_s6)
+            st.session_state["voiceover_audio_path"] = str(saved_vo)
+            st.session_state["voiceover_audio_name"] = vo_up_s6.name
+        if st.session_state.get("voiceover_audio_path") and Path(st.session_state["voiceover_audio_path"]).exists():
+            st.caption(f"Active voiceover file: **{st.session_state.get('voiceover_audio_name') or Path(st.session_state['voiceover_audio_path']).name}**")
+            st.audio(st.session_state["voiceover_audio_path"])
+    else:
+        vo_script_s6 = st.text_area(
+            "Voiceover script to read inside the video",
+            key="voiceover_script_text",
+            height=80,
+            placeholder="Type what you want read over the muted/clipped video...",
+        )
+        render_fast_voice_reader(
+            vo_script_s6 or (st.session_state.brief[:500]),
+            label="🔊 Preview Voiceover Readout",
+            uid="stage6_s6_vo",
+        )
