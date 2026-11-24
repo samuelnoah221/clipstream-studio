@@ -53,7 +53,10 @@ def ffmpeg_ready() -> bool:
     return bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
 
 def fmt_time(seconds: float) -> str:
-    return str(timedelta(seconds=max(0, int(seconds))))
+    return str(timedelta(seconds=max(0, int(round(seconds)))))
+
+def minutes_to_seconds(minutes: float) -> float:
+    return round(max(1.0, float(minutes) * 60.0), 1)
 
 def safe_name(value: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "_", value).strip("_")
@@ -62,7 +65,7 @@ def safe_name(value: str) -> str:
 def escape_drawtext(value: str) -> str:
     txt = re.sub(r"\s+", " ", (value or "").strip())
     txt = txt.replace("\\", "\\\\").replace("'", "\u2019").replace(":", "\\:").replace("%", "\\%")
-    return txt[:140]
+    return txt[:120]
 
 def save_upload(uploaded, suffix: str | None = None) -> Path:
     ext = suffix or Path(uploaded.name).suffix.lower() or ".bin"
@@ -131,38 +134,6 @@ def extract_document_text(uploaded) -> str:
         return pytesseract.image_to_string(Image.open(io.BytesIO(raw))).strip()
     raise ValueError("Unsupported file type. Use PDF, DOCX, TXT, MD, CSV or an image.")
 
-def public_http_url(url: str) -> bool:
-    try:
-        parsed = urlparse(url.strip())
-        if parsed.scheme not in ("http", "https") or not parsed.hostname:
-            return False
-        host = parsed.hostname.lower()
-        if host == "localhost" or host.endswith((".local", ".internal")):
-            return False
-        infos = socket.getaddrinfo(host, None)
-        return all(ipaddress.ip_address(x[4][0]).is_global for x in infos)
-    except Exception:
-        return False
-
-def read_public_page(url: str) -> tuple[str, str]:
-    if not public_http_url(url):
-        raise ValueError("Only public HTTP/HTTPS webpages can be read.")
-    import requests
-    from bs4 import BeautifulSoup
-    response = requests.get(url, timeout=20, headers={"User-Agent": "ClipStreamStudio/1.0"}, allow_redirects=True)
-    if not public_http_url(response.url):
-        raise ValueError("The link redirected to a non-public address.")
-    response.raise_for_status()
-    if "text/html" not in response.headers.get("content-type", "").lower():
-        raise ValueError("This link does not return a readable HTML webpage.")
-    soup = BeautifulSoup(response.text, "html.parser")
-    for tag in soup(["script", "style", "noscript", "svg", "nav", "footer"]):
-        tag.decompose()
-    title = soup.title.get_text(" ", strip=True) if soup.title else response.url
-    main = soup.find("main") or soup.find("article") or soup.body or soup
-    content = re.sub(r"\n{3,}", "\n\n", main.get_text("\n", strip=True))
-    return title, content[:35000]
-
 def parse_json_response(content: str) -> dict:
     text = content.strip()
     text = re.sub(r"^```(?:json)?\s*", "", text)
@@ -225,24 +196,22 @@ def overlaps_used(start: float, end: float, used_windows: list[list[float]], min
 
 def pick_fresh_windows(
     duration: float,
-    clip_seconds: float,
+    desired_minutes: float,
     count: int,
     used_windows: list[list[float]],
-    prefer_8s_hook: bool = False,
     transcript: dict | None = None,
 ) -> list[tuple[float, float, str]]:
-    """Pick 1-2 windows of desired length without repeating previously used ranges when possible."""
+    """Pick 1-2 windows matching the exact requested minute length without repeating prior ranges."""
     if duration <= 0:
         return []
     count = max(1, min(2, int(count)))
-    target_len = 8.0 if prefer_8s_hook else max(2.0, min(duration, float(clip_seconds)))
-    target_len = min(duration, target_len)
+    exact_len = round(min(duration, minutes_to_seconds(desired_minutes)), 1)
 
-    max_start = max(0.0, duration - target_len)
+    max_start = round(max(0.0, duration - exact_len), 1)
     if max_start <= 0.0:
         anchors = [0.0]
     else:
-        fractions = [0.12, 0.34, 0.58, 0.78, 0.22, 0.68, 0.0, 0.90]
+        fractions = [0.10, 0.32, 0.56, 0.78, 0.22, 0.66, 0.0, 0.90]
         random.shuffle(fractions)
         anchors = [round(max(0.0, min(max_start, f * max_start)), 1) for f in fractions]
         for _ in range(8):
@@ -263,7 +232,7 @@ def pick_fresh_windows(
         if len(picked) >= count:
             break
         s_val = round(max(0.0, min(max_start, anc)), 1)
-        e_val = round(min(duration, s_val + target_len), 1)
+        e_val = round(min(duration, s_val + exact_len), 1)
         if e_val <= s_val:
             continue
         if not overlaps_used(s_val, e_val, combined_used, min_gap=2.0):
@@ -275,7 +244,7 @@ def pick_fresh_windows(
             if len(picked) >= count:
                 break
             s_val = round(max(0.0, min(max_start, anc)), 1)
-            e_val = round(min(duration, s_val + target_len), 1)
+            e_val = round(min(duration, s_val + exact_len), 1)
             if e_val <= s_val:
                 continue
             if any(abs(s_val - ps) < 1.5 and abs(e_val - pe) < 1.5 for ps, pe, _ in picked):
@@ -322,7 +291,7 @@ def heuristic_campaign_analysis(brief: str, project_name: str) -> dict:
             f"On-screen captions: {'Required' if wants_onscreen_captions else 'Optional'}. "
             f"Hook rule: {'8-second hook' if wants_8s_hook else ('Video hook' if wants_video_hook else 'Standard opening')}."
         ),
-        "deliverables": ["1 to 2 clips of custom length tailored to target platform"],
+        "deliverables": ["1 to 2 clips matching your selected minute length"],
         "platforms": platforms,
         "requires_onscreen_captions": wants_onscreen_captions,
         "requires_8s_hook": wants_8s_hook,
@@ -338,9 +307,9 @@ def heuristic_campaign_analysis(brief: str, project_name: str) -> dict:
         "assets_to_request": [],
         "unclear_or_conflicting_points": [] if len(brief.strip()) >= 30 else ["Brief is short—add more details on hooks, on-screen captions, or rules for sharper alignment."],
         "pre_publish_checklist": [
-            "Confirm top hook banner is clear (8s or full clip)",
-            "Verify lower-third visible captions are legible and accurate",
-            "Check no prohibited terms or visuals appear",
+            "Confirm clip duration matches selected minutes",
+            "Verify lower-third captions sit cleanly near the bottom without blocking action",
+            "Check video sharpness and audio clarity",
         ],
     }
 
@@ -387,22 +356,22 @@ def evaluate_video_against_campaign(analysis: dict, video_info: dict, transcript
     w = int(video_info.get("width", 0) or 0)
     h = int(video_info.get("height", 0) or 0)
     if dur > 0:
-        strengths.append(f"Video duration is {dur:.1f}s ({fmt_time(dur)}) at {w}x{h} (sharp rendering preserves detail or better).")
+        strengths.append(f"Video duration is {dur:.1f}s ({fmt_time(dur)}) at {w}x{h}.")
     if dur < 8:
-        gaps.append("Source video is under 8 seconds; an 8s hook will use the full available clip length.")
+        gaps.append("Source video is under 8 seconds; hook banner timing will clamp to available clip length.")
     if analysis.get("requires_onscreen_captions"):
-        strengths.append("Campaign asks for visible on-screen captions/writing — lower-third captions are enabled.")
+        strengths.append("Lower-third captions enabled with clean bottom placement.")
     if analysis.get("requires_8s_hook"):
-        strengths.append("Campaign asks for an 8-second hook — 8s top hook banner mode is ready.")
+        strengths.append("8-second hook banner rule detected.")
     elif analysis.get("requires_video_hook"):
-        strengths.append("Campaign asks for a video hook — top hook banner framing is ready.")
+        strengths.append("Video hook banner framing ready.")
 
     must_items = analysis.get("must_include", []) or []
     req_scenes = analysis.get("required_scenes_or_moments", []) or []
     t_text = ((transcript or {}).get("text") or "").lower()
 
     if transcript and t_text.strip():
-        strengths.append(f"Speech transcript captured ({len(t_text.split())} words) for lower-third captions & timing.")
+        strengths.append(f"Speech transcript captured ({len(t_text.split())} words) for timed lower-third captions.")
         for req in (must_items + req_scenes)[:5]:
             key_words = [kw for kw in re.findall(r"[a-z]{4,}", req.lower()) if kw not in {"with", "from", "that", "this", "your", "show", "must", "include", "hook", "caption"}]
             if key_words and any(kw in t_text for kw in key_words[:4]):
@@ -410,7 +379,7 @@ def evaluate_video_against_campaign(analysis: dict, video_info: dict, transcript
             else:
                 gaps.append(f"Verify spoken/visual coverage for requirement: {req}")
     else:
-        gaps.append("No speech transcript yet—you can still pick fresh video segments of your chosen length and add custom hook/caption text.")
+        gaps.append("No speech transcript yet—you can still extract exact minute-length segments and add custom hook/caption text.")
 
     return {
         "ready": True,
@@ -448,7 +417,7 @@ def transcribe_video(video_path: str) -> dict:
     finally:
         audio_path.unlink(missing_ok=True)
 
-def make_contact_sheet(video_path: str, duration: float, max_frames: int = 12) -> Path:
+def make_contact_sheet(video_path: str, duration: float, max_frames: int = 9) -> Path:
     from PIL import Image, ImageDraw
     count = max(1, min(max_frames, int(duration // 12) + 1))
     interval = max(1.0, duration / count)
@@ -493,18 +462,13 @@ def build_non_repeating_candidates(
     clip_count: int,
     desired_minutes: float,
     used_windows: list[list[float]],
-    hook_mode: str = "Auto (8s if requested by campaign)",
 ) -> list[dict]:
     count = max(1, min(2, int(clip_count)))
-    prefer_8s = ("8s" in hook_mode) or ("8s hook" in brief.lower() or "8-second hook" in brief.lower())
-    clip_seconds = 8.0 if prefer_8s else max(3.0, float(desired_minutes) * 60.0)
-
     fresh_slots = pick_fresh_windows(
         duration=duration,
-        clip_seconds=clip_seconds,
+        desired_minutes=desired_minutes,
         count=count,
         used_windows=used_windows,
-        prefer_8s_hook=prefer_8s,
         transcript=transcript,
     )
 
@@ -516,7 +480,7 @@ def build_non_repeating_candidates(
             t_lines = [f"[{float(s.get('start',0)):.1f}-{float(s.get('end',0)):.1f}] {s.get('text','')}" for s in segs]
             t_text = "\n".join(t_lines)[:18000] or (transcript or {}).get("text", "")[:18000]
             img_b64 = base64.b64encode(contact_sheet.read_bytes()).decode("utf-8")
-            prompt = f"""Given target platform {target_platform}, clip duration ~{clip_seconds:.1f}s ({desired_minutes:.2f} min), and previously used ranges {used_windows},
+            prompt = f"""Given target platform {target_platform}, exact requested clip duration {desired_minutes:.2f} min ({minutes_to_seconds(desired_minutes):.1f}s), and previously used ranges {used_windows},
 write short titles and hooks for {count} fresh clip(s). Return ONLY JSON:
 {{"items":[{{"title":"short title","reason":"why it fits","campaign_match":"brief match","hook":"short hook banner text","confidence":"high|medium|low"}}]}}
 BRIEF: {brief[:8000]}
@@ -537,15 +501,15 @@ TRANSCRIPT: {t_text}
     results = []
     for idx, (s_sec, e_sec, spoken_txt) in enumerate(fresh_slots):
         ai_m = ai_meta_list[idx] if idx < len(ai_meta_list) else {}
-        dur_actual = max(0.5, e_sec - s_sec)
+        dur_actual = round(max(0.5, e_sec - s_sec), 1)
         results.append({
-            "title": ai_m.get("title") or f"{target_platform} Pick #{len(used_windows) + idx + 1} ({dur_actual/60:.2f}m)",
+            "title": ai_m.get("title") or f"{target_platform} Pick #{len(used_windows) + idx + 1} ({desired_minutes:.2f}m)",
             "start": s_sec,
             "end": e_sec,
             "target_platform": target_platform,
-            "reason": spoken_txt[:150] if spoken_txt else (ai_m.get("reason") or f"Fresh {dur_actual:.1f}s segment starting at {s_sec:.1f}s (no prior overlap)."),
-            "campaign_match": ai_m.get("campaign_match") or "Non-repeating segment matched to requested length",
-            "hook": ai_m.get("hook") or (spoken_txt[:80] if spoken_txt else "Don't miss this part!"),
+            "reason": spoken_txt[:150] if spoken_txt else (ai_m.get("reason") or f"Exact {desired_minutes:.2f} min ({dur_actual:.1f}s) segment starting at {s_sec:.1f}s."),
+            "campaign_match": ai_m.get("campaign_match") or f"Exact {desired_minutes:.2f}m non-repeating segment",
+            "hook": ai_m.get("hook") or (spoken_txt[:70] if spoken_txt else "Watch this moment"),
             "risk": "",
             "confidence": ai_m.get("confidence") or "high",
         })
@@ -607,6 +571,26 @@ Return ONLY valid JSON:
         "description": str(parsed.get("description", "")).strip(),
     }
 
+def wrap_caption_lines(text: str, max_chars: int = 38, max_lines: int = 2) -> str:
+    words = re.sub(r"\s+", " ", (text or "").strip()).split()
+    if not words:
+        return ""
+    lines: list[str] = []
+    cur = ""
+    for w in words:
+        candidate = f"{cur} {w}".strip() if cur else w
+        if len(candidate) <= max_chars:
+            cur = candidate
+        else:
+            if cur:
+                lines.append(cur)
+            cur = w[:max_chars]
+            if len(lines) >= max_lines:
+                break
+    if cur and len(lines) < max_lines:
+        lines.append(cur)
+    return "\n".join(lines[:max_lines])
+
 def build_lower_third_srt(
     transcript: dict | None,
     start: float,
@@ -628,23 +612,33 @@ def build_lower_third_srt(
         a, b = float(seg.get("start", 0)), float(seg.get("end", 0))
         if b <= start or a >= end:
             continue
-        text = re.sub(r"\s+", " ", str(seg.get("text", ""))).strip()
-        if not text:
+        wrapped = wrap_caption_lines(str(seg.get("text", "")), max_chars=38, max_lines=2)
+        if not wrapped:
             continue
         rel_a = max(0.0, a - start)
         rel_b = min(clip_dur, b - start)
         if rel_b <= rel_a + 0.15:
             continue
-        rows.append(f"{idx}\n{stamp(rel_a)} --> {stamp(rel_b)}\n{text}\n")
+        rows.append(f"{idx}\n{stamp(rel_a)} --> {stamp(rel_b)}\n{wrapped}\n")
         idx += 1
 
     if not rows:
         fb = re.sub(r"\s+", " ", (fallback_caption_text or "").strip())
         if fb:
-            chunks = [fb[i:i+85] for i in range(0, min(len(fb), 340), 85)]
+            words = fb.split()
+            chunks = []
+            buf = []
+            for w in words:
+                buf.append(w)
+                if len(" ".join(buf)) >= 68:
+                    chunks.append(wrap_caption_lines(" ".join(buf), max_chars=38, max_lines=2))
+                    buf = []
+            if buf:
+                chunks.append(wrap_caption_lines(" ".join(buf), max_chars=38, max_lines=2))
+            chunks = [c for c in chunks if c][:4]
             step = clip_dur / max(1, len(chunks))
             for i, ch in enumerate(chunks):
-                rows.append(f"{idx}\n{stamp(i * step)} --> {stamp((i + 1) * step)}\n{ch.strip()}\n")
+                rows.append(f"{idx}\n{stamp(i * step)} --> {stamp((i + 1) * step)}\n{ch}\n")
                 idx += 1
 
     return "\n".join(rows)
@@ -655,22 +649,25 @@ def resolve_sharp_dimensions(
     src_w: int,
     src_h: int,
 ) -> tuple[str | None, str | None, int, int]:
+    src_w = max(2, int(src_w or 1920))
+    src_h = max(2, int(src_h or 1080))
+
     aspect_crops = {
-        "9:16 Vertical": "crop=ih*9/16:ih",
-        "16:9 Landscape": "crop=iw:iw*9/16",
-        "1:1 Square": r"crop=min(iw\,ih):min(iw\,ih)",
-        "4:5 Portrait": "crop=ih*4/5:ih",
+        "9:16 Vertical": f"crop='min(iw\\,ih*9/16)':'min(ih\\,iw*16/9)'",
+        "16:9 Landscape": f"crop='min(iw\\,ih*16/9)':'min(ih\\,iw*9/16)'",
+        "1:1 Square": "crop='min(iw\\,ih)':'min(iw\\,ih)'",
+        "4:5 Portrait": f"crop='min(iw\\,ih*4/5)':'min(ih\\,iw*5/4)'",
         "Keep original": None,
     }
     crop = aspect_crops.get(aspect)
 
     if aspect == "9:16 Vertical":
-        cw, ch = int(src_h * 9 / 16), src_h
+        cw, ch = min(src_w, int(src_h * 9 / 16)), min(src_h, int(src_w * 16 / 9))
         default_4k = (2160, 3840)
         default_1k = (1080, 1920)
         default_720 = (720, 1280)
     elif aspect == "16:9 Landscape":
-        cw, ch = src_w, int(src_w * 9 / 16)
+        cw, ch = min(src_w, int(src_h * 16 / 9)), min(src_h, int(src_w * 9 / 16))
         default_4k = (3840, 2160)
         default_1k = (1920, 1080)
         default_720 = (1280, 720)
@@ -681,7 +678,7 @@ def resolve_sharp_dimensions(
         default_1k = (1080, 1080)
         default_720 = (720, 720)
     elif aspect == "4:5 Portrait":
-        cw, ch = int(src_h * 4 / 5), src_h
+        cw, ch = min(src_w, int(src_h * 4 / 5)), min(src_h, int(src_w * 5 / 4))
         default_4k = (2160, 2700)
         default_1k = (1080, 1350)
         default_720 = (720, 900)
@@ -694,7 +691,9 @@ def resolve_sharp_dimensions(
     cw = max(2, cw - (cw % 2))
     ch = max(2, ch - (ch % 2))
 
-    if resolution == "Source or Better (Auto Sharp)":
+    if resolution == "Match Source (Zero Resize Loss)":
+        tw, th = cw, ch
+    elif resolution == "Source or Better (Auto Sharp)":
         if max(cw, ch) >= 1080:
             tw, th = cw, ch
         else:
@@ -708,6 +707,8 @@ def resolve_sharp_dimensions(
     else:
         tw, th = cw, ch
 
+    tw = max(2, tw - (tw % 2))
+    th = max(2, th - (th % 2))
     return crop, f"{tw}:{th}", tw, th
 
 def render_video(
@@ -724,73 +725,85 @@ def render_video(
     hook_banner_duration: float = 8.0,
     src_w: int = 1920,
     src_h: int = 1080,
-    caption_font_size: int = 24,
+    caption_font_size: int = 16,
+    encode_preset: str = "slow",
 ):
     if not source or not Path(source).exists():
         raise RuntimeError("Source video file is no longer in temporary storage. Please re-upload and load your video.")
 
+    clip_duration = max(0.5, round(float(end) - float(start), 1))
     crop, dims, out_w, out_h = resolve_sharp_dimensions(aspect, resolution, src_w, src_h)
-    filters = []
+
+    graph: list[str] = []
+    current = "0:v"
+
     if crop:
-        filters.append(crop)
-    if dims:
-        filters += [
-            f"scale={dims}:force_original_aspect_ratio=decrease:flags=lanczos",
-            f"pad={dims}:(ow-iw)/2:(oh-ih)/2:black",
-        ]
-    filters.append("unsharp=5:5:0.55:3:3:0.25")
+        graph.append(f"[{current}]{crop},setsar=1[vcrop]")
+        current = "vcrop"
 
-    vf = ",".join(filters) if filters else "null"
-    args = ["ffmpeg", "-y", "-ss", str(start), "-i", source]
-    has_logo = bool(logo and Path(logo).exists())
-    if has_logo:
-        args += ["-i", logo]
+    if dims and (out_w != src_w or out_h != src_h or crop):
+        graph.append(
+            f"[{current}]scale={dims}:flags=lanczos[vscale]"
+        )
+        current = "vscale"
 
-    graph = [f"[0:v]{vf}[v0]"]
-    current = "v0"
+    # Light, clean sharpening that preserves crisp edges without ringing or noise
+    graph.append(f"[{current}]unsharp=5:5:0.35:3:3:0.15[vsharp]")
+    current = "vsharp"
 
     clean_hook = escape_drawtext(hook_banner_text)
     if clean_hook:
-        hook_font_px = max(22, int(out_h * 0.032))
-        box_h = max(46, int(hook_font_px * 1.9))
-        top_y = max(24, int(out_h * 0.06))
-        clip_span = max(1.0, end - start)
-        active_end = min(clip_span, max(1.5, float(hook_banner_duration)))
+        hook_font_px = max(16, int(out_h * 0.022))
+        box_h = max(34, int(hook_font_px * 1.75))
+        top_y = max(18, int(out_h * 0.04))
+        active_end = min(clip_duration, max(1.0, float(hook_banner_duration)))
         draw_hook = (
-            f"[{current}]drawbox=x=0:y={top_y - 8}:w=iw:h={box_h}:color=black@0.72:t=fill:"
+            f"[{current}]drawbox=x=0:y={top_y - 5}:w=iw:h={box_h}:color=black@0.62:t=fill:"
             f"enable='between(t,0,{active_end:.2f})',"
             f"drawtext=text='{clean_hook}':fontcolor=white:fontsize={hook_font_px}:"
-            f"x=(w-text_w)/2:y={top_y + (box_h - hook_font_px)//2 - 8}:"
-            f"shadowcolor=black@0.85:shadowx=2:shadowy=2:"
+            f"x=(w-text_w)/2:y={top_y + (box_h - hook_font_px)//2 - 5}:"
+            f"shadowcolor=black@0.85:shadowx=1:shadowy=1:"
             f"enable='between(t,0,{active_end:.2f})'[vhook]"
         )
         graph.append(draw_hook)
         current = "vhook"
 
+    has_logo = bool(logo and Path(logo).exists())
     if has_logo:
-        graph += ["[1:v]scale=iw*0.16:-1:flags=lanczos[logo]", f"[{current}][logo]overlay=W-w-24:24:format=auto[vlogo]"]
+        graph += [
+            "[1:v]scale=iw*0.14:-1:flags=lanczos[logo]",
+            f"[{current}][logo]overlay=W-w-20:20:format=auto[vlogo]"
+        ]
         current = "vlogo"
 
     if srt and Path(srt).exists():
         srt_path = Path(srt).resolve().as_posix().replace(":", "\\:")
+        # Normal compact lower-third subtitle near the bottom so video stays clear
+        normal_font_px = max(12, min(22, int(caption_font_size)))
+        margin_v = max(22, int(out_h * 0.035))
         style = (
-            f"Alignment=2,FontSize={int(caption_font_size)},PrimaryColour=&H00FFFFFF,"
-            "OutlineColour=&H00000000,BackColour=&H88000000,BorderStyle=3,Outline=2,Shadow=1,MarginV=48"
+            f"Alignment=2,FontName=Arial,FontSize={normal_font_px},"
+            "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
+            f"BorderStyle=1,Outline=1.5,Shadow=1,MarginV={margin_v},MarginL=28,MarginR=28"
         )
         graph.append(f"[{current}]subtitles='{srt_path}':force_style='{style}'[vout]")
         current = "vout"
+
+    args = ["ffmpeg", "-y", "-ss", str(round(float(start), 2)), "-i", source]
+    if has_logo:
+        args += ["-i", logo]
 
     args += [
         "-filter_complex", ";".join(graph),
         "-map", f"[{current}]",
         "-map", "0:a?",
-        "-t", str(max(0.5, end - start)),
+        "-t", str(clip_duration),
         "-c:v", "libx264",
-        "-preset", "medium",
-        "-crf", str(crf),
+        "-preset", encode_preset,
+        "-crf", str(int(crf)),
         "-pix_fmt", "yuv420p",
         "-c:a", "aac",
-        "-b:a", "192k",
+        "-b:a", "256k",
         "-movflags", "+faststart",
         output
     ]
@@ -809,10 +822,10 @@ def init_state():
         "desired_clip_minutes": 0.50,
         "step3_clip_minutes": 0.50,
         "used_clip_windows": [],
-        "hook_mode_choice": "Auto (8s if requested by campaign)",
+        "hook_mode_choice": "Standard Clip Length (Exact Minutes)",
         "hook_banner_scope": "8-Second Top Banner (0–8s)",
         "burn_onscreen_captions": True,
-        "onscreen_caption_size": 24,
+        "onscreen_caption_size": 16,
         "source_video": None,
         "video_name": None,
         "video_info": None,
@@ -836,13 +849,13 @@ init_state()
 
 # ----------------------------- HEADER & NAV -----------------------------
 st.markdown(f"""<div class="hero">
-<div style="color:#a5b4fc;font-weight:750;font-size:.76rem;letter-spacing:.13em">CAMPAIGN INTELLIGENCE · CUSTOM MINUTE LENGTHS · NON-REPEATING PICKS · TOP HOOK & LOWER-THIRD CAPTIONS</div>
+<div style="color:#a5b4fc;font-weight:750;font-size:.76rem;letter-spacing:.13em">EXACT MINUTE DURATION · NON-REPEATING PICKS · COMPACT BOTTOM CAPTIONS · HIGH-SHARPNESS ENCODE</div>
 <h1>🎬 {APP_NAME}</h1>
-<p class="muted">Pick desired clip length in minutes + varied start points with zero repeat picks across runs $\rightarrow$ top hook banner + lower-third captions $\rightarrow$ caption/description + fast readout.</p>
-<span class="pill">Length in minutes</span>
+<p class="muted">Exact minute-length clips + varied start points with zero repeat picks across runs $\rightarrow$ subtle top hook + compact lower-third captions $\rightarrow$ caption/description + fast readout.</p>
+<span class="pill">Exact minutes</span>
 <span class="pill">No repeat picks</span>
-<span class="pill">Top hook + lower-third captions</span>
-<span class="pill">Fast voice readout</span>
+<span class="pill">Compact bottom captions</span>
+<span class="pill">Crisp high-bitrate output</span>
 </div>""", unsafe_allow_html=True)
 
 if not ffmpeg_ready():
@@ -918,7 +931,7 @@ if page == "Campaign & Clip Workflow":
             "Paste campaign requirements",
             key="brief",
             height=175,
-            placeholder="Example: Post on YouTube and Instagram. Include an 8-second hook, visible caption reading on screen, and CTA to check the link."
+            placeholder="Example: Post on YouTube and Instagram. Include a clean opening hook, readable bottom captions, and CTA to check the link."
         )
 
         p_col, c_col, min_col = st.columns(3)
@@ -943,12 +956,12 @@ if page == "Campaign & Clip Workflow":
         with h_col:
             st.selectbox(
                 "Hook strategy",
-                ["Auto (8s if requested by campaign)", "8-Second Hook (8s)", "Video Hook (Opening / Highlight)"],
+                ["Standard Clip Length (Exact Minutes)", "8-Second Hook Banner (0–8s)", "Video Hook (Opening / Highlight)"],
                 key="hook_mode_choice"
             )
         with cap_col:
             st.checkbox(
-                "Visible lower-third captions on video",
+                "Compact bottom captions on video",
                 key="burn_onscreen_captions"
             )
 
@@ -971,7 +984,6 @@ if page == "Campaign & Clip Workflow":
                         if analysis.get("requires_onscreen_captions"):
                             st.session_state.burn_onscreen_captions = True
                         if analysis.get("requires_8s_hook"):
-                            st.session_state.hook_mode_choice = "8-Second Hook (8s)"
                             st.session_state.hook_banner_scope = "8-Second Top Banner (0–8s)"
                         elif analysis.get("requires_video_hook"):
                             st.session_state.hook_banner_scope = "Full Clip Top Banner"
@@ -992,7 +1004,6 @@ if page == "Campaign & Clip Workflow":
                                 clip_count=st.session_state.desired_clip_count,
                                 desired_minutes=float(st.session_state.desired_clip_minutes),
                                 used_windows=st.session_state.used_clip_windows,
-                                hook_mode=st.session_state.hook_mode_choice,
                             )
                             st.session_state.campaign_feedback = evaluate_video_against_campaign(
                                 analysis, st.session_state.video_info, st.session_state.transcript
@@ -1056,14 +1067,14 @@ if page == "Campaign & Clip Workflow":
                         clip_count=st.session_state.desired_clip_count,
                         desired_minutes=float(st.session_state.step3_clip_minutes),
                         used_windows=st.session_state.used_clip_windows,
-                        hook_mode=st.session_state.hook_mode_choice,
                     )
                 st.session_state.go_ahead_clips = True
                 st.rerun()
 
         with go_col2:
             if st.session_state.go_ahead_clips:
-                st.success(f"Go-ahead granted! Target clip length: {float(st.session_state.step3_clip_minutes):.2f} min ({float(st.session_state.step3_clip_minutes)*60:.0f}s).")
+                exact_s = minutes_to_seconds(float(st.session_state.step3_clip_minutes))
+                st.success(f"Go-ahead granted! Exact clip duration: {float(st.session_state.step3_clip_minutes):.2f} min ({exact_s:.1f}s).")
 
     # Step 3: 1-2 Non-Repeating Clip Extraction
     if st.session_state.go_ahead_clips and st.session_state.video_info and ffmpeg_ready():
@@ -1075,13 +1086,14 @@ if page == "Campaign & Clip Workflow":
         ctrl1, ctrl2, ctrl3 = st.columns([1.2, 1.2, 1])
         with ctrl1:
             st.number_input(
-                "Adjust clip length (minutes)",
+                "Exact clip length (minutes)",
                 min_value=0.10,
                 max_value=15.0,
                 step=0.25,
                 key="step3_clip_minutes"
             )
         active_minutes = float(st.session_state.step3_clip_minutes)
+        exact_target_sec = round(min(dur, minutes_to_seconds(active_minutes)), 1)
 
         with ctrl2:
             if st.button("🔄 Pick Fresh Non-Repeating Spots", use_container_width=True, key="pick_fresh_spots_btn"):
@@ -1094,7 +1106,6 @@ if page == "Campaign & Clip Workflow":
                     clip_count=st.session_state.desired_clip_count,
                     desired_minutes=active_minutes,
                     used_windows=st.session_state.used_clip_windows,
-                    hook_mode=st.session_state.hook_mode_choice,
                 )
                 st.rerun()
         with ctrl3:
@@ -1109,10 +1120,10 @@ if page == "Campaign & Clip Workflow":
                     clip_count=st.session_state.desired_clip_count,
                     desired_minutes=active_minutes,
                     used_windows=[],
-                    hook_mode=st.session_state.hook_mode_choice,
                 )
                 st.rerun()
 
+        st.caption(f"Target length per clip: **{active_minutes:.2f} min = {exact_target_sec:.1f}s**")
         if st.session_state.used_clip_windows:
             used_str = ", ".join(f"{w[0]:.1f}s–{w[1]:.1f}s" for w in st.session_state.used_clip_windows)
             st.caption(f"Already used ranges avoided automatically: {used_str}")
@@ -1126,21 +1137,22 @@ if page == "Campaign & Clip Workflow":
             clip_count=st.session_state.desired_clip_count,
             desired_minutes=active_minutes,
             used_windows=st.session_state.used_clip_windows,
-            hook_mode=st.session_state.hook_mode_choice,
         )
         cands = cands[:int(st.session_state.desired_clip_count)]
 
-        q_col1, q_col2, q_col3 = st.columns(3)
+        q_col1, q_col2, q_col3, q_col4 = st.columns(4)
         with q_col1:
             sharp_res = st.selectbox(
-                "Sharpness / Resolution",
-                ["Source or Better (Auto Sharp)", "4K Ultra Sharp", "1080p Full HD", "720p HD"],
+                "Output Resolution",
+                ["Match Source (Zero Resize Loss)", "Source or Better (Auto Sharp)", "1080p Full HD", "4K Ultra Sharp", "720p HD"],
                 key="wf_sharp_res"
             )
         with q_col2:
-            sharp_crf = st.slider("Visual detail CRF (16 = razor sharp)", 16, 24, 17, key="wf_sharp_crf")
+            sharp_crf = st.slider("Quality CRF (15 = crispest)", 15, 22, 16, key="wf_sharp_crf")
         with q_col3:
-            cap_size = st.slider("Lower-third caption size", 18, 40, int(st.session_state.onscreen_caption_size), key="wf_cap_size")
+            encode_preset = st.selectbox("Encode speed/quality", ["slow", "medium", "fast"], key="wf_encode_preset")
+        with q_col4:
+            cap_size = st.slider("Bottom caption size", 12, 22, int(st.session_state.onscreen_caption_size), key="wf_cap_size")
 
         chosen_windows = []
         run_tag = len(st.session_state.used_clip_windows)
@@ -1148,10 +1160,10 @@ if page == "Campaign & Clip Workflow":
         for idx, cand in enumerate(cands):
             with st.container(border=True):
                 st.markdown(f"**Clip {idx + 1}: {cand.get('title', f'Highlight {idx+1}')}**")
-                st.caption(f"AI Reason: {cand.get('reason', '')}")
+                st.caption(f"Note: {cand.get('reason', '')}")
                 wc1, wc2, wc3 = st.columns([1, 1, 1.4])
                 with wc1:
-                    init_s = min(max_start_limit, max(0.0, float(cand["start"])))
+                    init_s = round(min(max_start_limit, max(0.0, float(cand["start"]))), 1)
                     s_val = st.number_input(
                         f"Start (sec) — Clip {idx+1}",
                         min_value=0.0,
@@ -1161,21 +1173,20 @@ if page == "Campaign & Clip Workflow":
                         key=f"c_start_{run_tag}_{idx}"
                     )
                 with wc2:
-                    calc_end = min(dur, float(s_val) + active_minutes * 60.0)
-                    init_e = max(min(dur, float(s_val) + 0.5), float(calc_end))
+                    exact_end = round(min(dur, float(s_val) + exact_target_sec), 1)
                     e_val = st.number_input(
                         f"End (sec) — Clip {idx+1}",
                         min_value=0.5,
                         max_value=max(0.5, dur),
-                        value=init_e,
+                        value=max(min(dur, float(s_val) + 0.5), exact_end),
                         step=0.5,
                         key=f"c_end_{run_tag}_{idx}"
                     )
                 with wc3:
                     asp_val = st.selectbox(
                         f"Aspect — Clip {idx+1}",
-                        ["9:16 Vertical", "16:9 Landscape", "1:1 Square", "4:5 Portrait", "Keep original"],
-                        index=0 if ("Shorts" in st.session_state.target_platform_choice or "Reels" in st.session_state.target_platform_choice or "TikTok" in st.session_state.target_platform_choice) else 1,
+                        ["Keep original", "9:16 Vertical", "16:9 Landscape", "1:1 Square", "4:5 Portrait"],
+                        index=0,
                         key=f"c_asp_{run_tag}_{idx}"
                     )
                 hook_txt = st.text_input(
@@ -1206,7 +1217,7 @@ if page == "Campaign & Clip Workflow":
                             srt_file = WORK_DIR / f"{safe_name(title)}_clip{num}.srt"
                             srt_file.write_text(srt_txt, encoding="utf-8")
 
-                    with st.spinner(f"Rendering sharp Clip {num} ({s_v:.1f}s – {e_v:.1f}s)..."):
+                    with st.spinner(f"Rendering Clip {num} ({s_v:.1f}s – {e_v:.1f}s = {e_v - s_v:.1f}s)..."):
                         render_video(
                             st.session_state.source_video,
                             str(out_file),
@@ -1222,6 +1233,7 @@ if page == "Campaign & Clip Workflow":
                             src_w=int(vi.get("width") or 1920),
                             src_h=int(vi.get("height") or 1080),
                             caption_font_size=int(cap_size),
+                            encode_preset=encode_preset,
                         )
                     st.session_state.used_clip_windows.append([round(s_v, 1), round(e_v, 1)])
                     rec = {
@@ -1246,7 +1258,6 @@ if page == "Campaign & Clip Workflow":
                         clip_count=st.session_state.desired_clip_count,
                         desired_minutes=active_minutes,
                         used_windows=st.session_state.used_clip_windows,
-                        hook_mode=st.session_state.hook_mode_choice,
                     )
                     copy_pack = generate_social_copy(
                         platform=st.session_state.target_platform_choice,
@@ -1269,8 +1280,9 @@ if page == "Campaign & Clip Workflow":
             with st.container(border=True):
                 c_vid, c_dl = st.columns([2.2, 1])
                 with c_vid:
+                    actual_sec = round(float(cl["end"]) - float(cl["start"]), 1)
                     st.markdown(f"**{idx + 1}. {cl['name']}**")
-                    st.caption(f"{fmt_time(cl['start'])} – {fmt_time(cl['end'])} · {cl['aspect']} · {cl['resolution']}")
+                    st.caption(f"{fmt_time(cl['start'])} – {fmt_time(cl['end'])} ({actual_sec:.1f}s) · {cl['aspect']} · {cl['resolution']}")
                     if Path(cl["path"]).exists():
                         st.video(cl["path"])
                 with c_dl:
@@ -1303,11 +1315,11 @@ elif page == "Editor & Templates":
             hook_line = st.text_input("Top hook banner text", value="", key="ed_hook_line")
             hook_dur_opt = st.selectbox("Top hook duration", ["8s Banner", "Full Clip Banner"], key="ed_hook_dur")
         with b:
-            aspect = st.selectbox("Aspect ratio", ["9:16 Vertical", "16:9 Landscape", "1:1 Square", "4:5 Portrait", "Keep original"], key="ed_aspect")
-            resolution = st.selectbox("Sharpness / Resolution", ["Source or Better (Auto Sharp)", "4K Ultra Sharp", "1080p Full HD", "720p HD"], key="ed_resolution")
-            crf = st.slider("Visual detail CRF (lower = sharper)", 16, 24, 17, key="ed_crf")
+            aspect = st.selectbox("Aspect ratio", ["Keep original", "9:16 Vertical", "16:9 Landscape", "1:1 Square", "4:5 Portrait"], key="ed_aspect")
+            resolution = st.selectbox("Output Resolution", ["Match Source (Zero Resize Loss)", "Source or Better (Auto Sharp)", "1080p Full HD", "4K Ultra Sharp", "720p HD"], key="ed_resolution")
+            crf = st.slider("Quality CRF (15 = crispest)", 15, 22, 16, key="ed_crf")
             add_logo = st.checkbox("Include saved brand logo", value=bool(st.session_state.logo_path), key="ed_add_logo")
-            add_sub = st.checkbox("Burn lower-third captions", value=True, key="ed_add_sub")
+            add_sub = st.checkbox("Compact bottom captions", value=True, key="ed_add_sub")
 
         if st.button("Render Sharp Clip", type="primary", use_container_width=True, key="ed_render_btn"):
             if end <= start:
@@ -1336,6 +1348,7 @@ elif page == "Editor & Templates":
                             hook_banner_duration=8.0 if hook_dur_opt.startswith("8s") else 9999.0,
                             src_w=int(vi.get("width") or 1920),
                             src_h=int(vi.get("height") or 1080),
+                            caption_font_size=int(st.session_state.onscreen_caption_size),
                         )
                     st.session_state.used_clip_windows.append([round(start, 1), round(end, 1)])
                     st.session_state.clips.append({
