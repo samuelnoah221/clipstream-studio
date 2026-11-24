@@ -131,7 +131,7 @@ def attach_uploader_percentage_bar(max_mb: int = 2048):
 
               const total = Math.max(1, file.size || 1);
               const totalMb = (total / (1024 * 1024)).toFixed(1);
-              const step = 8 * 1024 * 1024;
+              const step = 16 * 1024 * 1024;
               let offset = 0;
 
               lbl.textContent = "Reading " + file.name + "...";
@@ -183,7 +183,7 @@ def attach_uploader_percentage_bar(max_mb: int = 2048):
             bindUploader();
             const observer = new MutationObserver(bindUploader);
             observer.observe(parentDoc.body, {{ childList: true, subtree: true }});
-            setInterval(bindUploader, 800);
+            setInterval(bindUploader, 900);
           }})();
         </script>
         """,
@@ -195,7 +195,8 @@ def save_upload(uploaded, suffix: str | None = None, show_progress: bool = False
     path = WORK_DIR / f"{next(tempfile._get_candidate_names())}_{int(time.time())}{ext}"
     total_bytes = max(1, int(getattr(uploaded, "size", 0) or 0))
     written = 0
-    chunk_size = 4 * 1024 * 1024
+    chunk_size = 8 * 1024 * 1024
+    last_pct = -5
 
     bar = st.progress(0, text="Loading video to disk: 0%") if show_progress else None
     uploaded.seek(0)
@@ -206,8 +207,9 @@ def save_upload(uploaded, suffix: str | None = None, show_progress: bool = False
                 break
             handle.write(chunk)
             written += len(chunk)
-            if bar is not None:
-                pct = min(100, int((written / total_bytes) * 100))
+            pct = min(100, int((written / total_bytes) * 100))
+            if bar is not None and (pct >= last_pct + 5 or pct == 100):
+                last_pct = pct
                 bar.progress(
                     pct,
                     text=f"Loading video to disk: {pct}% ({written / (1024*1024):.1f} / {total_bytes / (1024*1024):.1f} MB)",
@@ -240,6 +242,7 @@ def probe_video(path: str) -> dict:
     }
 
 def split_video_into_two_parts(source: str, duration: float, split_sec: float | None = None) -> tuple[dict, dict]:
+    """Splits a video into Part 1 and Part 2 using fast stream copy with safe fallback."""
     src_path = Path(source)
     if not src_path.exists():
         raise RuntimeError("Source video file is missing.")
@@ -248,24 +251,42 @@ def split_video_into_two_parts(source: str, duration: float, split_sec: float | 
     mid = max(1.0, min(dur - 1.0, mid))
 
     stem = safe_name(src_path.stem)
-    part1_path = WORK_DIR / f"{stem}_part1_{next(tempfile._get_candidate_names())}{src_path.suffix or '.mp4'}"
-    part2_path = WORK_DIR / f"{stem}_part2_{next(tempfile._get_candidate_names())}{src_path.suffix or '.mp4'}"
+    ext = src_path.suffix if src_path.suffix.lower() in {".mp4", ".mov", ".mkv", ".webm", ".m4v"} else ".mp4"
+    part1_path = WORK_DIR / f"{stem}_part1_{next(tempfile._get_candidate_names())}{ext}"
+    part2_path = WORK_DIR / f"{stem}_part2_{next(tempfile._get_candidate_names())}{ext}"
 
+    # Fast lossless split first
     p1 = run_cmd([
         "ffmpeg", "-y", "-i", str(src_path),
         "-t", str(mid), "-c", "copy", "-avoid_negative_ts", "make_zero",
         str(part1_path)
     ], timeout=600)
-    if p1.returncode or not part1_path.exists():
-        raise RuntimeError(p1.stderr[-1500:] or "Failed creating Part 1.")
-
     p2 = run_cmd([
         "ffmpeg", "-y", "-ss", str(mid), "-i", str(src_path),
         "-c", "copy", "-avoid_negative_ts", "make_zero",
         str(part2_path)
     ], timeout=600)
-    if p2.returncode or not part2_path.exists():
-        raise RuntimeError(p2.stderr[-1500:] or "Failed creating Part 2.")
+
+    # Fallback if stream copy failed or produced an unreadable/empty segment
+    if p1.returncode or not part1_path.exists() or part1_path.stat().st_size == 0:
+        part1_path.unlink(missing_ok=True)
+        p1 = run_cmd([
+            "ffmpeg", "-y", "-i", str(src_path),
+            "-t", str(mid), "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
+            "-c:a", "aac", "-b:a", "128k", str(part1_path)
+        ], timeout=1800)
+        if p1.returncode or not part1_path.exists():
+            raise RuntimeError(p1.stderr[-1500:] or "Failed creating Part 1.")
+
+    if p2.returncode or not part2_path.exists() or part2_path.stat().st_size == 0:
+        part2_path.unlink(missing_ok=True)
+        p2 = run_cmd([
+            "ffmpeg", "-y", "-ss", str(mid), "-i", str(src_path),
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
+            "-c:a", "aac", "-b:a", "128k", str(part2_path)
+        ], timeout=1800)
+        if p2.returncode or not part2_path.exists():
+            raise RuntimeError(p2.stderr[-1500:] or "Failed creating Part 2.")
 
     info1 = probe_video(str(part1_path))
     info2 = probe_video(str(part2_path))
@@ -288,54 +309,122 @@ def mix_two_parts_into_one(
     src_w: int = 1920,
     src_h: int = 1080,
     caption_font_size: int = 28,
-    encode_preset: str = "fast",
+    encode_preset: str = "veryfast",
     normalize_audio: bool = False,
     max_duration: float | None = None,
 ):
+    """Joins Part 1 + Part 2 and renders the final video in a single pass."""
     if not Path(part1_path).exists() or not Path(part2_path).exists():
         raise RuntimeError("One or both split parts are missing.")
 
-    list_file = WORK_DIR / f"concat_{next(tempfile._get_candidate_names())}.txt"
-    p1_posix = Path(part1_path).resolve().as_posix().replace("'", "'\\''")
-    p2_posix = Path(part2_path).resolve().as_posix().replace("'", "'\\''")
-    list_file.write_text(f"file '{p1_posix}'\nfile '{p2_posix}'\n", encoding="utf-8")
+    p1_info = probe_video(part1_path)
+    p2_info = probe_video(part2_path)
+    combined_dur = round(max(0.5, float(p1_info.get("duration") or 0) + float(p2_info.get("duration") or 0)), 1)
+    final_dur = round(min(combined_dur, float(max_duration)), 1) if max_duration else combined_dur
 
-    merged_raw = WORK_DIR / f"merged_raw_{next(tempfile._get_candidate_names())}.mp4"
+    crop, dims, out_w, out_h = resolve_sharp_dimensions(
+        aspect, resolution, src_w, src_h, clip_index=0
+    )
+
+    # Concat both inputs in filter_complex so there is only ONE encode pass
+    graph: list[str] = []
+    if p1_info.get("audio_codec") != "none" and p2_info.get("audio_codec") != "none":
+        graph.append("[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[vcat][acat]")
+        audio_map = ["-map", "[acat]"]
+    else:
+        graph.append("[0:v][1:v]concat=n=2:v=1:a=0[vcat]")
+        audio_map = ["-map", "0:a?"]
+
+    current = "vcat"
+    if crop:
+        graph.append(f"[{current}]{crop},setsar=1[vcrop]")
+        current = "vcrop"
+    if dims:
+        graph.append(f"[{current}]scale={dims}:flags=bilinear,setsar=1[vscale]")
+        current = "vscale"
+
+    font_opt = ""
+    sys_font = find_system_font()
+    if sys_font:
+        font_opt = f":fontfile='{sys_font}'"
+
+    temp_text_files: list[Path] = []
     try:
-        m_cmd = [
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "192k", str(merged_raw)
+        clean_hook = (hook_banner_text or "").strip()
+        if clean_hook:
+            hook_txt_path = WORK_DIR / f"hook_{next(tempfile._get_candidate_names())}.txt"
+            hook_txt_path.write_text(clean_hook[:120], encoding="utf-8")
+            temp_text_files.append(hook_txt_path)
+            hook_file_esc = hook_txt_path.resolve().as_posix().replace(":", "\\:")
+
+            hook_font_px = max(20, int(out_h * 0.025))
+            box_h = max(40, int(hook_font_px * 1.7))
+            top_y = max(24, int(out_h * 0.055))
+            active_end = min(final_dur, max(1.0, float(hook_banner_duration)))
+            draw_hook = (
+                f"[{current}]drawbox=x=0:y={top_y - 6}:w=iw:h={box_h}:color=black@0.68:t=fill:"
+                f"enable='between(t,0,{active_end:.2f})',"
+                f"drawtext=textfile='{hook_file_esc}'{font_opt}:fontcolor=white:fontsize={hook_font_px}:"
+                f"x=(w-text_w)/2:y={top_y + (box_h - hook_font_px)//2 - 6}:"
+                f"box=1:boxcolor=black@0.45:boxborderw=6:"
+                f"enable='between(t,0,{active_end:.2f})'[vhook]"
+            )
+            graph.append(draw_hook)
+            current = "vhook"
+
+        if cues:
+            sub_px = max(20, min(46, int(caption_font_size)))
+            bottom_margin = max(52, int(out_h * 0.09))
+            sub_filters = []
+            for c_start, c_end, c_text in cues[:24]:
+                lines_list = [ln.strip() for ln in c_text.splitlines() if ln.strip()][:2]
+                if not lines_list:
+                    continue
+                line_step = int(sub_px * 1.25)
+                total_block_h = line_step * len(lines_list)
+                base_y = out_h - bottom_margin - total_block_h
+                for l_i, raw_ln in enumerate(lines_list):
+                    cue_file = WORK_DIR / f"cue_{next(tempfile._get_candidate_names())}.txt"
+                    cue_file.write_text(raw_ln, encoding="utf-8")
+                    temp_text_files.append(cue_file)
+                    cue_file_esc = cue_file.resolve().as_posix().replace(":", "\\:")
+                    y_pos = base_y + (l_i * line_step)
+                    sub_filters.append(
+                        f"drawtext=textfile='{cue_file_esc}'{font_opt}:fontcolor=white:fontsize={sub_px}:"
+                        f"x=(w-text_w)/2:y={y_pos}:"
+                        f"box=1:boxcolor=black@0.80:boxborderw=8:"
+                        f"enable='between(t,{c_start:.2f},{c_end:.2f})'"
+                    )
+            if sub_filters:
+                graph.append(f"[{current}]{','.join(sub_filters)}[vout]")
+                current = "vout"
+
+        if normalize_audio:
+            audio_map += ["-af", "loudnorm=I=-14:TP=-1.5:LRA=11"]
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", part1_path,
+            "-i", part2_path,
+            "-filter_complex", ";".join(graph),
+            "-map", f"[{current}]",
+            *audio_map,
+            "-t", str(final_dur),
+            "-c:v", "libx264",
+            "-preset", encode_preset,
+            "-crf", str(int(crf)),
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-b:a", "160k",
+            "-movflags", "+faststart",
+            output_path,
         ]
-        pm = run_cmd(m_cmd, timeout=1800)
-        if pm.returncode or not merged_raw.exists():
-            raise RuntimeError(pm.stderr[-2000:] or "Failed joining Part 1 and Part 2.")
-
-        m_info = probe_video(str(merged_raw))
-        total_dur = max(0.5, float(m_info.get("duration") or 1.0))
-        final_dur = round(min(total_dur, float(max_duration)), 1) if max_duration else round(total_dur, 1)
-
-        render_video(
-            source=str(merged_raw),
-            output=output_path,
-            start=0.0,
-            end=final_dur,
-            aspect=aspect,
-            resolution=resolution,
-            crf=crf,
-            cues=cues,
-            hook_banner_text=hook_banner_text,
-            hook_banner_duration=hook_banner_duration,
-            src_w=int(m_info.get("width") or src_w),
-            src_h=int(m_info.get("height") or src_h),
-            caption_font_size=caption_font_size,
-            encode_preset=encode_preset,
-            normalize_audio=normalize_audio,
-            clip_index=0,
-        )
+        p = run_cmd(cmd, timeout=1800)
+        if p.returncode or not Path(output_path).exists():
+            raise RuntimeError(p.stderr[-2200:] or "Failed mixing Part 1 and Part 2.")
     finally:
-        list_file.unlink(missing_ok=True)
-        merged_raw.unlink(missing_ok=True)
+        for tf in temp_text_files:
+            tf.unlink(missing_ok=True)
         gc.collect()
 
 def get_openai_client():
@@ -999,7 +1088,7 @@ def build_caption_cues(
             if b_end > b_start + 0.15:
                 cues.append((b_start, b_end, wrap_caption_lines(beats[i % len(beats)], max_chars=32, max_lines=2)))
 
-    return cues[:36]
+    return cues[:24]
 
 def resolve_sharp_dimensions(
     aspect: str,
@@ -1082,7 +1171,7 @@ def render_video(
     src_w: int = 1920,
     src_h: int = 1080,
     caption_font_size: int = 28,
-    encode_preset: str = "fast",
+    encode_preset: str = "veryfast",
     normalize_audio: bool = False,
     clip_index: int = 0,
 ):
@@ -1102,11 +1191,8 @@ def render_video(
         current = "vcrop"
 
     if dims:
-        graph.append(f"[{current}]scale={dims}:flags=lanczos,setsar=1[vscale]")
+        graph.append(f"[{current}]scale={dims}:flags=bilinear,setsar=1[vscale]")
         current = "vscale"
-
-    graph.append(f"[{current}]unsharp=5:5:0.35:3:3:0.15[vsharp]")
-    current = "vsharp"
 
     font_opt = ""
     sys_font = find_system_font()
@@ -1140,7 +1226,7 @@ def render_video(
         has_logo = bool(logo and Path(logo).exists())
         if has_logo:
             graph += [
-                "[1:v]scale=iw*0.14:-1:flags=lanczos[logo]",
+                "[1:v]scale=iw*0.14:-1:flags=bilinear[logo]",
                 f"[{current}][logo]overlay=W-w-20:20:format=auto[vlogo]"
             ]
             current = "vlogo"
@@ -1149,7 +1235,7 @@ def render_video(
             sub_px = max(20, min(46, int(caption_font_size)))
             bottom_margin = max(52, int(out_h * 0.09))
             sub_filters = []
-            for c_start, c_end, c_text in cues:
+            for c_start, c_end, c_text in cues[:24]:
                 lines_list = [ln.strip() for ln in c_text.splitlines() if ln.strip()][:2]
                 if not lines_list:
                     continue
@@ -1190,7 +1276,7 @@ def render_video(
             "-crf", str(int(crf)),
             "-pix_fmt", "yuv420p",
             "-c:a", "aac",
-            "-b:a", "192k",
+            "-b:a", "160k",
             "-movflags", "+faststart",
             output
         ]
@@ -1240,12 +1326,12 @@ init_state()
 
 # ----------------------------- HEADER & NAV -----------------------------
 st.markdown(f"""<div class="hero">
-<div style="color:#a5b4fc;font-weight:750;font-size:.76rem;letter-spacing:.13em">SINGLE UPLOADER + LIVE % · 2-PART SPLIT & MIX · CHANGING BOTTOM CAPTIONS</div>
+<div style="color:#a5b4fc;font-weight:750;font-size:.76rem;letter-spacing:.13em">SINGLE-PASS VIDEO BREAKER · 2-PART SPLIT & MIX · LIVE % METER</div>
 <h1>🎬 {APP_NAME}</h1>
-<p class="muted">Single video uploader with live % progress + 2-part split & mix into one sharp short/video + changing speech-synced bottom captions + unique campaign captions per short.</p>
-<span class="pill">Single uploader + %</span>
-<span class="pill">Split 2 parts & mix</span>
-<span class="pill">Changing bottom captions</span>
+<p class="muted">Single-pass 2-part split & mix + live % progress + changing speech-synced bottom captions + unique campaign captions per short.</p>
+<span class="pill">Single-pass mix</span>
+<span class="pill">Split 2 parts</span>
+<span class="pill">Live % meter</span>
 <span class="pill">Unique caption per short</span>
 </div>""", unsafe_allow_html=True)
 
@@ -1266,13 +1352,13 @@ with st.sidebar:
 
 # ----------------------------- PAGE 1: CAMPAIGN & CLIP WORKFLOW ---------
 if page == "Campaign & Clip Workflow":
-    st.subheader("Step 1 · Video (Single Uploader + Live %) + Campaign Requirements")
+    st.subheader("Step 1 · Video (Single Uploader + Live % + 2-Part Breaker) + Campaign Requirements")
     left_col, right_col = st.columns([1.15, 1], gap="large")
 
     with left_col:
         st.text_input("Project / Campaign Name", key="project_name")
         st.checkbox(
-            "Enable 2-part split & mix (recommended for large files)",
+            "Enable 2-part video breaker & single-pass mixer",
             key="split_mode_enabled"
         )
         attach_uploader_percentage_bar(MAX_UPLOAD_MB)
@@ -1310,29 +1396,30 @@ if page == "Campaign & Clip Workflow":
             m3.metric("File Size", f"{size_mb} MB")
 
             if st.session_state.split_mode_enabled and ffmpeg_ready() and float(vi["duration"]) >= 2.0:
-                if st.button("✂️ Break Video into 2 Parts (Lossless)", use_container_width=True, key="split_2_parts_btn"):
+                if st.button("✂️ Break Video into 2 Parts", use_container_width=True, key="split_2_parts_btn"):
                     try:
-                        with st.spinner("Splitting video cleanly into Part 1 and Part 2..."):
+                        with st.spinner("Breaking video into Part 1 and Part 2..."):
                             p1_obj, p2_obj = split_video_into_two_parts(st.session_state.source_video, float(vi["duration"]))
                             st.session_state.split_parts = [p1_obj, p2_obj]
-                        st.success("Created Part 1 and Part 2! You can now mix both parts into one sharp short/video below.")
+                        st.success("Created Part 1 and Part 2! Mix them into one video below.")
                     except Exception as exc:
                         st.error(f"Split error: {exc}")
 
             if len(st.session_state.split_parts) == 2:
                 sp1, sp2 = st.session_state.split_parts
-                st.markdown("**2 Split Parts Ready:**")
+                st.markdown("**2 Parts Ready:**")
                 sc1, sc2 = st.columns(2)
                 sc1.caption(f"Part 1: {fmt_time(sp1['info']['duration'])} ({round(sp1['info']['size']/(1024*1024), 1)} MB)")
                 sc2.caption(f"Part 2: {fmt_time(sp2['info']['duration'])} ({round(sp2['info']['size']/(1024*1024), 1)} MB)")
 
                 mix_asp_opts = ["9:16 Vertical", "16:9 Landscape", "1:1 Square", "4:5 Portrait", "Keep original"]
                 mix_asp = st.selectbox("Mixed output aspect", mix_asp_opts, index=0, key="mix_parts_aspect")
-                mix_res = st.selectbox("Mixed output sharpness", ["1080p Full HD", "4K Ultra Sharp", "720p HD", "Source or Better (Auto Sharp)"], index=0, key="mix_parts_res")
+                mix_res = st.selectbox("Mixed output resolution", ["1080p Full HD", "720p HD", "4K Ultra Sharp", "Source or Better (Auto Sharp)"], index=0, key="mix_parts_res")
+                mix_preset = st.selectbox("Mix speed preset", ["veryfast", "fast", "ultrafast"], index=0, key="mix_parts_preset")
                 mix_hook = st.text_input("Top hook for mixed video (optional)", value=pick_good_hook("", brief=st.session_state.brief, clip_index=0), key="mix_parts_hook")
                 mix_cap = st.checkbox("Include changing bottom captions on mixed video", value=True, key="mix_parts_captions")
 
-                if st.button("🔀 Mix Part 1 + Part 2 into One Sharp Short / Video", type="primary", use_container_width=True, key="mix_2_parts_btn"):
+                if st.button("🔀 Mix Part 1 + Part 2 into One Video (Single Pass)", type="primary", use_container_width=True, key="mix_2_parts_btn"):
                     try:
                         clip_num = len(st.session_state.clips) + 1
                         mixed_out = WORK_DIR / f"{safe_name(st.session_state.project_name)}_mixed_{clip_num}.mp4"
@@ -1344,21 +1431,21 @@ if page == "Campaign & Clip Workflow":
                             fallback_text=st.session_state.brief or "Mixed two-part highlight",
                         ) if mix_cap else None
 
-                        with st.spinner("Mixing Part 1 and Part 2 into one sharp output..."):
+                        with st.spinner("Mixing Part 1 and Part 2 in a single pass..."):
                             mix_two_parts_into_one(
                                 part1_path=sp1["path"],
                                 part2_path=sp2["path"],
                                 output_path=str(mixed_out),
                                 aspect=mix_asp,
                                 resolution=mix_res,
-                                crf=16,
+                                crf=18,
                                 cues=cues,
                                 hook_banner_text=mix_hook,
                                 hook_banner_duration=8.0,
                                 src_w=int(vi.get("width") or 1920),
                                 src_h=int(vi.get("height") or 1080),
                                 caption_font_size=int(st.session_state.onscreen_caption_size),
-                                encode_preset="fast",
+                                encode_preset=mix_preset,
                                 normalize_audio=False,
                             )
 
@@ -1390,7 +1477,7 @@ if page == "Campaign & Clip Workflow":
                             "caption": copy_pack["caption"],
                             "description": copy_pack["description"],
                         })
-                        st.success("Mixed Part 1 + Part 2 into one sharp short/video! Scroll down to preview, download, or generate its caption.")
+                        st.success("Mixed Part 1 + Part 2 into one video! Scroll down to preview, download, or generate its caption.")
                         st.rerun()
                     except Exception as exc:
                         st.error(f"Mix error: {exc}")
@@ -1630,13 +1717,13 @@ if page == "Campaign & Clip Workflow":
         with q_col1:
             sharp_res = st.selectbox(
                 "Output Resolution",
-                ["1080p Full HD", "Source or Better (Auto Sharp)", "4K Ultra Sharp", "720p HD", "Match Source (Zero Resize Loss)"],
+                ["1080p Full HD", "720p HD", "4K Ultra Sharp", "Source or Better (Auto Sharp)", "Match Source (Zero Resize Loss)"],
                 key="wf_sharp_res"
             )
         with q_col2:
-            sharp_crf = st.slider("Quality CRF (15 = crispest)", 15, 22, 16, key="wf_sharp_crf")
+            sharp_crf = st.slider("Quality CRF (15 = crispest)", 15, 22, 18, key="wf_sharp_crf")
         with q_col3:
-            encode_preset = st.selectbox("Encode speed/quality", ["fast", "medium", "ultrafast"], key="wf_encode_preset")
+            encode_preset = st.selectbox("Encode speed/quality", ["veryfast", "fast", "ultrafast"], key="wf_encode_preset")
         with q_col4:
             cap_size = st.slider("Bottom caption size", 20, 42, int(st.session_state.onscreen_caption_size), key="wf_cap_size")
 
@@ -1892,8 +1979,8 @@ elif page == "Editor & Templates":
             hook_dur_opt = st.selectbox("Top hook duration", ["8s Banner", "Full Clip Banner"], key="ed_hook_dur")
         with b:
             aspect = st.selectbox("Aspect ratio", ["9:16 Vertical", "16:9 Landscape", "1:1 Square", "4:5 Portrait", "Keep original"], key="ed_aspect")
-            resolution = st.selectbox("Output Resolution", ["1080p Full HD", "Source or Better (Auto Sharp)", "4K Ultra Sharp", "720p HD", "Match Source (Zero Resize Loss)"], key="ed_resolution")
-            crf = st.slider("Quality CRF (15 = crispest)", 15, 22, 16, key="ed_crf")
+            resolution = st.selectbox("Output Resolution", ["1080p Full HD", "720p HD", "4K Ultra Sharp", "Source or Better (Auto Sharp)", "Match Source (Zero Resize Loss)"], key="ed_resolution")
+            crf = st.slider("Quality CRF (15 = crispest)", 15, 22, 18, key="ed_crf")
             add_logo = st.checkbox("Include saved brand logo", value=bool(st.session_state.logo_path), key="ed_add_logo")
             add_sub = st.checkbox("Changing bottom captions", value=True, key="ed_add_sub")
 
