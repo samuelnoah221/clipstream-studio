@@ -1295,7 +1295,8 @@ def init_state():
         "used_clip_windows": [],
         "hook_mode_choice": "Standard Clip Length (Exact Minutes)",
         "hook_banner_scope": "8-Second Top Banner (0–8s)",
-        "burn_onscreen_captions_widget": True,
+        "pending_hook_banner_scope": None,
+        "burn_subtitles_chk_v2": True,
         "onscreen_caption_size": 30,
         "source_video": None,
         "video_name": None,
@@ -1479,8 +1480,13 @@ if page == "Campaign & Auto-Clipper":
         with cap_col:
             burn_captions_enabled = st.checkbox(
                 "Burn bottom subtitles + export .SRT",
-                key="burn_onscreen_captions_widget",
+                key="burn_subtitles_chk_v2",
             )
+
+        pending_scope = st.session_state.get("pending_hook_banner_scope")
+        if pending_scope in {"8-Second Top Banner (0–8s)", "Full Clip Top Banner"}:
+            st.session_state["hook_banner_scope"] = pending_scope
+            st.session_state["pending_hook_banner_scope"] = None
 
         st.selectbox(
             "Hook banner placement timing",
@@ -1499,9 +1505,9 @@ if page == "Campaign & Auto-Clipper":
                         st.session_state.auto_clip_minutes = float(st.session_state.desired_clip_minutes)
 
                         if analysis.get("requires_8s_hook"):
-                            st.session_state.hook_banner_scope = "8-Second Top Banner (0–8s)"
+                            st.session_state["pending_hook_banner_scope"] = "8-Second Top Banner (0–8s)"
                         elif analysis.get("requires_video_hook"):
-                            st.session_state.hook_banner_scope = "Full Clip Top Banner"
+                            st.session_state["pending_hook_banner_scope"] = "Full Clip Top Banner"
 
                         if st.session_state.source_video and st.session_state.video_info and Path(st.session_state.source_video).exists():
                             tr = None
@@ -1602,7 +1608,7 @@ if page == "Campaign & Auto-Clipper":
         st.subheader("Step 3 · Auto-Clipper (Different Spots · Exact Desired Minutes)")
         vi = st.session_state.video_info
         dur = max(1.0, float(vi["duration"]))
-        use_subs = bool(st.session_state.get("burn_onscreen_captions_widget", True))
+        use_subs = bool(st.session_state.get("burn_subtitles_chk_v2", True))
 
         if use_subs and not st.session_state.transcript and not get_openai_client():
             st.warning("No transcript available because `OPENAI_API_KEY` is not set—bottom subtitles will use transcript text only if available rather than live word-by-word speech.")
