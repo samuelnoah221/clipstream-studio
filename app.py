@@ -1282,6 +1282,13 @@ def render_video(
         gc.collect()
 
 
+def sync_auto_clip_count(source_key: str):
+    val = max(1, min(6, int(st.session_state.get(source_key, 2))))
+    st.session_state["auto_clip_count"] = val
+    st.session_state["auto_clip_count_top"] = val
+    st.session_state["auto_clip_count_step3"] = val
+
+
 def init_state():
     defaults = {
         "brief": "",
@@ -1290,6 +1297,8 @@ def init_state():
         "go_ahead_clips": False,
         "target_platform_choice": "YouTube Shorts / Reels",
         "auto_clip_count": 2,
+        "auto_clip_count_top": 2,
+        "auto_clip_count_step3": 2,
         "desired_clip_minutes": 0.50,
         "auto_clip_minutes": 0.50,
         "used_clip_windows": [],
@@ -1459,7 +1468,9 @@ if page == "Campaign & Auto-Clipper":
                 min_value=1,
                 max_value=6,
                 step=1,
-                key="auto_clip_count",
+                key="auto_clip_count_top",
+                on_change=sync_auto_clip_count,
+                args=("auto_clip_count_top",),
             )
         with min_col:
             st.number_input(
@@ -1494,6 +1505,8 @@ if page == "Campaign & Auto-Clipper":
             key="hook_banner_scope",
         )
 
+        active_count = int(st.session_state.get("auto_clip_count", 2))
+
         if st.button("🧠 Analyse Campaign & Video Fit", type="primary", use_container_width=True, key="wf_analyse_btn"):
             if not st.session_state.brief.strip():
                 st.error("Enter campaign requirements first.")
@@ -1525,7 +1538,7 @@ if page == "Campaign & Auto-Clipper":
                                 contact_sheet=sheet,
                                 duration=st.session_state.video_info["duration"],
                                 target_platform=st.session_state.target_platform_choice,
-                                clip_count=int(st.session_state.auto_clip_count),
+                                clip_count=active_count,
                                 desired_minutes=float(st.session_state.desired_clip_minutes),
                                 used_windows=st.session_state.used_clip_windows,
                             )
@@ -1591,7 +1604,7 @@ if page == "Campaign & Auto-Clipper":
                         contact_sheet=None,
                         duration=st.session_state.video_info["duration"],
                         target_platform=st.session_state.target_platform_choice,
-                        clip_count=int(st.session_state.auto_clip_count),
+                        clip_count=int(st.session_state.get("auto_clip_count", 2)),
                         desired_minutes=float(st.session_state.auto_clip_minutes),
                         used_windows=st.session_state.used_clip_windows,
                     )
@@ -1628,9 +1641,12 @@ if page == "Campaign & Auto-Clipper":
                 min_value=1,
                 max_value=6,
                 step=1,
-                key="auto_clip_count",
+                key="auto_clip_count_step3",
+                on_change=sync_auto_clip_count,
+                args=("auto_clip_count_step3",),
             )
         active_minutes = float(st.session_state.auto_clip_minutes)
+        active_count = int(st.session_state.get("auto_clip_count", 2))
         exact_target_sec = round(min(dur, minutes_to_seconds(active_minutes)), 1)
 
         with ctrl3:
@@ -1641,7 +1657,7 @@ if page == "Campaign & Auto-Clipper":
                     contact_sheet=None,
                     duration=dur,
                     target_platform=st.session_state.target_platform_choice,
-                    clip_count=int(st.session_state.auto_clip_count),
+                    clip_count=active_count,
                     desired_minutes=active_minutes,
                     used_windows=st.session_state.used_clip_windows,
                 )
@@ -1654,7 +1670,7 @@ if page == "Campaign & Auto-Clipper":
                     contact_sheet=None,
                     duration=dur,
                     target_platform=st.session_state.target_platform_choice,
-                    clip_count=int(st.session_state.auto_clip_count),
+                    clip_count=active_count,
                     desired_minutes=active_minutes,
                     used_windows=[],
                 )
@@ -1670,11 +1686,11 @@ if page == "Campaign & Auto-Clipper":
             contact_sheet=None,
             duration=dur,
             target_platform=st.session_state.target_platform_choice,
-            clip_count=int(st.session_state.auto_clip_count),
+            clip_count=active_count,
             desired_minutes=active_minutes,
             used_windows=st.session_state.used_clip_windows,
         )
-        cands = cands[:int(st.session_state.auto_clip_count)]
+        cands = cands[:active_count]
 
         q_col1, q_col2, q_col3, q_col4 = st.columns(4)
         with q_col1:
@@ -1804,7 +1820,7 @@ if page == "Campaign & Auto-Clipper":
                         contact_sheet=None,
                         duration=dur,
                         target_platform=st.session_state.target_platform_choice,
-                        clip_count=int(st.session_state.auto_clip_count),
+                        clip_count=active_count,
                         desired_minutes=active_minutes,
                         used_windows=st.session_state.used_clip_windows,
                     )
