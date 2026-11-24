@@ -518,58 +518,140 @@ def pick_good_hook(spoken_text: str, brief: str = "", clip_index: int = 0) -> st
     return CAMPAIGN_HOOK_BANK[clip_index % len(CAMPAIGN_HOOK_BANK)]
 
 
-def pick_auto_clip_windows(
+def build_stitched_peak_moments(
     duration: float,
     desired_minutes: float,
-    count: int,
     used_windows: list[list[float]],
     transcript: dict | None = None,
-) -> list[tuple[float, float, str]]:
-    """Picks distinct spots across the video, each sized to desired_minutes."""
-    if duration <= 0:
-        return []
-    count = max(1, min(6, int(count)))
-    exact_len = round(min(duration, minutes_to_seconds(desired_minutes)), 1)
-    max_start = round(max(0.0, duration - exact_len), 1)
+    seed_offset: int = 0,
+) -> list[dict]:
+    """Picks multiple short peak sub-moments across the video whose durations sum to desired_minutes."""
+    total_target = round(max(1.0, min(duration, minutes_to_seconds(desired_minutes))), 1)
+    if duration <= 1.0 or total_target <= 0:
+        end_s = round(max(0.5, duration), 1)
+        return [{"start": 0.0, "end": end_s, "text": transcript_slice(transcript, 0.0, end_s)}]
 
-    if max_start <= 0.0:
-        end_s = round(min(duration, exact_len), 1)
-        return [(0.0, end_s, transcript_slice(transcript, 0.0, end_s))]
+    if total_target <= 15.0:
+        num_parts = 3
+    elif total_target <= 45.0:
+        num_parts = 4
+    else:
+        num_parts = 5
 
-    even_anchors = [
-        round((i / max(1, count)) * max_start, 1)
-        for i in range(count)
-    ]
-    extra_fractions = [0.08, 0.28, 0.48, 0.68, 0.86, 0.16, 0.38, 0.58, 0.78, 0.94, 0.0]
-    random.shuffle(extra_fractions)
-    anchors = even_anchors + [round(max(0.0, min(max_start, f * max_start)), 1) for f in extra_fractions]
-    for _ in range(10):
-        anchors.append(round(random.uniform(0.0, max_start), 1))
+    raw_weights = [1.4, 0.85, 0.9, 1.35, 0.8][:num_parts]
+    w_sum = sum(raw_weights)
+    part_durs = [max(2.0, round((w / w_sum) * total_target, 1)) for w in raw_weights]
+    diff = round(total_target - sum(part_durs), 1)
+    part_durs[-1] = round(max(1.5, part_durs[-1] + diff), 1)
 
-    picked: list[tuple[float, float, str]] = []
+    max_start_for_each = [max(0.0, duration - d) for d in part_durs]
+    rng = random.Random(int(time.time() * 100) + seed_offset * 37)
+    base_fracs = [0.12, 0.34, 0.58, 0.78, 0.91][:num_parts]
+    rng.shuffle(base_fracs)
+
+    moments: list[dict] = []
     combined_used = list(used_windows)
 
-    for anc in anchors:
-        if len(picked) >= count:
-            break
-        s_val = round(max(0.0, min(max_start, anc)), 1)
-        e_val = round(min(duration, s_val + exact_len), 1)
-        if e_val <= s_val:
+    for idx, p_dur in enumerate(part_durs):
+        max_s = max_start_for_each[idx]
+        if max_s <= 0.0:
+            s_val = 0.0
+            e_val = round(min(duration, p_dur), 1)
+            moments.append({"start": s_val, "end": e_val, "text": transcript_slice(transcript, s_val, e_val)})
             continue
-        if not overlaps_used(s_val, e_val, combined_used, min_gap=2.0):
-            picked.append((s_val, e_val, transcript_slice(transcript, s_val, e_val)))
-            combined_used.append([s_val, e_val])
 
-    if len(picked) < count:
-        for idx in range(count):
-            if len(picked) >= count:
+        candidate_starts = [
+            round(max(0.0, min(max_s, base_fracs[idx] * max_s)), 1),
+            round(max(0.0, min(max_s, ((idx + 0.35 + (seed_offset * 0.19)) % 0.96) * max_s)), 1),
+        ]
+        for _ in range(8):
+            candidate_starts.append(round(rng.uniform(0.0, max_s), 1))
+
+        chosen_s = None
+        for cs in candidate_starts:
+            ce = round(min(duration, cs + p_dur), 1)
+            if ce <= cs:
+                continue
+            already_in_clip = any(cs < (m["end"] + 2.0) and ce > (m["start"] - 2.0) for m in moments)
+            if not already_in_clip and not overlaps_used(cs, ce, combined_used, min_gap=1.5):
+                chosen_s = cs
                 break
-            s_val = round((idx / max(1, count)) * max_start, 1)
-            e_val = round(min(duration, s_val + exact_len), 1)
-            if e_val > s_val and not any(abs(s_val - ps) < 1.0 and abs(e_val - pe) < 1.0 for ps, pe, _ in picked):
-                picked.append((s_val, e_val, transcript_slice(transcript, s_val, e_val)))
 
-    return picked[:count]
+        if chosen_s is None:
+            for cs in candidate_starts:
+                ce = round(min(duration, cs + p_dur), 1)
+                if ce > cs and not any(abs(cs - m["start"]) < 1.0 and abs(ce - m["end"]) < 1.0 for m in moments):
+                    chosen_s = cs
+                    break
+
+        if chosen_s is None:
+            chosen_s = round(max(0.0, min(max_s, (idx / max(1, num_parts)) * max_s)), 1)
+
+        chosen_e = round(min(duration, chosen_s + p_dur), 1)
+        if chosen_e <= chosen_s:
+            chosen_e = round(min(duration, chosen_s + 1.0), 1)
+
+        moments.append({
+            "start": chosen_s,
+            "end": chosen_e,
+            "text": transcript_slice(transcript, chosen_s, chosen_e),
+        })
+        combined_used.append([chosen_s, chosen_e])
+
+    return moments
+
+
+def build_auto_clip_candidates(
+    brief: str,
+    transcript: dict | None,
+    contact_sheet: Path | None,
+    duration: float,
+    target_platform: str,
+    clip_count: int,
+    desired_minutes: float,
+    used_windows: list[list[float]],
+) -> list[dict]:
+    """Builds stitched multi-moment auto clip candidates (each clip joins multiple peak spots)."""
+    count = max(1, min(6, int(clip_count)))
+    results: list[dict] = []
+    combined_used = list(used_windows)
+
+    for idx in range(count):
+        pick_num = len(used_windows) + idx + 1
+        moments = build_stitched_peak_moments(
+            duration=duration,
+            desired_minutes=desired_minutes,
+            used_windows=combined_used,
+            transcript=transcript,
+            seed_offset=pick_num,
+        )
+        for m in moments:
+            combined_used.append([m["start"], m["end"]])
+
+        stitched_dur = round(sum(max(0.1, m["end"] - m["start"]) for m in moments), 1)
+        all_spoken = " ".join(m["text"] for m in moments if m.get("text")).strip()
+        span_summary = ", ".join(f"{m['start']:.0f}s–{m['end']:.0f}s" for m in moments)
+        good_hook = pick_good_hook(all_spoken, brief=brief, clip_index=pick_num - 1)
+
+        results.append({
+            "title": f"Peak Stitch #{pick_num} ({len(moments)} moments)",
+            "moments": moments,
+            "start": moments[0]["start"] if moments else 0.0,
+            "end": moments[-1]["end"] if moments else stitched_dur,
+            "stitched_duration": stitched_dur,
+            "mode": "Auto Peak Stitch",
+            "target_platform": target_platform,
+            "reason": all_spoken[:160] if all_spoken else f"Stitched peak spots: {span_summary} ({stitched_dur:.1f}s total).",
+            "campaign_match": f"Stitched {len(moments)} peak moments ({stitched_dur:.1f}s)",
+            "hook": str(good_hook)[:85],
+            "risk": "",
+            "confidence": "high",
+        })
+
+    if contact_sheet is not None and contact_sheet.exists():
+        contact_sheet.unlink(missing_ok=True)
+
+    return results
 
 
 # ----------------------------- CAMPAIGN & CLIP INTELLIGENCE -------------
@@ -607,10 +689,10 @@ def heuristic_campaign_analysis(brief: str, project_name: str) -> dict:
         "campaign_name": project_name.strip() or "Campaign Brief",
         "plain_english_summary": (
             f"Campaign targeting {', '.join(platforms)} based on {len(lines)} brief line(s). "
-            f"On-screen captions: {'Required' if wants_onscreen_captions else 'Enabled'}. "
+            f"Full-frame 9:16 + multi-moment peak stitching ready. "
             f"Hook rule: {'8-second hook' if wants_8s_hook else ('Video hook' if wants_video_hook else 'Standard opening')}."
         ),
-        "deliverables": ["Auto-clipped segments matching desired minute length or manual range clips"],
+        "deliverables": ["Auto-stitched peak moment clips or manual start-to-end clips"],
         "platforms": platforms,
         "requires_onscreen_captions": wants_onscreen_captions,
         "requires_8s_hook": wants_8s_hook,
@@ -626,8 +708,8 @@ def heuristic_campaign_analysis(brief: str, project_name: str) -> dict:
         "assets_to_request": [],
         "unclear_or_conflicting_points": [] if len(brief.strip()) >= 30 else ["Brief is short—add more details on hooks, captions, or rules for sharper campaign alignment."],
         "pre_publish_checklist": [
-            "Confirm vertical 9:16 framing for Shorts/Reels/TikTok",
-            "Verify burned-in bottom subtitles fit cleanly inside the frame",
+            "Confirm full-frame 9:16 visibility (no cropped sides)",
+            "Verify peak moments are stitched cleanly into one clip",
             "Confirm caption & description include required campaign elements/tags",
         ],
     }
@@ -679,9 +761,7 @@ def evaluate_video_against_campaign(analysis: dict, video_info: dict, transcript
     w = int(video_info.get("width", 0) or 0)
     h = int(video_info.get("height", 0) or 0)
     if dur > 0:
-        strengths.append(f"Video duration is {dur:.1f}s ({fmt_time(dur)}) at {w}x{h}.")
-    if dur < 8:
-        gaps.append("Source video is under 8 seconds; hook banner timing will clamp to available clip length.")
+        strengths.append(f"Video duration is {dur:.1f}s ({fmt_time(dur)}) at {w}x{h} — full video stays visible in 9:16.")
     if analysis.get("caption_requirements") or analysis.get("hashtags"):
         strengths.append("Campaign caption/tag requirements detected—each clip's caption generator will incorporate them.")
     if analysis.get("requires_8s_hook"):
@@ -694,7 +774,7 @@ def evaluate_video_against_campaign(analysis: dict, video_info: dict, transcript
     t_text = ((transcript or {}).get("text") or "").lower()
 
     if transcript and t_text.strip():
-        strengths.append(f"Speech transcript captured ({len(t_text.split())} words) for SRT & bottom subtitles.")
+        strengths.append(f"Speech transcript captured ({len(t_text.split())} words) for SRT & subtitles.")
         for req in (must_items + req_scenes)[:5]:
             key_words = [
                 kw for kw in re.findall(r"[a-z]{4,}", req.lower())
@@ -705,11 +785,11 @@ def evaluate_video_against_campaign(analysis: dict, video_info: dict, transcript
             else:
                 gaps.append(f"Verify spoken/visual coverage for requirement: {req}")
     else:
-        gaps.append("No speech transcript yet—add OPENAI_API_KEY in Streamlit Secrets/env so subtitles transcribe exact spoken words.")
+        gaps.append("No speech transcript yet—add OPENAI_API_KEY in Streamlit Secrets/env for automatic speech transcription.")
 
     return {
         "ready": True,
-        "verdict": "Ready for Go-Ahead — Auto-Clipping & Manual Clipping Unlocked",
+        "verdict": "Ready for Go-Ahead — Full-Frame 9:16 & Multi-Moment Stitch Unlocked",
         "strengths": strengths,
         "gaps": gaps,
         "warnings": warnings,
@@ -792,74 +872,6 @@ def make_contact_sheet(video_path: str, duration: float, max_frames: int = 6) ->
         gc.collect()
 
 
-def build_auto_clip_candidates(
-    brief: str,
-    transcript: dict | None,
-    contact_sheet: Path | None,
-    duration: float,
-    target_platform: str,
-    clip_count: int,
-    desired_minutes: float,
-    used_windows: list[list[float]],
-) -> list[dict]:
-    count = max(1, min(6, int(clip_count)))
-    fresh_slots = pick_auto_clip_windows(
-        duration=duration,
-        desired_minutes=desired_minutes,
-        count=count,
-        used_windows=used_windows,
-        transcript=transcript,
-    )
-
-    client = get_openai_client()
-    ai_meta_list: list[dict] = []
-    if client and contact_sheet is not None and contact_sheet.exists():
-        try:
-            segs = (transcript or {}).get("segments", []) or []
-            t_lines = [f"[{float(s.get('start',0)):.1f}-{float(s.get('end',0)):.1f}] {s.get('text','')}" for s in segs]
-            t_text = "\n".join(t_lines)[:12000] or (transcript or {}).get("text", "")[:12000]
-            img_b64 = base64.b64encode(contact_sheet.read_bytes()).decode("utf-8")
-            prompt = f"""Given target platform {target_platform}, exact requested clip duration {desired_minutes:.2f} min ({minutes_to_seconds(desired_minutes):.1f}s), and previously used ranges {used_windows},
-write distinct short titles and high-retention hooks based on what is actually said/shown in each window for {count} fresh auto-clipped segment(s). Return ONLY JSON:
-{{"items":[{{"title":"short title","reason":"why it fits","campaign_match":"brief match","hook":"punchy hook line from speech/moment","confidence":"high|medium|low"}}]}}
-BRIEF: {brief[:6000]}
-TRANSCRIPT: {t_text}
-"""
-            resp = client.chat.completions.create(
-                model="gpt-4o-mini", temperature=0.45,
-                response_format={"type": "json_object"},
-                messages=[{"role": "user", "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + img_b64}},
-                ]}],
-            )
-            ai_meta_list = parse_json_response(resp.choices[0].message.content or "{}").get("items", []) or []
-        except Exception:
-            ai_meta_list = []
-        finally:
-            contact_sheet.unlink(missing_ok=True)
-
-    results = []
-    for idx, (s_sec, e_sec, spoken_txt) in enumerate(fresh_slots):
-        ai_m = ai_meta_list[idx] if idx < len(ai_meta_list) else {}
-        dur_actual = round(max(0.5, e_sec - s_sec), 1)
-        pick_num = len(used_windows) + idx + 1
-        good_hook = ai_m.get("hook") or pick_good_hook(spoken_txt, brief=brief, clip_index=pick_num - 1)
-        results.append({
-            "title": ai_m.get("title") or f"Auto Clip #{pick_num} ({s_sec:.0f}s–{e_sec:.0f}s)",
-            "start": s_sec,
-            "end": e_sec,
-            "mode": "Auto Clip",
-            "target_platform": target_platform,
-            "reason": spoken_txt[:150] if spoken_txt else (ai_m.get("reason") or f"Exact {desired_minutes:.2f} min ({dur_actual:.1f}s) auto-cut segment at {s_sec:.1f}s–{e_sec:.1f}s."),
-            "campaign_match": ai_m.get("campaign_match") or f"Exact {desired_minutes:.2f}m auto-clipped spot",
-            "hook": str(good_hook)[:85],
-            "risk": "",
-            "confidence": ai_m.get("confidence") or "high",
-        })
-    return results
-
-
 def build_campaign_caption_context(analysis: dict | None, brief: str) -> str:
     if not analysis:
         return brief.strip()[:2000]
@@ -899,9 +911,14 @@ def generate_social_copy(
 
     clip_title = (clip_info or {}).get("title") or f"Clip #{clip_index + 1}"
     clip_hook = (clip_info or {}).get("hook") or ""
-    clip_start = (clip_info or {}).get("start")
-    clip_end = (clip_info or {}).get("end")
-    window_label = f" ({float(clip_start):.0f}s–{float(clip_end):.0f}s)" if clip_start is not None and clip_end is not None else ""
+    moments = (clip_info or {}).get("moments") or []
+    if moments:
+        window_label = " (" + " + ".join(f"{float(m['start']):.0f}s–{float(m['end']):.0f}s" for m in moments) + ")"
+    else:
+        clip_start = (clip_info or {}).get("start")
+        clip_end = (clip_info or {}).get("end")
+        window_label = f" ({float(clip_start):.0f}s–{float(clip_end):.0f}s)" if clip_start is not None and clip_end is not None else ""
+
     req_note = custom_instructions.strip()
     camp_ctx = build_campaign_caption_context(analysis, brief)
     camp_reqs_list = (analysis or {}).get("caption_requirements") or (analysis or {}).get("must_include") or []
@@ -910,7 +927,7 @@ def generate_social_copy(
     if not client:
         angle_lines = [
             f"{clip_hook or clip_title}{window_label}",
-            f"What's in this clip: {transcript_text[:140].strip()}" if transcript_text.strip() else f"Focused moment #{clip_index + 1} tailored for {platform}.",
+            f"Peak moments: {transcript_text[:140].strip()}" if transcript_text.strip() else f"Stitched peak moments #{clip_index + 1} for {platform}.",
             camp_req_line,
             f"Custom note: {req_note}" if req_note else "",
             clean_tags,
@@ -919,18 +936,18 @@ def generate_social_copy(
         description = (
             f"{clip_title}{window_label} — {platform}\n\n"
             f"{camp_ctx[:900]}\n\n"
-            f"Clip Moment Notes: {transcript_text[:300].strip() if transcript_text.strip() else clip_hook}\n"
+            f"Moment Notes: {transcript_text[:300].strip() if transcript_text.strip() else clip_hook}\n"
             f"{'Extra Instructions: ' + req_note + chr(10) if req_note else ''}\n"
             f"{clean_tags}"
         ).strip()
         return {"caption": caption, "description": description}
 
     prompt = f"""You are writing a UNIQUE social media CAPTION and DESCRIPTION specifically for ONE video clip (Clip #{clip_index + 1}) on {platform}.
-Make sure this clip's caption is distinct from other clips in the same batch, reflects this clip's exact moment/transcript/hook, and satisfies every relevant campaign brief caption/content requirement.
+Make sure this clip's caption is distinct from other clips in the same batch, reflects this clip's stitched moments/transcript/hook, and satisfies every relevant campaign brief caption/content requirement.
 
 THIS CLIP DETAILS:
 {json.dumps(clip_info or {}, ensure_ascii=False)}
-THIS CLIP'S TRANSCRIPT SEGMENT:
+THIS CLIP'S TRANSCRIPT SEGMENTS:
 {transcript_text[:1800]}
 
 CAMPAIGN BRIEF & CAPTION REQUIREMENTS:
@@ -1043,6 +1060,35 @@ def build_caption_cues(
     return cues[:64]
 
 
+def build_stitched_caption_cues(
+    transcript: dict | None,
+    moments: list[dict],
+    max_chars: int = 34,
+) -> list[tuple[float, float, str]]:
+    """Maps spoken cues across each stitched sub-moment onto the unified concatenated timeline."""
+    stitched_cues: list[tuple[float, float, str]] = []
+    timeline_offset = 0.0
+    for m in moments:
+        m_start = float(m["start"])
+        m_end = float(m["end"])
+        m_dur = max(0.5, round(m_end - m_start, 2))
+        local_cues = build_caption_cues(
+            transcript=transcript,
+            start=m_start,
+            end=m_end,
+            fallback_text=m.get("text") or "",
+            max_chars=max_chars,
+        )
+        for c_a, c_b, c_txt in local_cues:
+            stitched_cues.append((
+                round(timeline_offset + c_a, 2),
+                round(timeline_offset + min(m_dur, c_b), 2),
+                c_txt,
+            ))
+        timeline_offset = round(timeline_offset + m_dur, 2)
+    return stitched_cues[:64]
+
+
 def write_srt_file(cues: list[tuple[float, float, str]], clip_duration: float, srt_path: Path) -> Path:
     """Writes valid SRT subtitle blocks clamped cleanly inside [0, clip_duration]."""
     blocks: list[str] = []
@@ -1064,56 +1110,41 @@ def write_srt_file(cues: list[tuple[float, float, str]], clip_duration: float, s
     return srt_path
 
 
-def resolve_sharp_dimensions(
+def resolve_target_dimensions(
     aspect: str,
     resolution: str,
     src_w: int,
     src_h: int,
-    clip_index: int = 0,
-) -> tuple[str | None, str | None, int, int]:
+) -> tuple[int, int, bool]:
+    """Returns (out_w, out_h, use_full_frame_fit_canvas)."""
     src_w = max(2, int(src_w or 1920))
     src_h = max(2, int(src_h or 1080))
-    pan_phase = (clip_index % 3) * 0.5
 
     if aspect == "9:16 Vertical":
-        if src_w / src_h > 9 / 16:
-            crop = f"crop=ih*9/16:ih:(iw-ih*9/16)*({pan_phase:.2f}+0.15*sin(t*0.6)):0"
-        else:
-            crop = f"crop=iw:min(ih\\,iw*16/9):0:(ih-min(ih\\,iw*16/9))*{pan_phase:.2f}"
         default_4k = (2160, 3840)
         default_1k = (1080, 1920)
         default_720 = (720, 1280)
-        cw, ch = default_1k
+        fit_canvas = True
     elif aspect == "16:9 Landscape":
-        if src_w / src_h < 16 / 9:
-            crop = f"crop=iw:iw*9/16:0:(ih-iw*9/16)*({pan_phase:.2f}+0.1*sin(t*0.5))"
-        else:
-            crop = f"crop=min(iw\\,ih*16/9):ih:(iw-min(iw\\,ih*16/9))*({pan_phase:.2f}+0.15*sin(t*0.5)):0"
         default_4k = (3840, 2160)
         default_1k = (1920, 1080)
         default_720 = (1280, 720)
-        cw, ch = default_1k
+        fit_canvas = (src_w / src_h) < (16 / 9)
     elif aspect == "1:1 Square":
-        crop = f"crop=min(iw\\,ih):min(iw\\,ih):(iw-min(iw\\,ih))*({pan_phase:.2f}+0.12*sin(t*0.5)):(ih-min(iw\\,ih))*0.45"
         default_4k = (2160, 2160)
         default_1k = (1080, 1080)
         default_720 = (720, 720)
-        cw, ch = default_1k
+        fit_canvas = True
     elif aspect == "4:5 Portrait":
-        if src_w / src_h > 4 / 5:
-            crop = f"crop=ih*4/5:ih:(iw-ih*4/5)*({pan_phase:.2f}+0.15*sin(t*0.5)):0"
-        else:
-            crop = f"crop=iw:iw*5/4:0:(ih-iw*5/4)*{pan_phase:.2f}"
         default_4k = (2160, 2700)
         default_1k = (1080, 1350)
         default_720 = (720, 900)
-        cw, ch = default_1k
+        fit_canvas = True
     else:
-        crop = None
         default_4k = (max(src_w, 3840), max(src_h, 2160))
         default_1k = (max(src_w, 1920), max(src_h, 1080))
         default_720 = (max(src_w, 1280), max(src_h, 720))
-        cw, ch = src_w, src_h
+        fit_canvas = False
 
     if resolution == "Match Source (Zero Resize Loss)" and aspect == "Keep original":
         tw, th = src_w, src_h
@@ -1124,11 +1155,126 @@ def resolve_sharp_dimensions(
     elif resolution == "720p HD":
         tw, th = default_720
     else:
-        tw, th = default_1k if aspect != "Keep original" else (cw, ch)
+        tw, th = default_1k if aspect != "Keep original" else (src_w, src_h)
 
     tw = max(2, int(tw) - (int(tw) % 2))
     th = max(2, int(th) - (int(th) % 2))
-    return crop, f"{tw}:{th}", tw, th
+    return tw, th, fit_canvas
+
+
+def build_frame_stage_filter(
+    in_label: str,
+    out_w: int,
+    out_h: int,
+    fit_canvas: bool,
+    out_label: str,
+) -> str:
+    """Renders the full video frame cleanly without cutting off edges on 9:16."""
+    if fit_canvas:
+        return (
+            f"[{in_label}]split=2[bg_src][fg_src];"
+            f"[bg_src]scale={out_w}:{out_h}:force_original_aspect_ratio=increase,"
+            f"crop={out_w}:{out_h},boxblur=20:10,eq=brightness=-0.18,setsar=1[bg_ready];"
+            f"[fg_src]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease:flags=lanczos,setsar=1[fg_ready];"
+            f"[bg_ready][fg_ready]overlay=(W-w)/2:(H-h)/2:format=auto[{out_label}]"
+        )
+    return (
+        f"[{in_label}]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease:flags=lanczos,"
+        f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:color=#090c13,setsar=1[{out_label}]"
+    )
+
+
+def append_overlays_and_subs(
+    graph: list[str],
+    current_label: str,
+    clip_duration: float,
+    out_w: int,
+    out_h: int,
+    logo: str | None,
+    cues: list[tuple[float, float, str]] | None,
+    hook_banner_text: str,
+    hook_banner_duration: float,
+    caption_font_size: int,
+    srt_output_path: str | None,
+    temp_text_files: list[Path],
+) -> tuple[str, str | None]:
+    current = current_label
+    srt_file: Path | None = None
+    font_opt = ""
+    sys_font = find_system_font()
+    if sys_font:
+        font_opt = f":fontfile='{sys_font}'"
+
+    clean_hook = (hook_banner_text or "").strip()
+    if clean_hook:
+        hook_txt_path = WORK_DIR / f"hook_{next(tempfile._get_candidate_names())}.txt"
+        hook_txt_path.write_text(clean_hook[:120], encoding="utf-8")
+        temp_text_files.append(hook_txt_path)
+        hook_file_esc = escape_ffmpeg_path(hook_txt_path)
+
+        hook_font_px = max(20, int(out_h * 0.025))
+        box_h = max(40, int(hook_font_px * 1.7))
+        top_y = max(24, int(out_h * 0.055))
+        active_end = min(clip_duration, max(1.0, float(hook_banner_duration)))
+        draw_hook = (
+            f"[{current}]drawbox=x=0:y={top_y - 6}:w=iw:h={box_h}:color=black@0.68:t=fill:"
+            f"enable='between(t,0,{active_end:.2f})',"
+            f"drawtext=textfile='{hook_file_esc}'{font_opt}:fontcolor=white:fontsize={hook_font_px}:"
+            f"x=(w-text_w)/2:y={top_y + (box_h - hook_font_px)//2 - 6}:"
+            f"box=1:boxcolor=black@0.45:boxborderw=6:"
+            f"enable='between(t,0,{active_end:.2f})'[vhook]"
+        )
+        graph.append(draw_hook)
+        current = "vhook"
+
+    has_logo = bool(logo and Path(logo).exists())
+    if has_logo:
+        graph += [
+            "[1:v]scale=iw*0.14:-1:flags=lanczos[logo]",
+            f"[{current}][logo]overlay=W-w-20:20:format=auto[vlogo]",
+        ]
+        current = "vlogo"
+
+    if cues:
+        if srt_output_path:
+            srt_file = write_srt_file(cues, clip_duration, Path(srt_output_path))
+
+        scale_ratio = out_h / 1080.0
+        sub_px = max(20, min(52, int(round(int(caption_font_size) * max(0.85, scale_ratio)))))
+        bottom_margin = max(68, min(int(out_h * 0.22), int(round(out_h * 0.095))))
+        line_step = int(sub_px * 1.32)
+        sub_filters: list[str] = []
+
+        for c_start, c_end, c_text in cues[:64]:
+            c_a = max(0.0, min(clip_duration, float(c_start)))
+            c_b = max(c_a + 0.15, min(clip_duration, float(c_end)))
+            lines_list = [
+                re.sub(r"\s+", " ", ln).strip()
+                for ln in (c_text or "").splitlines()
+                if ln.strip()
+            ][:2]
+            if not lines_list:
+                continue
+            total_block_h = line_step * len(lines_list)
+            base_y = out_h - bottom_margin - total_block_h
+            for l_i, raw_ln in enumerate(lines_list):
+                cue_file = WORK_DIR / f"cue_{next(tempfile._get_candidate_names())}.txt"
+                cue_file.write_text(raw_ln, encoding="utf-8")
+                temp_text_files.append(cue_file)
+                cue_file_esc = escape_ffmpeg_path(cue_file)
+                y_pos = max(16, base_y + (l_i * line_step))
+                sub_filters.append(
+                    f"drawtext=textfile='{cue_file_esc}'{font_opt}:fontcolor=white:fontsize={sub_px}:"
+                    f"x=(w-text_w)/2:y={y_pos}:"
+                    f"box=1:boxcolor=black@0.82:boxborderw=10:"
+                    f"enable='between(t,{c_a:.2f},{c_b:.2f})'"
+                )
+
+        if sub_filters:
+            graph.append(f"[{current}]{','.join(sub_filters)}[vsub]")
+            current = "vsub"
+
+    return current, (str(srt_file) if srt_file and srt_file.exists() else None)
 
 
 def render_video(
@@ -1155,99 +1301,31 @@ def render_video(
         raise RuntimeError("Source or broken-part video file is missing. Load or break the video again.")
 
     clip_duration = max(0.5, round(float(end) - float(start), 1))
-    crop, dims, out_w, out_h = resolve_sharp_dimensions(
-        aspect, resolution, src_w, src_h, clip_index=clip_index
-    )
+    out_w, out_h, fit_canvas = resolve_target_dimensions(aspect, resolution, src_w, src_h)
 
     graph: list[str] = []
-    current = "0:v"
-
-    if crop:
-        graph.append(f"[{current}]{crop},setsar=1[vcrop]")
-        current = "vcrop"
-
-    if dims:
-        graph.append(f"[{current}]scale={dims}:flags=bilinear,setsar=1[vscale]")
-        current = "vscale"
-
-    font_opt = ""
-    sys_font = find_system_font()
-    if sys_font:
-        font_opt = f":fontfile='{sys_font}'"
+    stage_filter = build_frame_stage_filter("0:v", out_w, out_h, fit_canvas, "vstage")
+    graph.append(stage_filter)
 
     temp_text_files: list[Path] = []
-    srt_file: Path | None = None
     try:
-        clean_hook = (hook_banner_text or "").strip()
-        if clean_hook:
-            hook_txt_path = WORK_DIR / f"hook_{next(tempfile._get_candidate_names())}.txt"
-            hook_txt_path.write_text(clean_hook[:120], encoding="utf-8")
-            temp_text_files.append(hook_txt_path)
-            hook_file_esc = escape_ffmpeg_path(hook_txt_path)
-
-            hook_font_px = max(20, int(out_h * 0.025))
-            box_h = max(40, int(hook_font_px * 1.7))
-            top_y = max(24, int(out_h * 0.055))
-            active_end = min(clip_duration, max(1.0, float(hook_banner_duration)))
-            draw_hook = (
-                f"[{current}]drawbox=x=0:y={top_y - 6}:w=iw:h={box_h}:color=black@0.68:t=fill:"
-                f"enable='between(t,0,{active_end:.2f})',"
-                f"drawtext=textfile='{hook_file_esc}'{font_opt}:fontcolor=white:fontsize={hook_font_px}:"
-                f"x=(w-text_w)/2:y={top_y + (box_h - hook_font_px)//2 - 6}:"
-                f"box=1:boxcolor=black@0.45:boxborderw=6:"
-                f"enable='between(t,0,{active_end:.2f})'[vhook]"
-            )
-            graph.append(draw_hook)
-            current = "vhook"
-
-        has_logo = bool(logo and Path(logo).exists())
-        if has_logo:
-            graph += [
-                "[1:v]scale=iw*0.14:-1:flags=bilinear[logo]",
-                f"[{current}][logo]overlay=W-w-20:20:format=auto[vlogo]",
-            ]
-            current = "vlogo"
-
-        if cues:
-            if srt_output_path:
-                srt_file = write_srt_file(cues, clip_duration, Path(srt_output_path))
-
-            scale_ratio = out_h / 1080.0
-            sub_px = max(20, min(52, int(round(int(caption_font_size) * max(0.85, scale_ratio)))))
-            bottom_margin = max(68, min(int(out_h * 0.22), int(round(out_h * 0.095))))
-            line_step = int(sub_px * 1.32)
-            sub_filters: list[str] = []
-
-            for c_start, c_end, c_text in cues[:64]:
-                c_a = max(0.0, min(clip_duration, float(c_start)))
-                c_b = max(c_a + 0.15, min(clip_duration, float(c_end)))
-                lines_list = [
-                    re.sub(r"\s+", " ", ln).strip()
-                    for ln in (c_text or "").splitlines()
-                    if ln.strip()
-                ][:2]
-                if not lines_list:
-                    continue
-                total_block_h = line_step * len(lines_list)
-                base_y = out_h - bottom_margin - total_block_h
-                for l_i, raw_ln in enumerate(lines_list):
-                    cue_file = WORK_DIR / f"cue_{next(tempfile._get_candidate_names())}.txt"
-                    cue_file.write_text(raw_ln, encoding="utf-8")
-                    temp_text_files.append(cue_file)
-                    cue_file_esc = escape_ffmpeg_path(cue_file)
-                    y_pos = max(16, base_y + (l_i * line_step))
-                    sub_filters.append(
-                        f"drawtext=textfile='{cue_file_esc}'{font_opt}:fontcolor=white:fontsize={sub_px}:"
-                        f"x=(w-text_w)/2:y={y_pos}:"
-                        f"box=1:boxcolor=black@0.82:boxborderw=10:"
-                        f"enable='between(t,{c_a:.2f},{c_b:.2f})'"
-                    )
-
-            if sub_filters:
-                graph.append(f"[{current}]{','.join(sub_filters)}[vsub]")
-                current = "vsub"
+        current, saved_srt = append_overlays_and_subs(
+            graph=graph,
+            current_label="vstage",
+            clip_duration=clip_duration,
+            out_w=out_w,
+            out_h=out_h,
+            logo=logo,
+            cues=cues,
+            hook_banner_text=hook_banner_text,
+            hook_banner_duration=hook_banner_duration,
+            caption_font_size=caption_font_size,
+            srt_output_path=srt_output_path,
+            temp_text_files=temp_text_files,
+        )
 
         args = ["ffmpeg", "-y", "-ss", str(round(float(start), 2)), "-i", source]
+        has_logo = bool(logo and Path(logo).exists())
         if has_logo:
             args += ["-i", str(logo)]
 
@@ -1255,11 +1333,7 @@ def render_video(
         if normalize_audio:
             audio_map += ["-af", "loudnorm=I=-14:TP=-1.5:LRA=11"]
 
-        if graph:
-            args += ["-filter_complex", ";".join(graph), "-map", f"[{current}]"]
-        else:
-            args += ["-map", "0:v"]
-
+        args += ["-filter_complex", ";".join(graph), "-map", f"[{current}]"]
         args += [
             *audio_map,
             "-t", str(clip_duration),
@@ -1275,7 +1349,103 @@ def render_video(
         p = run_cmd(args, timeout=1800)
         if p.returncode or not Path(output).exists():
             raise RuntimeError(p.stderr[-2500:] or "FFmpeg render failed.")
-        return str(srt_file) if srt_file and srt_file.exists() else None
+        return saved_srt
+    finally:
+        for tf in temp_text_files:
+            tf.unlink(missing_ok=True)
+        gc.collect()
+
+
+def render_stitched_clip(
+    source: str,
+    output: str,
+    moments: list[dict],
+    aspect: str,
+    resolution: str,
+    crf: int,
+    logo: str | None = None,
+    cues: list[tuple[float, float, str]] | None = None,
+    hook_banner_text: str = "",
+    hook_banner_duration: float = 8.0,
+    src_w: int = 1920,
+    src_h: int = 1080,
+    caption_font_size: int = 30,
+    encode_preset: str = "veryfast",
+    srt_output_path: str | None = None,
+) -> str | None:
+    """Trims multiple peak moments from source and concatenates them into ONE single clip."""
+    if not source or not Path(source).exists():
+        raise RuntimeError("Source video file is missing.")
+    if not moments:
+        raise RuntimeError("No peak moments selected to stitch.")
+
+    out_w, out_h, fit_canvas = resolve_target_dimensions(aspect, resolution, src_w, src_h)
+    graph: list[str] = []
+    concat_inputs: list[str] = []
+    total_dur = 0.0
+
+    for idx, m in enumerate(moments):
+        s_v = round(max(0.0, float(m["start"])), 2)
+        e_v = round(max(s_v + 0.5, float(m["end"])), 2)
+        seg_d = round(e_v - s_v, 2)
+        total_dur = round(total_dur + seg_d, 2)
+
+        v_trim = f"vt{idx}"
+        v_stage = f"vs{idx}"
+        a_trim = f"at{idx}"
+        graph.append(
+            f"[0:v]trim=start={s_v:.2f}:end={e_v:.2f},setpts=PTS-STARTPTS[{v_trim}]"
+        )
+        graph.append(build_frame_stage_filter(v_trim, out_w, out_h, fit_canvas, v_stage))
+        graph.append(
+            f"[0:a]atrim=start={s_v:.2f}:end={e_v:.2f},asetpts=PTS-STARTPTS,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[{a_trim}]"
+        )
+        concat_inputs.append(f"[{v_stage}][{a_trim}]")
+
+    n_seg = len(moments)
+    graph.append(
+        f"{''.join(concat_inputs)}concat=n={n_seg}:v=1:a=1[vconcat][aconcat]"
+    )
+
+    temp_text_files: list[Path] = []
+    try:
+        current, saved_srt = append_overlays_and_subs(
+            graph=graph,
+            current_label="vconcat",
+            clip_duration=max(0.5, total_dur),
+            out_w=out_w,
+            out_h=out_h,
+            logo=logo,
+            cues=cues,
+            hook_banner_text=hook_banner_text,
+            hook_banner_duration=hook_banner_duration,
+            caption_font_size=caption_font_size,
+            srt_output_path=srt_output_path,
+            temp_text_files=temp_text_files,
+        )
+
+        args = ["ffmpeg", "-y", "-i", source]
+        has_logo = bool(logo and Path(logo).exists())
+        if has_logo:
+            args += ["-i", str(logo)]
+
+        args += [
+            "-filter_complex", ";".join(graph),
+            "-map", f"[{current}]",
+            "-map", "[aconcat]",
+            "-c:v", "libx264",
+            "-preset", encode_preset,
+            "-crf", str(int(crf)),
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-b:a", "160k",
+            "-movflags", "+faststart",
+            output,
+        ]
+        p = run_cmd(args, timeout=1800)
+        if p.returncode or not Path(output).exists():
+            raise RuntimeError(p.stderr[-2500:] or "FFmpeg stitched render failed.")
+        return saved_srt
     finally:
         for tf in temp_text_files:
             tf.unlink(missing_ok=True)
@@ -1331,13 +1501,13 @@ init_state()
 
 # ----------------------------- HEADER & NAV -----------------------------
 st.markdown(f"""<div class="hero">
-<div style="color:#a5b4fc;font-weight:750;font-size:.76rem;letter-spacing:.13em">AUTO-CLIPPING (EXACT MINUTES) · MANUAL CLIPPING (START → END) · SRT + SUBTITLES</div>
+<div style="color:#a5b4fc;font-weight:750;font-size:.76rem;letter-spacing:.13em">FULL-FRAME 9:16 · MULTI-MOMENT PEAK STITCH · MANUAL START→END · SRT</div>
 <h1>🎬 {APP_NAME}</h1>
-<p class="muted">Auto-clip different spots across your video in exact minutes, or manually clip from one timestamp to another.</p>
-<span class="pill">Auto-clip different spots</span>
-<span class="pill">Exact minute length</span>
+<p class="muted">Auto-pick peak sub-moments across the video and stitch them into one clip at your target minutes, with full-frame 9:16 visibility.</p>
+<span class="pill">Full-frame 9:16</span>
+<span class="pill">Multi-moment peak stitch</span>
 <span class="pill">Manual start → end clipper</span>
-<span class="pill">Burned subtitles + .SRT</span>
+<span class="pill">Subtitles + .SRT</span>
 </div>""", unsafe_allow_html=True)
 
 if not ffmpeg_ready():
@@ -1452,7 +1622,7 @@ if page == "Campaign & Auto-Clipper":
             "Paste campaign requirements",
             key="brief",
             height=175,
-            placeholder="Example: Post vertical YouTube Shorts & Instagram Reels. Include hooks, bottom subtitles + SRT file, and hashtags.",
+            placeholder="Example: Post vertical YouTube Shorts & Instagram Reels. Stitch peak moments, show full frame in 9:16, include hooks & hashtags.",
         )
 
         p_col, c_col, min_col = st.columns(3)
@@ -1526,7 +1696,7 @@ if page == "Campaign & Auto-Clipper":
                             tr = None
                             if get_openai_client():
                                 try:
-                                    with st.spinner("Transcribing spoken words for bottom subtitles & SRT..."):
+                                    with st.spinner("Transcribing spoken words..."):
                                         tr = transcribe_video(st.session_state.source_video)
                                         st.session_state.transcript = tr
                                 except Exception as t_exc:
@@ -1550,7 +1720,7 @@ if page == "Campaign & Auto-Clipper":
                                 "ready": False,
                                 "verdict": "Campaign Analysed — Upload Video to Check Fit & Auto-Clip",
                                 "strengths": [],
-                                "gaps": ["Upload a campaign video on the left to match moments and auto-clip."],
+                                "gaps": ["Upload a campaign video on the left to pick peak moments and stitch clips."],
                                 "warnings": analysis.get("prohibited_content", []) or [],
                             }
                     st.success("Campaign feedback ready.")
@@ -1613,18 +1783,15 @@ if page == "Campaign & Auto-Clipper":
         with go_col2:
             if st.session_state.go_ahead_clips:
                 exact_s = minutes_to_seconds(float(st.session_state.auto_clip_minutes))
-                st.success(f"Go-ahead granted! Auto-clip target: {float(st.session_state.auto_clip_minutes):.2f} min ({exact_s:.1f}s) per clip.")
+                st.success(f"Go-ahead granted! Each stitched clip totals ~{float(st.session_state.auto_clip_minutes):.2f} min ({exact_s:.1f}s) across multiple peak moments.")
 
-    # Step 3: True Auto-Clipping (Different spots across video, exact desired minutes)
+    # Step 3: Auto-Clipper (Multi-moment peak stitch + full-frame 9:16)
     if st.session_state.go_ahead_clips and st.session_state.video_info and ffmpeg_ready():
         st.divider()
-        st.subheader("Step 3 · Auto-Clipper (Different Spots · Exact Desired Minutes)")
+        st.subheader("Step 3 · Auto-Clipper (Peak Moment Stitch + Full-Frame 9:16)")
         vi = st.session_state.video_info
         dur = max(1.0, float(vi["duration"]))
         use_subs = bool(st.session_state.get("burn_subtitles_chk_v2", True))
-
-        if use_subs and not st.session_state.transcript and not get_openai_client():
-            st.warning("No transcript available because `OPENAI_API_KEY` is not set—bottom subtitles will use transcript text only if available rather than live word-by-word speech.")
 
         ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([1.1, 1.0, 1.2, 1.0])
         with ctrl1:
@@ -1637,7 +1804,7 @@ if page == "Campaign & Auto-Clipper":
             )
         with ctrl2:
             st.number_input(
-                "How many auto clips",
+                "How many stitched clips",
                 min_value=1,
                 max_value=6,
                 step=1,
@@ -1650,7 +1817,7 @@ if page == "Campaign & Auto-Clipper":
         exact_target_sec = round(min(dur, minutes_to_seconds(active_minutes)), 1)
 
         with ctrl3:
-            if st.button("🔄 Pick Different Spots", use_container_width=True, key="pick_fresh_spots_btn"):
+            if st.button("🔄 Pick Different Peak Spots", use_container_width=True, key="pick_fresh_spots_btn"):
                 st.session_state.auto_candidates = build_auto_clip_candidates(
                     brief=st.session_state.brief,
                     transcript=st.session_state.transcript,
@@ -1675,9 +1842,10 @@ if page == "Campaign & Auto-Clipper":
                     used_windows=[],
                 )
 
+        default_asp = default_aspect_for_platform(st.session_state.target_platform_choice)
         st.caption(
-            f"Each auto-clipped segment will be **{active_minutes:.2f} min ({exact_target_sec:.1f}s)** from distinct spots in the video · "
-            f"Default aspect for {st.session_state.target_platform_choice}: **{default_aspect_for_platform(st.session_state.target_platform_choice)}**"
+            f"Each clip stitches multiple peak sub-moments summing to **{active_minutes:.2f} min ({exact_target_sec:.1f}s)** · "
+            f"Default aspect: **{default_asp}** (full video kept visible without side cropping)."
         )
 
         cands = st.session_state.auto_candidates or build_auto_clip_candidates(
@@ -1704,68 +1872,70 @@ if page == "Campaign & Auto-Clipper":
         with q_col3:
             encode_preset = st.selectbox("Encode speed/quality", ["veryfast", "fast", "ultrafast"], key="wf_encode_preset")
         with q_col4:
-            cap_size = st.slider("Bottom subtitle size", 22, 44, int(st.session_state.onscreen_caption_size), key="wf_cap_size")
+            cap_size = st.slider("Subtitle size", 22, 44, int(st.session_state.onscreen_caption_size), key="wf_cap_size")
 
-        default_asp = default_aspect_for_platform(st.session_state.target_platform_choice)
-
-        max_start_limit = max(0.0, dur - 0.5)
-        auto_windows_to_render: list[tuple[int, str, float, float, str, str, dict]] = []
         for idx, cand in enumerate(cands):
-            s_val = round(min(max_start_limit, max(0.0, float(cand["start"]))), 1)
-            e_val = round(min(dur, s_val + exact_target_sec), 1)
-            if e_val <= s_val:
-                e_val = round(min(dur, s_val + 0.5), 1)
-            spoken_now = transcript_slice(st.session_state.transcript, s_val, e_val)
-            hook_txt = cand.get("hook") or pick_good_hook(spoken_now, brief=st.session_state.brief, clip_index=idx)
-            seg_dur = round(e_val - s_val, 1)
-            st.info(
-                f"**Auto Spot {idx + 1}: {cand.get('title', f'Auto Clip {idx+1}')}** — "
-                f"`{fmt_time(s_val)}` → `{fmt_time(e_val)}` (**{seg_dur:.1f}s** / `{active_minutes:.2f} min`) · "
-                f"Hook: *{hook_txt}*"
+            moments = cand.get("moments") or build_stitched_peak_moments(
+                duration=dur,
+                desired_minutes=active_minutes,
+                used_windows=st.session_state.used_clip_windows,
+                transcript=st.session_state.transcript,
+                seed_offset=idx + 1,
             )
-            auto_windows_to_render.append((idx + 1, cand.get("title", f"Auto_Clip_{idx+1}"), s_val, e_val, default_asp, hook_txt, cand))
+            cand["moments"] = moments
+            stitched_sec = round(sum(max(0.1, float(m["end"]) - float(m["start"])) for m in moments), 1)
+            chain_str = "  ➜  ".join(
+                f"`{fmt_time(m['start'])}`–`{fmt_time(m['end'])}` ({round(float(m['end']) - float(m['start']), 1):.1f}s)"
+                for m in moments
+            )
+            st.info(
+                f"**{cand.get('title', f'Peak Stitch #{idx+1}')}** — Total: **{stitched_sec:.1f}s** (`{active_minutes:.2f} min`) · "
+                f"Hook: *{cand.get('hook', '')}*\n\nStitched spots: {chain_str}"
+            )
 
-        if st.button("⚡ Run Auto-Clipper (Render All Distinct Spots Now)", type="primary", use_container_width=True, key="wf_extract_clips_btn"):
+        if st.button("⚡ Run Auto Peak Stitch (Join Moments Into One Clip Each)", type="primary", use_container_width=True, key="wf_extract_clips_btn"):
             try:
                 if use_subs and not st.session_state.transcript and get_openai_client():
                     try:
-                        with st.spinner("Transcribing speech for bottom subtitles & SRT..."):
+                        with st.spinner("Transcribing speech..."):
                             st.session_state.transcript = transcribe_video(st.session_state.source_video)
                     except Exception:
                         pass
 
                 rendered_now = []
                 banner_dur = 8.0 if st.session_state.hook_banner_scope.startswith("8-Second") else 9999.0
-                for num, title, s_v, e_v, asp_v, h_txt, cand_meta in auto_windows_to_render:
-                    if e_v <= s_v:
+
+                for idx, cand in enumerate(cands):
+                    moments = cand.get("moments") or []
+                    if not moments:
                         continue
                     clip_num_global = len(st.session_state.clips) + 1
-                    base_stem = f"{safe_name(title)}_auto{clip_num_global}"
+                    base_stem = f"{safe_name(cand.get('title', f'Peak_Stitch_{clip_num_global}'))}_stitch{clip_num_global}"
                     out_file = WORK_DIR / f"{base_stem}.mp4"
                     srt_file = WORK_DIR / f"{base_stem}.srt"
-                    spoken_now = transcript_slice(st.session_state.transcript, s_v, e_v)
-                    final_hook = (h_txt or "").strip() or pick_good_hook(spoken_now, brief=st.session_state.brief, clip_index=clip_num_global - 1)
 
-                    wrap_chars = 26 if asp_v in {"9:16 Vertical", "4:5 Portrait", "1:1 Square"} else 38
-                    cues = []
-                    if use_subs:
-                        cues = build_caption_cues(
-                            transcript=st.session_state.transcript,
-                            start=s_v,
-                            end=e_v,
-                            fallback_text=spoken_now,
-                            max_chars=wrap_chars,
-                        )
+                    stitched_sec = round(sum(max(0.1, float(m["end"]) - float(m["start"])) for m in moments), 1)
+                    all_spoken = " ".join(
+                        m.get("text") or transcript_slice(st.session_state.transcript, float(m["start"]), float(m["end"]))
+                        for m in moments
+                    ).strip()
+                    final_hook = (cand.get("hook") or "").strip() or pick_good_hook(all_spoken, brief=st.session_state.brief, clip_index=clip_num_global - 1)
 
-                    with st.spinner(f"Auto-clipping spot {num}: {s_v:.1f}s – {e_v:.1f}s ({round(e_v - s_v, 1):.1f}s)..."):
-                        saved_srt = render_video(
-                            st.session_state.source_video,
-                            str(out_file),
-                            s_v,
-                            e_v,
-                            asp_v,
-                            sharp_res,
-                            sharp_crf,
+                    wrap_chars = 26 if default_asp in {"9:16 Vertical", "4:5 Portrait", "1:1 Square"} else 38
+                    cues = build_stitched_caption_cues(
+                        transcript=st.session_state.transcript,
+                        moments=moments,
+                        max_chars=wrap_chars,
+                    ) if use_subs else []
+
+                    with st.spinner(f"Stitching {len(moments)} peak moments into Clip {clip_num_global} ({stitched_sec:.1f}s) in {default_asp}..."):
+                        saved_srt = render_stitched_clip(
+                            source=st.session_state.source_video,
+                            output=str(out_file),
+                            moments=moments,
+                            aspect=default_asp,
+                            resolution=sharp_res,
+                            crf=sharp_crf,
                             logo=st.session_state.logo_path,
                             cues=cues if cues else None,
                             hook_banner_text=final_hook,
@@ -1774,37 +1944,39 @@ if page == "Campaign & Auto-Clipper":
                             src_h=int(vi.get("height") or 1080),
                             caption_font_size=int(cap_size),
                             encode_preset=encode_preset,
-                            normalize_audio=False,
-                            clip_index=clip_num_global - 1,
                             srt_output_path=str(srt_file),
                         )
-                    st.session_state.used_clip_windows.append([round(s_v, 1), round(e_v, 1)])
+
+                    for m in moments:
+                        st.session_state.used_clip_windows.append([round(float(m["start"]), 1), round(float(m["end"]), 1)])
+
                     clip_meta = {
-                        **cand_meta,
-                        "mode": "Auto Clip",
-                        "title": title,
-                        "start": s_v,
-                        "end": e_v,
-                        "aspect": asp_v,
+                        **cand,
+                        "mode": "Auto Peak Stitch",
+                        "title": cand.get("title", f"Peak Stitch #{clip_num_global}"),
+                        "moments": moments,
+                        "start": float(moments[0]["start"]),
+                        "end": round(float(moments[0]["start"]) + stitched_sec, 1),
+                        "aspect": default_asp,
                         "hook": final_hook,
-                        "transcript_excerpt": spoken_now,
+                        "transcript_excerpt": all_spoken,
                     }
                     init_copy = generate_social_copy(
                         platform=st.session_state.target_platform_choice,
                         brief=st.session_state.brief,
                         analysis=st.session_state.brief_analysis,
                         clip_info=clip_meta,
-                        transcript_text=spoken_now,
+                        transcript_text=all_spoken,
                         custom_instructions=st.session_state.caption_instructions,
                         clip_index=clip_num_global - 1,
                     )
                     rec = {
-                        "name": f"{title} ({asp_v})",
+                        "name": f"{clip_meta['title']} ({default_asp})",
                         "path": str(out_file),
                         "srt_path": saved_srt,
-                        "start": s_v,
-                        "end": e_v,
-                        "aspect": asp_v,
+                        "start": float(moments[0]["start"]),
+                        "end": round(float(moments[0]["start"]) + stitched_sec, 1),
+                        "aspect": default_asp,
                         "resolution": sharp_res,
                         "meta": clip_meta,
                         "caption": init_copy["caption"],
@@ -1824,9 +1996,9 @@ if page == "Campaign & Auto-Clipper":
                         desired_minutes=active_minutes,
                         used_windows=st.session_state.used_clip_windows,
                     )
-                    st.success(f"Auto-clipped {len(rendered_now)} distinct segment(s) at {active_minutes:.2f} min each.")
+                    st.success(f"Stitched {len(rendered_now)} peak-moment clip(s) at ~{active_minutes:.2f} min each in full-frame {default_asp}.")
             except Exception as exc:
-                st.error(f"Auto-clip render error: {exc}")
+                st.error(f"Auto-clip stitch error: {exc}")
 
 # ----------------------------- PAGE 2: MANUAL CLIPPER (START -> END) --
 elif page == "Manual Clipper (Start → End)":
@@ -1967,7 +2139,7 @@ elif page == "Brand Kit & Settings":
 # ----------------------------- SHARED GENERATED CLIPS SECTION --------
 if st.session_state.clips:
     st.divider()
-    st.subheader("Generated Clips (Auto & Manual) + Per-Clip Campaign Captions")
+    st.subheader("Generated Clips (Peak Stitch & Manual) + Per-Clip Campaign Captions")
     st.text_area(
         "Optional extra caption/CTA note for clips",
         key="caption_instructions",
@@ -2014,10 +2186,16 @@ if st.session_state.clips:
         with st.container(border=True):
             c_vid, c_cap = st.columns([1.25, 1.35], gap="large")
             actual_sec = round(float(cl["end"]) - float(cl["start"]), 1)
-            clip_mode = (cl.get("meta") or {}).get("mode") or "Clip"
+            c_meta = cl.get("meta") or {}
+            clip_mode = c_meta.get("mode") or "Clip"
+            moments_list = c_meta.get("moments") or []
             with c_vid:
                 st.markdown(f"**Clip {idx + 1} [{clip_mode}]: {cl['name']}**")
-                st.caption(f"{fmt_time(cl['start'])} → {fmt_time(cl['end'])} ({actual_sec:.1f}s) · {cl['aspect']} · {cl['resolution']}")
+                if moments_list:
+                    m_txt = " + ".join(f"{float(m['start']):.0f}s–{float(m['end']):.0f}s" for m in moments_list)
+                    st.caption(f"Stitched: {m_txt} ({actual_sec:.1f}s total) · {cl['aspect']} · {cl['resolution']}")
+                else:
+                    st.caption(f"{fmt_time(cl['start'])} → {fmt_time(cl['end'])} ({actual_sec:.1f}s) · {cl['aspect']} · {cl['resolution']}")
                 if Path(cl["path"]).exists():
                     st.video(cl["path"])
                     dl_c1, dl_c2 = st.columns(2)
@@ -2050,7 +2228,6 @@ if st.session_state.clips:
                     use_container_width=True,
                     key=f"get_cap_short_{idx}",
                 ):
-                    c_meta = cl.get("meta") or {"title": cl["name"], "start": cl["start"], "end": cl["end"]}
                     t_seg = c_meta.get("transcript_excerpt") or transcript_slice(st.session_state.transcript, cl["start"], cl["end"])
                     with st.spinner(f"Writing campaign-matched caption for Clip {idx+1}..."):
                         pack = generate_social_copy(
