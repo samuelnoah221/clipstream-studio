@@ -726,6 +726,9 @@ def render_video(
     src_h: int = 1080,
     caption_font_size: int = 24,
 ):
+    if not source or not Path(source).exists():
+        raise RuntimeError("Source video file is no longer in temporary storage. Please re-upload and load your video.")
+
     crop, dims, out_w, out_h = resolve_sharp_dimensions(aspect, resolution, src_w, src_h)
     filters = []
     if crop:
@@ -739,7 +742,8 @@ def render_video(
 
     vf = ",".join(filters) if filters else "null"
     args = ["ffmpeg", "-y", "-ss", str(start), "-i", source]
-    if logo:
+    has_logo = bool(logo and Path(logo).exists())
+    if has_logo:
         args += ["-i", logo]
 
     graph = [f"[0:v]{vf}[v0]"]
@@ -763,11 +767,11 @@ def render_video(
         graph.append(draw_hook)
         current = "vhook"
 
-    if logo:
+    if has_logo:
         graph += ["[1:v]scale=iw*0.16:-1:flags=lanczos[logo]", f"[{current}][logo]overlay=W-w-24:24:format=auto[vlogo]"]
         current = "vlogo"
 
-    if srt:
+    if srt and Path(srt).exists():
         srt_path = Path(srt).resolve().as_posix().replace(":", "\\:")
         style = (
             f"Alignment=2,FontSize={int(caption_font_size)},PrimaryColour=&H00FFFFFF,"
@@ -803,6 +807,7 @@ def init_state():
         "target_platform_choice": "YouTube Shorts / Reels",
         "desired_clip_count": 2,
         "desired_clip_minutes": 0.50,
+        "step3_clip_minutes": 0.50,
         "used_clip_windows": [],
         "hook_mode_choice": "Auto (8s if requested by campaign)",
         "hook_banner_scope": "8-Second Top Banner (0–8s)",
@@ -850,7 +855,7 @@ with st.sidebar:
         "Editor & Templates",
         "Caption & Description Studio",
         "Brand Kit & Settings",
-    ], label_visibility="collapsed")
+    ], label_visibility="collapsed", key="nav_page_radio")
     st.divider()
     st.metric("Go-Ahead Status", "Approved" if st.session_state.go_ahead_clips else "Pending Review")
     st.metric("Used Clip Ranges", len(st.session_state.used_clip_windows))
@@ -883,7 +888,7 @@ if page == "Campaign & Clip Workflow":
             except Exception as exc:
                 st.error(f"Video error: {exc}")
 
-        if st.session_state.video_info:
+        if st.session_state.video_info and st.session_state.source_video and Path(st.session_state.source_video).exists():
             vi = st.session_state.video_info
             st.video(st.session_state.source_video)
             m1, m2, m3 = st.columns(3)
@@ -961,6 +966,7 @@ if page == "Campaign & Clip Workflow":
                     with st.spinner("Analysing campaign requirements and inspecting video..."):
                         analysis = ai_campaign_analysis(st.session_state.brief, st.session_state.project_name)
                         st.session_state.brief_analysis = analysis
+                        st.session_state.step3_clip_minutes = float(st.session_state.desired_clip_minutes)
 
                         if analysis.get("requires_onscreen_captions"):
                             st.session_state.burn_onscreen_captions = True
@@ -970,7 +976,7 @@ if page == "Campaign & Clip Workflow":
                         elif analysis.get("requires_video_hook"):
                             st.session_state.hook_banner_scope = "Full Clip Top Banner"
 
-                        if st.session_state.source_video and st.session_state.video_info:
+                        if st.session_state.source_video and st.session_state.video_info and Path(st.session_state.source_video).exists():
                             try:
                                 tr = transcribe_video(st.session_state.source_video)
                                 st.session_state.transcript = tr
@@ -1039,6 +1045,7 @@ if page == "Campaign & Clip Workflow":
                 use_container_width=True,
                 key="wf_go_ahead_btn"
             ):
+                st.session_state.step3_clip_minutes = float(st.session_state.desired_clip_minutes)
                 if st.session_state.video_info:
                     st.session_state.highlights = build_non_repeating_candidates(
                         brief=st.session_state.brief,
@@ -1047,7 +1054,7 @@ if page == "Campaign & Clip Workflow":
                         duration=st.session_state.video_info["duration"],
                         target_platform=st.session_state.target_platform_choice,
                         clip_count=st.session_state.desired_clip_count,
-                        desired_minutes=float(st.session_state.desired_clip_minutes),
+                        desired_minutes=float(st.session_state.step3_clip_minutes),
                         used_windows=st.session_state.used_clip_windows,
                         hook_mode=st.session_state.hook_mode_choice,
                     )
@@ -1056,25 +1063,25 @@ if page == "Campaign & Clip Workflow":
 
         with go_col2:
             if st.session_state.go_ahead_clips:
-                st.success(f"Go-ahead granted! Target clip length: {float(st.session_state.desired_clip_minutes):.2f} min ({float(st.session_state.desired_clip_minutes)*60:.0f}s).")
+                st.success(f"Go-ahead granted! Target clip length: {float(st.session_state.step3_clip_minutes):.2f} min ({float(st.session_state.step3_clip_minutes)*60:.0f}s).")
 
     # Step 3: 1-2 Non-Repeating Clip Extraction
     if st.session_state.go_ahead_clips and st.session_state.video_info and ffmpeg_ready():
         st.divider()
         st.subheader(f"Step 3 · Extract 1–2 Fresh Clips ({st.session_state.target_platform_choice})")
         vi = st.session_state.video_info
-        dur = float(vi["duration"])
+        dur = max(1.0, float(vi["duration"]))
 
         ctrl1, ctrl2, ctrl3 = st.columns([1.2, 1.2, 1])
         with ctrl1:
             st.number_input(
-                "Desired clip length (minutes)",
+                "Adjust clip length (minutes)",
                 min_value=0.10,
                 max_value=15.0,
                 step=0.25,
-                key="desired_clip_minutes"
+                key="step3_clip_minutes"
             )
-        active_minutes = float(st.session_state.desired_clip_minutes)
+        active_minutes = float(st.session_state.step3_clip_minutes)
 
         with ctrl2:
             if st.button("🔄 Pick Fresh Non-Repeating Spots", use_container_width=True, key="pick_fresh_spots_btn"):
@@ -1137,27 +1144,30 @@ if page == "Campaign & Clip Workflow":
 
         chosen_windows = []
         run_tag = len(st.session_state.used_clip_windows)
+        max_start_limit = max(0.0, dur - 0.5)
         for idx, cand in enumerate(cands):
             with st.container(border=True):
                 st.markdown(f"**Clip {idx + 1}: {cand.get('title', f'Highlight {idx+1}')}**")
                 st.caption(f"AI Reason: {cand.get('reason', '')}")
                 wc1, wc2, wc3 = st.columns([1, 1, 1.4])
                 with wc1:
+                    init_s = min(max_start_limit, max(0.0, float(cand["start"])))
                     s_val = st.number_input(
                         f"Start (sec) — Clip {idx+1}",
-                        0.0,
-                        max(0.5, dur - 0.5),
-                        float(cand["start"]),
+                        min_value=0.0,
+                        max_value=max(0.5, max_start_limit),
+                        value=init_s,
                         step=0.5,
                         key=f"c_start_{run_tag}_{idx}"
                     )
                 with wc2:
                     calc_end = min(dur, float(s_val) + active_minutes * 60.0)
+                    init_e = max(min(dur, float(s_val) + 0.5), float(calc_end))
                     e_val = st.number_input(
                         f"End (sec) — Clip {idx+1}",
-                        0.5,
-                        max(0.5, dur),
-                        max(float(s_val) + 1.0, float(calc_end)),
+                        min_value=0.5,
+                        max_value=max(0.5, dur),
+                        value=init_e,
                         step=0.5,
                         key=f"c_end_{run_tag}_{idx}"
                     )
@@ -1176,78 +1186,81 @@ if page == "Campaign & Clip Workflow":
                 chosen_windows.append((idx + 1, cand.get("title", f"Clip_{idx+1}"), float(s_val), float(e_val), asp_val, hook_txt, cand))
 
         if st.button("✂️ Extract & Render Sharp Clips Now", type="primary", use_container_width=True, key="wf_extract_clips_btn"):
-            rendered_now = []
-            banner_dur = 8.0 if st.session_state.hook_banner_scope.startswith("8-Second") else 9999.0
-            for num, title, s_v, e_v, asp_v, h_txt, cand_meta in chosen_windows:
-                if e_v <= s_v:
-                    st.warning(f"Clip {num}: End time must be greater than start time.")
-                    continue
-                out_file = WORK_DIR / f"{safe_name(title)}_clip{num}_{len(st.session_state.clips)+1}.mp4"
-                srt_file = None
-                if st.session_state.burn_onscreen_captions:
-                    srt_txt = build_lower_third_srt(
+            try:
+                rendered_now = []
+                banner_dur = 8.0 if st.session_state.hook_banner_scope.startswith("8-Second") else 9999.0
+                for num, title, s_v, e_v, asp_v, h_txt, cand_meta in chosen_windows:
+                    if e_v <= s_v:
+                        st.warning(f"Clip {num}: End time must be greater than start time.")
+                        continue
+                    out_file = WORK_DIR / f"{safe_name(title)}_clip{num}_{len(st.session_state.clips)+1}.mp4"
+                    srt_file = None
+                    if st.session_state.burn_onscreen_captions:
+                        srt_txt = build_lower_third_srt(
+                            transcript=st.session_state.transcript,
+                            start=s_v,
+                            end=e_v,
+                            fallback_caption_text=st.session_state.caption_instructions or st.session_state.brief,
+                        )
+                        if srt_txt.strip():
+                            srt_file = WORK_DIR / f"{safe_name(title)}_clip{num}.srt"
+                            srt_file.write_text(srt_txt, encoding="utf-8")
+
+                    with st.spinner(f"Rendering sharp Clip {num} ({s_v:.1f}s – {e_v:.1f}s)..."):
+                        render_video(
+                            st.session_state.source_video,
+                            str(out_file),
+                            s_v,
+                            e_v,
+                            asp_v,
+                            sharp_res,
+                            sharp_crf,
+                            logo=st.session_state.logo_path,
+                            srt=str(srt_file) if srt_file else None,
+                            hook_banner_text=h_txt,
+                            hook_banner_duration=banner_dur,
+                            src_w=int(vi.get("width") or 1920),
+                            src_h=int(vi.get("height") or 1080),
+                            caption_font_size=int(cap_size),
+                        )
+                    st.session_state.used_clip_windows.append([round(s_v, 1), round(e_v, 1)])
+                    rec = {
+                        "name": f"{title} ({st.session_state.target_platform_choice})",
+                        "path": str(out_file),
+                        "start": s_v,
+                        "end": e_v,
+                        "aspect": asp_v,
+                        "resolution": sharp_res,
+                        "meta": {**cand_meta, "hook": h_txt or cand_meta.get("hook", "")},
+                    }
+                    st.session_state.clips.append(rec)
+                    rendered_now.append(rec)
+
+                if rendered_now:
+                    st.session_state.highlights = build_non_repeating_candidates(
+                        brief=st.session_state.brief,
                         transcript=st.session_state.transcript,
-                        start=s_v,
-                        end=e_v,
-                        fallback_caption_text=st.session_state.caption_instructions or st.session_state.brief,
+                        contact_sheet=None,
+                        duration=dur,
+                        target_platform=st.session_state.target_platform_choice,
+                        clip_count=st.session_state.desired_clip_count,
+                        desired_minutes=active_minutes,
+                        used_windows=st.session_state.used_clip_windows,
+                        hook_mode=st.session_state.hook_mode_choice,
                     )
-                    if srt_txt.strip():
-                        srt_file = WORK_DIR / f"{safe_name(title)}_clip{num}.srt"
-                        srt_file.write_text(srt_txt, encoding="utf-8")
-
-                with st.spinner(f"Rendering sharp Clip {num} ({s_v:.1f}s – {e_v:.1f}s)..."):
-                    render_video(
-                        st.session_state.source_video,
-                        str(out_file),
-                        s_v,
-                        e_v,
-                        asp_v,
-                        sharp_res,
-                        sharp_crf,
-                        logo=st.session_state.logo_path,
-                        srt=str(srt_file) if srt_file else None,
-                        hook_banner_text=h_txt,
-                        hook_banner_duration=banner_dur,
-                        src_w=int(vi.get("width") or 1920),
-                        src_h=int(vi.get("height") or 1080),
-                        caption_font_size=int(cap_size),
+                    copy_pack = generate_social_copy(
+                        platform=st.session_state.target_platform_choice,
+                        brief=st.session_state.brief,
+                        analysis=st.session_state.brief_analysis,
+                        clip_info=rendered_now[0].get("meta"),
+                        transcript_text=((st.session_state.transcript or {}).get("text") or ""),
+                        custom_instructions=st.session_state.caption_instructions,
                     )
-                st.session_state.used_clip_windows.append([round(s_v, 1), round(e_v, 1)])
-                rec = {
-                    "name": f"{title} ({st.session_state.target_platform_choice})",
-                    "path": str(out_file),
-                    "start": s_v,
-                    "end": e_v,
-                    "aspect": asp_v,
-                    "resolution": sharp_res,
-                    "meta": {**cand_meta, "hook": h_txt or cand_meta.get("hook", "")},
-                }
-                st.session_state.clips.append(rec)
-                rendered_now.append(rec)
-
-            if rendered_now:
-                st.session_state.highlights = build_non_repeating_candidates(
-                    brief=st.session_state.brief,
-                    transcript=st.session_state.transcript,
-                    contact_sheet=None,
-                    duration=dur,
-                    target_platform=st.session_state.target_platform_choice,
-                    clip_count=st.session_state.desired_clip_count,
-                    desired_minutes=active_minutes,
-                    used_windows=st.session_state.used_clip_windows,
-                    hook_mode=st.session_state.hook_mode_choice,
-                )
-                copy_pack = generate_social_copy(
-                    platform=st.session_state.target_platform_choice,
-                    brief=st.session_state.brief,
-                    analysis=st.session_state.brief_analysis,
-                    clip_info=rendered_now[0].get("meta"),
-                    transcript_text=((st.session_state.transcript or {}).get("text") or ""),
-                    custom_instructions=st.session_state.caption_instructions,
-                )
-                st.session_state.social_caption = copy_pack["caption"]
-                st.session_state.social_description = copy_pack["description"]
-                st.success(f"Extracted {len(rendered_now)} sharp clip(s) and queued fresh non-repeating picks for your next run.")
+                    st.session_state.social_caption = copy_pack["caption"]
+                    st.session_state.social_description = copy_pack["description"]
+                    st.success(f"Extracted {len(rendered_now)} sharp clip(s) and queued fresh non-repeating picks for your next run.")
+            except Exception as exc:
+                st.error(f"Clip render error: {exc}")
 
     if st.session_state.clips:
         st.divider()
@@ -1279,55 +1292,60 @@ elif page == "Editor & Templates":
         st.info("Upload and load a video in 'Campaign & Clip Workflow' first.")
     else:
         vi = st.session_state.video_info
-        st.video(st.session_state.source_video)
+        dur_ed = max(1.0, float(vi["duration"]))
+        if st.session_state.source_video and Path(st.session_state.source_video).exists():
+            st.video(st.session_state.source_video)
         a, b = st.columns(2)
         with a:
-            start = st.number_input("Start (seconds)", 0.0, float(max(vi["duration"], 0.1)), 0.0, step=0.5)
-            end = st.number_input("End (seconds)", 0.1, float(max(vi["duration"], 0.1)), min(30.0, float(max(vi["duration"], 0.1))), step=0.5)
-            clip_name = st.text_input("Clip name", value=safe_name(Path(st.session_state.video_name or "clip").stem + "_edit"))
-            hook_line = st.text_input("Top hook banner text", value="")
-            hook_dur_opt = st.selectbox("Top hook duration", ["8s Banner", "Full Clip Banner"])
+            start = st.number_input("Start (seconds)", min_value=0.0, max_value=max(0.5, dur_ed - 0.5), value=0.0, step=0.5, key="ed_start_sec")
+            end = st.number_input("End (seconds)", min_value=0.5, max_value=dur_ed, value=min(30.0, dur_ed), step=0.5, key="ed_end_sec")
+            clip_name = st.text_input("Clip name", value=safe_name(Path(st.session_state.video_name or "clip").stem + "_edit"), key="ed_clip_name")
+            hook_line = st.text_input("Top hook banner text", value="", key="ed_hook_line")
+            hook_dur_opt = st.selectbox("Top hook duration", ["8s Banner", "Full Clip Banner"], key="ed_hook_dur")
         with b:
-            aspect = st.selectbox("Aspect ratio", ["9:16 Vertical", "16:9 Landscape", "1:1 Square", "4:5 Portrait", "Keep original"])
-            resolution = st.selectbox("Sharpness / Resolution", ["Source or Better (Auto Sharp)", "4K Ultra Sharp", "1080p Full HD", "720p HD"])
-            crf = st.slider("Visual detail CRF (lower = sharper)", 16, 24, 17)
-            add_logo = st.checkbox("Include saved brand logo", value=bool(st.session_state.logo_path))
-            add_sub = st.checkbox("Burn lower-third captions", value=True)
+            aspect = st.selectbox("Aspect ratio", ["9:16 Vertical", "16:9 Landscape", "1:1 Square", "4:5 Portrait", "Keep original"], key="ed_aspect")
+            resolution = st.selectbox("Sharpness / Resolution", ["Source or Better (Auto Sharp)", "4K Ultra Sharp", "1080p Full HD", "720p HD"], key="ed_resolution")
+            crf = st.slider("Visual detail CRF (lower = sharper)", 16, 24, 17, key="ed_crf")
+            add_logo = st.checkbox("Include saved brand logo", value=bool(st.session_state.logo_path), key="ed_add_logo")
+            add_sub = st.checkbox("Burn lower-third captions", value=True, key="ed_add_sub")
 
-        if st.button("Render Sharp Clip", type="primary", use_container_width=True):
+        if st.button("Render Sharp Clip", type="primary", use_container_width=True, key="ed_render_btn"):
             if end <= start:
                 st.error("End time must be greater than start time.")
             elif ffmpeg_ready():
-                out = WORK_DIR / f"{safe_name(clip_name)}_{len(st.session_state.clips)+1}.mp4"
-                srt_path = None
-                if add_sub:
-                    s_txt = build_lower_third_srt(
-                        transcript=st.session_state.transcript,
-                        start=start,
-                        end=end,
-                        fallback_caption_text=st.session_state.caption_instructions or st.session_state.brief,
-                    )
-                    if s_txt.strip():
-                        srt_path = WORK_DIR / f"{safe_name(clip_name)}.srt"
-                        srt_path.write_text(s_txt, encoding="utf-8")
-                with st.spinner("Rendering sharp clip..."):
-                    render_video(
-                        st.session_state.source_video, str(out), start, end,
-                        aspect, resolution, crf,
-                        logo=st.session_state.logo_path if add_logo else None,
-                        srt=str(srt_path) if srt_path else None,
-                        hook_banner_text=hook_line,
-                        hook_banner_duration=8.0 if hook_dur_opt.startswith("8s") else 9999.0,
-                        src_w=int(vi.get("width") or 1920),
-                        src_h=int(vi.get("height") or 1080),
-                    )
-                st.session_state.used_clip_windows.append([round(start, 1), round(end, 1)])
-                st.session_state.clips.append({
-                    "name": clip_name, "path": str(out), "start": start,
-                    "end": end, "aspect": aspect, "resolution": resolution
-                })
-                st.success("Sharp clip rendered.")
-                st.video(str(out))
+                try:
+                    out = WORK_DIR / f"{safe_name(clip_name)}_{len(st.session_state.clips)+1}.mp4"
+                    srt_path = None
+                    if add_sub:
+                        s_txt = build_lower_third_srt(
+                            transcript=st.session_state.transcript,
+                            start=start,
+                            end=end,
+                            fallback_caption_text=st.session_state.caption_instructions or st.session_state.brief,
+                        )
+                        if s_txt.strip():
+                            srt_path = WORK_DIR / f"{safe_name(clip_name)}.srt"
+                            srt_path.write_text(s_txt, encoding="utf-8")
+                    with st.spinner("Rendering sharp clip..."):
+                        render_video(
+                            st.session_state.source_video, str(out), start, end,
+                            aspect, resolution, crf,
+                            logo=st.session_state.logo_path if add_logo else None,
+                            srt=str(srt_path) if srt_path else None,
+                            hook_banner_text=hook_line,
+                            hook_banner_duration=8.0 if hook_dur_opt.startswith("8s") else 9999.0,
+                            src_w=int(vi.get("width") or 1920),
+                            src_h=int(vi.get("height") or 1080),
+                        )
+                    st.session_state.used_clip_windows.append([round(start, 1), round(end, 1)])
+                    st.session_state.clips.append({
+                        "name": clip_name, "path": str(out), "start": start,
+                        "end": end, "aspect": aspect, "resolution": resolution
+                    })
+                    st.success("Sharp clip rendered.")
+                    st.video(str(out))
+                except Exception as exc:
+                    st.error(f"Render error: {exc}")
 
 # ----------------------------- PAGE 3: CAPTION & DESCRIPTION STUDIO -----
 elif page == "Caption & Description Studio":
@@ -1384,7 +1402,8 @@ elif page == "Caption & Description Studio":
         data=combined_copy,
         file_name=f"clipstream_{safe_name(copy_platform)}_copy.txt",
         mime="text/plain",
-        use_container_width=True
+        use_container_width=True,
+        key="dl_copy_txt_btn"
     )
 
 # ----------------------------- PAGE 4: BRAND KIT & SETTINGS ------------
