@@ -239,14 +239,12 @@ def pick_fresh_windows(
     target_len = min(duration, target_len)
 
     max_start = max(0.0, duration - target_len)
-    # Build varied candidate start anchors across the video (not just 0.0s)
     if max_start <= 0.0:
         anchors = [0.0]
     else:
         fractions = [0.12, 0.34, 0.58, 0.78, 0.22, 0.68, 0.0, 0.90]
         random.shuffle(fractions)
         anchors = [round(max(0.0, min(max_start, f * max_start)), 1) for f in fractions]
-        # Add jittered points so repeated runs keep finding fresh spots
         for _ in range(8):
             anchors.append(round(random.uniform(0.0, max_start), 1))
 
@@ -254,14 +252,12 @@ def pick_fresh_windows(
     picked: list[tuple[float, float, str]] = []
 
     def spoken_at(s_sec: float, e_sec: float) -> str:
-        txt = " ".join(
+        return " ".join(
             str(sg.get("text", "")).strip()
             for sg in segs
             if float(sg.get("end", 0)) >= s_sec and float(sg.get("start", 0)) <= e_sec
         ).strip()
-        return txt
 
-    # Pass 1: find windows that do not overlap previously used windows or each other
     combined_used = list(used_windows)
     for anc in anchors:
         if len(picked) >= count:
@@ -271,11 +267,9 @@ def pick_fresh_windows(
         if e_val <= s_val:
             continue
         if not overlaps_used(s_val, e_val, combined_used, min_gap=2.0):
-            sp = spoken_at(s_val, e_val)
-            picked.append((s_val, e_val, sp))
+            picked.append((s_val, e_val, spoken_at(s_val, e_val)))
             combined_used.append([s_val, e_val])
 
-    # Pass 2: if video is short and all windows overlapped, still return distinct windows if possible
     if len(picked) < count:
         for anc in anchors:
             if len(picked) >= count:
@@ -286,8 +280,7 @@ def pick_fresh_windows(
                 continue
             if any(abs(s_val - ps) < 1.5 and abs(e_val - pe) < 1.5 for ps, pe, _ in picked):
                 continue
-            sp = spoken_at(s_val, e_val)
-            picked.append((s_val, e_val, sp))
+            picked.append((s_val, e_val, spoken_at(s_val, e_val)))
 
     return picked[:count]
 
@@ -991,7 +984,7 @@ if page == "Campaign & Clip Workflow":
                                 duration=st.session_state.video_info["duration"],
                                 target_platform=st.session_state.target_platform_choice,
                                 clip_count=st.session_state.desired_clip_count,
-                                desired_minutes=st.session_state.desired_clip_minutes,
+                                desired_minutes=float(st.session_state.desired_clip_minutes),
                                 used_windows=st.session_state.used_clip_windows,
                                 hook_mode=st.session_state.hook_mode_choice,
                             )
@@ -1054,7 +1047,7 @@ if page == "Campaign & Clip Workflow":
                         duration=st.session_state.video_info["duration"],
                         target_platform=st.session_state.target_platform_choice,
                         clip_count=st.session_state.desired_clip_count,
-                        desired_minutes=st.session_state.desired_clip_minutes,
+                        desired_minutes=float(st.session_state.desired_clip_minutes),
                         used_windows=st.session_state.used_clip_windows,
                         hook_mode=st.session_state.hook_mode_choice,
                     )
@@ -1063,7 +1056,7 @@ if page == "Campaign & Clip Workflow":
 
         with go_col2:
             if st.session_state.go_ahead_clips:
-                st.success(f"Go-ahead granted! Target clip length: {st.session_state.desired_clip_minutes:.2f} min ({st.session_state.desired_clip_minutes*60:.0f}s).")
+                st.success(f"Go-ahead granted! Target clip length: {float(st.session_state.desired_clip_minutes):.2f} min ({float(st.session_state.desired_clip_minutes)*60:.0f}s).")
 
     # Step 3: 1-2 Non-Repeating Clip Extraction
     if st.session_state.go_ahead_clips and st.session_state.video_info and ffmpeg_ready():
@@ -1074,17 +1067,17 @@ if page == "Campaign & Clip Workflow":
 
         ctrl1, ctrl2, ctrl3 = st.columns([1.2, 1.2, 1])
         with ctrl1:
-            clip_min_live = st.number_input(
+            st.number_input(
                 "Desired clip length (minutes)",
                 min_value=0.10,
                 max_value=15.0,
-                value=float(st.session_state.desired_clip_minutes),
                 step=0.25,
-                key="live_clip_minutes"
+                key="desired_clip_minutes"
             )
+        active_minutes = float(st.session_state.desired_clip_minutes)
+
         with ctrl2:
             if st.button("🔄 Pick Fresh Non-Repeating Spots", use_container_width=True, key="pick_fresh_spots_btn"):
-                st.session_state.desired_clip_minutes = float(clip_min_live)
                 st.session_state.highlights = build_non_repeating_candidates(
                     brief=st.session_state.brief,
                     transcript=st.session_state.transcript,
@@ -1092,7 +1085,7 @@ if page == "Campaign & Clip Workflow":
                     duration=dur,
                     target_platform=st.session_state.target_platform_choice,
                     clip_count=st.session_state.desired_clip_count,
-                    desired_minutes=float(clip_min_live),
+                    desired_minutes=active_minutes,
                     used_windows=st.session_state.used_clip_windows,
                     hook_mode=st.session_state.hook_mode_choice,
                 )
@@ -1107,7 +1100,7 @@ if page == "Campaign & Clip Workflow":
                     duration=dur,
                     target_platform=st.session_state.target_platform_choice,
                     clip_count=st.session_state.desired_clip_count,
-                    desired_minutes=float(clip_min_live),
+                    desired_minutes=active_minutes,
                     used_windows=[],
                     hook_mode=st.session_state.hook_mode_choice,
                 )
@@ -1124,7 +1117,7 @@ if page == "Campaign & Clip Workflow":
             duration=dur,
             target_platform=st.session_state.target_platform_choice,
             clip_count=st.session_state.desired_clip_count,
-            desired_minutes=float(clip_min_live),
+            desired_minutes=active_minutes,
             used_windows=st.session_state.used_clip_windows,
             hook_mode=st.session_state.hook_mode_choice,
         )
@@ -1159,7 +1152,7 @@ if page == "Campaign & Clip Workflow":
                         key=f"c_start_{run_tag}_{idx}"
                     )
                 with wc2:
-                    calc_end = min(dur, float(s_val) + float(clip_min_live) * 60.0)
+                    calc_end = min(dur, float(s_val) + active_minutes * 60.0)
                     e_val = st.number_input(
                         f"End (sec) — Clip {idx+1}",
                         0.5,
@@ -1233,7 +1226,6 @@ if page == "Campaign & Clip Workflow":
                 rendered_now.append(rec)
 
             if rendered_now:
-                # Advance candidate picks automatically for the next round without repeating used ranges
                 st.session_state.highlights = build_non_repeating_candidates(
                     brief=st.session_state.brief,
                     transcript=st.session_state.transcript,
@@ -1241,7 +1233,7 @@ if page == "Campaign & Clip Workflow":
                     duration=dur,
                     target_platform=st.session_state.target_platform_choice,
                     clip_count=st.session_state.desired_clip_count,
-                    desired_minutes=float(clip_min_live),
+                    desired_minutes=active_minutes,
                     used_windows=st.session_state.used_clip_windows,
                     hook_mode=st.session_state.hook_mode_choice,
                 )
