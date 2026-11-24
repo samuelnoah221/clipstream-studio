@@ -613,7 +613,7 @@ def heuristic_campaign_analysis(brief: str, project_name: str) -> dict:
         "unclear_or_conflicting_points": [] if len(brief.strip()) >= 30 else ["Brief is short—add more details on hooks, captions, or rules for sharper campaign alignment."],
         "pre_publish_checklist": [
             "Confirm vertical 9:16 framing for Shorts/Reels/TikTok",
-            "Verify bottom captions update dynamically with speech",
+            "Verify bottom captions match spoken words in the clip",
             "Confirm caption & description include required campaign elements/tags",
         ],
     }
@@ -680,7 +680,7 @@ def evaluate_video_against_campaign(analysis: dict, video_info: dict, transcript
     t_text = ((transcript or {}).get("text") or "").lower()
 
     if transcript and t_text.strip():
-        strengths.append(f"Speech transcript captured ({len(t_text.split())} words) for changing bottom captions & hooks.")
+        strengths.append(f"Speech transcript captured ({len(t_text.split())} words) for speech-matched bottom captions & hooks.")
         for req in (must_items + req_scenes)[:5]:
             key_words = [
                 kw for kw in re.findall(r"[a-z]{4,}", req.lower())
@@ -691,7 +691,7 @@ def evaluate_video_against_campaign(analysis: dict, video_info: dict, transcript
             else:
                 gaps.append(f"Verify spoken/visual coverage for requirement: {req}")
     else:
-        gaps.append("No speech transcript yet—changing moment captions and hooks will still generate from the segment & campaign brief.")
+        gaps.append("No speech transcript yet—add OPENAI_API_KEY in Streamlit Secrets/env so bottom captions transcribe exact spoken words.")
 
     return {
         "ready": True,
@@ -970,6 +970,7 @@ def build_caption_cues(
     end: float,
     fallback_text: str = "",
 ) -> list[tuple[float, float, str]]:
+    """Builds time-synced bottom captions strictly from actual spoken words."""
     clip_dur = max(0.5, round(end - start, 2))
     cues: list[tuple[float, float, str]] = []
 
@@ -987,53 +988,43 @@ def build_caption_cues(
             overlapping.append((rel_a, rel_b, txt))
 
     for rel_a, rel_b, txt in overlapping:
-        sub_parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+|,\s+(?=[A-Za-z0-9])", txt) if p.strip()]
-        if len(sub_parts) > 1:
-            total_chars = sum(len(p) for p in sub_parts) or 1
-            span = rel_b - rel_a
-            cursor = rel_a
-            for p in sub_parts:
-                part_dur = max(0.35, span * (len(p) / total_chars))
-                p_end = round(min(rel_b, cursor + part_dur), 2)
-                wrapped = wrap_caption_lines(p, max_chars=34, max_lines=2)
-                if wrapped and p_end > cursor + 0.12:
-                    cues.append((round(cursor, 2), p_end, wrapped))
-                cursor = p_end
-        else:
-            wrapped = wrap_caption_lines(txt, max_chars=34, max_lines=2)
-            if wrapped:
-                cues.append((rel_a, rel_b, wrapped))
+        clauses = [p.strip() for p in re.split(r"(?<=[.!?])\s+|,\s+|\s+-\s+|\s+—\s+", txt) if p.strip()]
+        chunks: list[str] = []
+        for cl in clauses:
+            words = cl.split()
+            if len(words) <= 6:
+                chunks.append(cl)
+            else:
+                for i in range(0, len(words), 6):
+                    chunks.append(" ".join(words[i:i + 6]))
+
+        total_words = sum(max(1, len(c.split())) for c in chunks) or 1
+        span = rel_b - rel_a
+        cursor = rel_a
+        for ch in chunks:
+            w_share = max(1, len(ch.split())) / total_words
+            ch_dur = max(0.35, span * w_share)
+            ch_end = round(min(rel_b, cursor + ch_dur), 2)
+            wrapped = wrap_caption_lines(ch, max_chars=34, max_lines=2)
+            if wrapped and ch_end > cursor + 0.12:
+                cues.append((round(cursor, 2), ch_end, wrapped))
+            cursor = ch_end
 
     if not cues:
-        beats = [
-            "First reaction & setup",
-            "Checking the Puffco & jars",
-            "Big cloud & stream energy",
-            "Hash Butler banter & GTA",
-            "In-the-moment hype",
-            "Key short highlight",
-        ]
-        fb_clean = re.sub(r"\s+", " ", (fallback_text or "").strip())
-        if fb_clean and len(fb_clean.split()) >= 4:
-            words = fb_clean.split()
-            chunks = []
-            for i in range(0, len(words), 6):
-                piece = " ".join(words[i:i + 6])
-                w_txt = wrap_caption_lines(piece, max_chars=32, max_lines=2)
-                if w_txt:
-                    chunks.append(w_txt)
-            if len(chunks) >= 2:
-                beats = chunks[:10]
+        clean_speech = re.sub(r"\s+", " ", (fallback_text or "").strip())
+        if clean_speech:
+            words = clean_speech.split()
+            phrases = [" ".join(words[i:i + 6]) for i in range(0, len(words), 6)]
+            n_p = max(1, len(phrases))
+            step = clip_dur / n_p
+            for i, ph in enumerate(phrases):
+                b_start = round(i * step, 2)
+                b_end = round(min(clip_dur, (i + 1) * step), 2)
+                wrapped = wrap_caption_lines(ph, max_chars=34, max_lines=2)
+                if wrapped and b_end > b_start + 0.12:
+                    cues.append((b_start, b_end, wrapped))
 
-        n_beats = max(2, min(10, len(beats)))
-        step = clip_dur / n_beats
-        for i in range(n_beats):
-            b_start = round(i * step, 2)
-            b_end = round(min(clip_dur, (i + 1) * step), 2)
-            if b_end > b_start + 0.15:
-                cues.append((b_start, b_end, wrap_caption_lines(beats[i % len(beats)], max_chars=32, max_lines=2)))
-
-    return cues[:24]
+    return cues[:48]
 
 
 def resolve_sharp_dimensions(
@@ -1182,7 +1173,7 @@ def render_video(
             sub_px = max(20, min(46, int(caption_font_size)))
             bottom_margin = max(52, int(out_h * 0.09))
             sub_filters = []
-            for c_start, c_end, c_text in cues[:24]:
+            for c_start, c_end, c_text in cues[:48]:
                 c_a = max(0.0, min(clip_duration, float(c_start)))
                 c_b = max(c_a + 0.1, min(clip_duration, float(c_end)))
                 lines_list = [ln.strip() for ln in c_text.splitlines() if ln.strip()][:2]
@@ -1280,12 +1271,12 @@ init_state()
 
 # ----------------------------- HEADER & NAV -----------------------------
 st.markdown(f"""<div class="hero">
-<div style="color:#a5b4fc;font-weight:750;font-size:.76rem;letter-spacing:.13em">3 OR 5 PART BREAKER · CLIP LATER · LIVE % METER</div>
+<div style="color:#a5b4fc;font-weight:750;font-size:.76rem;letter-spacing:.13em">3 OR 5 PART BREAKER · CLIP LATER · SPEECH-SYNCED CAPTIONS</div>
 <h1>🎬 {APP_NAME}</h1>
-<p class="muted">Break into 3 or 5 parts first, clip any part later, with changing bottom captions and unique campaign captions per short.</p>
+<p class="muted">Break into 3 or 5 parts first, clip any part later, with speech-matched bottom captions and unique campaign captions per short.</p>
 <span class="pill">3 or 5 part breaker</span>
 <span class="pill">Clip later anytime</span>
-<span class="pill">ZIP batch export</span>
+<span class="pill">Speech-matched captions</span>
 <span class="pill">Unique caption per short</span>
 </div>""", unsafe_allow_html=True)
 
@@ -1401,7 +1392,7 @@ if page == "Campaign & Clip Workflow":
             "Paste campaign requirements",
             key="brief",
             height=175,
-            placeholder="Example: Post vertical YouTube Shorts & Instagram Reels for GTA + Puffco stream. Include hooks, changing bottom captions, and hashtags.",
+            placeholder="Example: Post vertical YouTube Shorts & Instagram Reels for GTA + Puffco stream. Include hooks, speech-matched bottom captions, and hashtags.",
         )
 
         p_col, c_col, min_col = st.columns(3)
@@ -1431,7 +1422,7 @@ if page == "Campaign & Clip Workflow":
             )
         with cap_col:
             st.checkbox(
-                "Changing bottom captions on video",
+                "Speech-matched bottom captions on video",
                 key="burn_onscreen_captions",
             )
 
@@ -1459,11 +1450,14 @@ if page == "Campaign & Clip Workflow":
                             st.session_state.hook_banner_scope = "Full Clip Top Banner"
 
                         if st.session_state.source_video and st.session_state.video_info and Path(st.session_state.source_video).exists():
-                            try:
-                                tr = transcribe_video(st.session_state.source_video)
-                                st.session_state.transcript = tr
-                            except Exception:
-                                tr = None
+                            tr = None
+                            if get_openai_client():
+                                try:
+                                    with st.spinner("Transcribing spoken words for accurate bottom captions..."):
+                                        tr = transcribe_video(st.session_state.source_video)
+                                        st.session_state.transcript = tr
+                                except Exception as t_exc:
+                                    st.warning(f"Transcription skipped: {t_exc}")
                             sheet = make_contact_sheet(st.session_state.source_video, st.session_state.video_info["duration"], max_frames=6)
                             st.session_state.highlights = build_non_repeating_candidates(
                                 brief=json.dumps(analysis, ensure_ascii=False),
@@ -1554,6 +1548,9 @@ if page == "Campaign & Clip Workflow":
         st.subheader(f"Step 3 · Extract 1–2 Fresh Shorts ({st.session_state.target_platform_choice})")
         vi = st.session_state.video_info
         dur = max(1.0, float(vi["duration"]))
+
+        if st.session_state.burn_onscreen_captions and not st.session_state.transcript and not get_openai_client():
+            st.warning("No transcript available because `OPENAI_API_KEY` is not set—bottom captions will fall back to transcript text only if available rather than live word-by-word speech.")
 
         ctrl1, ctrl2, ctrl3 = st.columns([1.2, 1.2, 1])
         with ctrl1:
@@ -1675,7 +1672,7 @@ if page == "Campaign & Clip Workflow":
             try:
                 if st.session_state.burn_onscreen_captions and not st.session_state.transcript and get_openai_client():
                     try:
-                        with st.spinner("Transcribing speech for changing bottom captions..."):
+                        with st.spinner("Transcribing speech for speech-matched bottom captions..."):
                             st.session_state.transcript = transcribe_video(st.session_state.source_video)
                     except Exception:
                         pass
@@ -1697,7 +1694,7 @@ if page == "Campaign & Clip Workflow":
                             transcript=st.session_state.transcript,
                             start=s_v,
                             end=e_v,
-                            fallback_text=f"{spoken_now} {st.session_state.brief}".strip(),
+                            fallback_text=spoken_now,
                         )
 
                     with st.spinner(f"Rendering {asp_v} Short {num} ({s_v:.1f}s – {e_v:.1f}s)..."):
@@ -1912,7 +1909,7 @@ elif page == "Editor & Templates":
             resolution = st.selectbox("Output Resolution", ["1080p Full HD", "720p HD", "4K Ultra Sharp", "Source or Better (Auto Sharp)", "Match Source (Zero Resize Loss)"], key="ed_resolution")
             crf = st.slider("Quality CRF (15 = crispest)", 15, 22, 18, key="ed_crf")
             add_logo = st.checkbox("Include saved brand logo", value=bool(st.session_state.logo_path), key="ed_add_logo")
-            add_sub = st.checkbox("Changing bottom captions", value=True, key="ed_add_sub")
+            add_sub = st.checkbox("Speech-matched bottom captions", value=True, key="ed_add_sub")
 
         if st.button("Render Sharp Clip", type="primary", use_container_width=True, key="ed_render_btn"):
             if end <= start:
@@ -1929,7 +1926,7 @@ elif page == "Editor & Templates":
                             transcript=st.session_state.transcript,
                             start=start,
                             end=end,
-                            fallback_text=f"{spoken_now} {st.session_state.brief}".strip(),
+                            fallback_text=spoken_now,
                         )
                     with st.spinner(f"Rendering sharp clip from {src_label}..."):
                         render_video(
