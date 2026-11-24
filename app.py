@@ -448,7 +448,7 @@ def render_fast_voice_reader(text: str, label: str = "🔊 Fast Readout (Zero Da
     )
 
 
-# ----------------------------- NON-REPEATING WINDOW & HOOK PICKER ------
+# ----------------------------- AUTO-CLIPPING HELPERS -----------------
 def overlaps_used(start: float, end: float, used_windows: list[list[float]], min_gap: float = 2.0) -> bool:
     for u_start, u_end in used_windows:
         if start < (u_end + min_gap) and end > (u_start - min_gap):
@@ -518,27 +518,33 @@ def pick_good_hook(spoken_text: str, brief: str = "", clip_index: int = 0) -> st
     return CAMPAIGN_HOOK_BANK[clip_index % len(CAMPAIGN_HOOK_BANK)]
 
 
-def pick_fresh_windows(
+def pick_auto_clip_windows(
     duration: float,
     desired_minutes: float,
     count: int,
     used_windows: list[list[float]],
     transcript: dict | None = None,
 ) -> list[tuple[float, float, str]]:
+    """Picks distinct spots across the video, each sized to desired_minutes."""
     if duration <= 0:
         return []
-    count = max(1, min(2, int(count)))
+    count = max(1, min(6, int(count)))
     exact_len = round(min(duration, minutes_to_seconds(desired_minutes)), 1)
-
     max_start = round(max(0.0, duration - exact_len), 1)
+
     if max_start <= 0.0:
-        anchors = [0.0]
-    else:
-        fractions = [0.05, 0.35, 0.65, 0.88, 0.20, 0.52, 0.76, 0.0]
-        random.shuffle(fractions)
-        anchors = [round(max(0.0, min(max_start, f * max_start)), 1) for f in fractions]
-        for _ in range(8):
-            anchors.append(round(random.uniform(0.0, max_start), 1))
+        return [(0.0, round(min(duration, exact_len), 1), transcript_slice(transcript, 0.0, min(duration, exact_len)))]
+
+    # Spread candidates evenly across different sections of the video first
+    even_anchors = [
+        round((i / max(1, count)) * max_start, 1)
+        for i in range(count)
+    ]
+    extra_fractions = [0.08, 0.28, 0.48, 0.68, 0.86, 0.16, 0.38, 0.58, 0.78, 0.94, 0.0]
+    random.shuffle(extra_fractions)
+    anchors = even_anchors + [round(max(0.0, min(max_start, f * max_start)), 1) for f in extra_fractions]
+    for _ in range(10):
+        anchors.append(round(random.uniform(0.0, max_start), 1))
 
     picked: list[tuple[float, float, str]] = []
     combined_used = list(used_windows)
@@ -554,17 +560,15 @@ def pick_fresh_windows(
             picked.append((s_val, e_val, transcript_slice(transcript, s_val, e_val)))
             combined_used.append([s_val, e_val])
 
+    # Fallback if the video is short and windows slightly overlap
     if len(picked) < count:
-        for anc in anchors:
+        for idx in range(count):
             if len(picked) >= count:
                 break
-            s_val = round(max(0.0, min(max_start, anc)), 1)
+            s_val = round((idx / max(1, count)) * max_start, 1)
             e_val = round(min(duration, s_val + exact_len), 1)
-            if e_val <= s_val:
-                continue
-            if any(abs(s_val - ps) < 1.5 and abs(e_val - pe) < 1.5 for ps, pe, _ in picked):
-                continue
-            picked.append((s_val, e_val, transcript_slice(transcript, s_val, e_val)))
+            if e_val > s_val and not any(abs(s_val - ps) < 1.0 and abs(e_val - pe) < 1.0 for ps, pe, _ in picked):
+                picked.append((s_val, e_val, transcript_slice(transcript, s_val, e_val)))
 
     return picked[:count]
 
@@ -607,7 +611,7 @@ def heuristic_campaign_analysis(brief: str, project_name: str) -> dict:
             f"On-screen captions: {'Required' if wants_onscreen_captions else 'Enabled'}. "
             f"Hook rule: {'8-second hook' if wants_8s_hook else ('Video hook' if wants_video_hook else 'Standard opening')}."
         ),
-        "deliverables": ["1 to 2 vertical/platform clips matching selected minute length"],
+        "deliverables": ["Auto-clipped segments matching desired minute length or manual range clips"],
         "platforms": platforms,
         "requires_onscreen_captions": wants_onscreen_captions,
         "requires_8s_hook": wants_8s_hook,
@@ -680,7 +684,7 @@ def evaluate_video_against_campaign(analysis: dict, video_info: dict, transcript
     if dur < 8:
         gaps.append("Source video is under 8 seconds; hook banner timing will clamp to available clip length.")
     if analysis.get("caption_requirements") or analysis.get("hashtags"):
-        strengths.append("Campaign caption/tag requirements detected—each short's caption generator will incorporate them.")
+        strengths.append("Campaign caption/tag requirements detected—each clip's caption generator will incorporate them.")
     if analysis.get("requires_8s_hook"):
         strengths.append("8-second hook banner rule detected.")
     elif analysis.get("requires_video_hook"):
@@ -706,7 +710,7 @@ def evaluate_video_against_campaign(analysis: dict, video_info: dict, transcript
 
     return {
         "ready": True,
-        "verdict": "Ready for Go-Ahead — Clip Extraction Unlocked",
+        "verdict": "Ready for Go-Ahead — Auto-Clipping & Manual Clipping Unlocked",
         "strengths": strengths,
         "gaps": gaps,
         "warnings": warnings,
@@ -789,7 +793,7 @@ def make_contact_sheet(video_path: str, duration: float, max_frames: int = 6) ->
         gc.collect()
 
 
-def build_non_repeating_candidates(
+def build_auto_clip_candidates(
     brief: str,
     transcript: dict | None,
     contact_sheet: Path | None,
@@ -799,8 +803,8 @@ def build_non_repeating_candidates(
     desired_minutes: float,
     used_windows: list[list[float]],
 ) -> list[dict]:
-    count = max(1, min(2, int(clip_count)))
-    fresh_slots = pick_fresh_windows(
+    count = max(1, min(6, int(clip_count)))
+    fresh_slots = pick_auto_clip_windows(
         duration=duration,
         desired_minutes=desired_minutes,
         count=count,
@@ -817,7 +821,7 @@ def build_non_repeating_candidates(
             t_text = "\n".join(t_lines)[:12000] or (transcript or {}).get("text", "")[:12000]
             img_b64 = base64.b64encode(contact_sheet.read_bytes()).decode("utf-8")
             prompt = f"""Given target platform {target_platform}, exact requested clip duration {desired_minutes:.2f} min ({minutes_to_seconds(desired_minutes):.1f}s), and previously used ranges {used_windows},
-write distinct short titles and high-retention hooks based on what is actually said/shown in each window for {count} fresh clip(s). Return ONLY JSON:
+write distinct short titles and high-retention hooks based on what is actually said/shown in each window for {count} fresh auto-clipped segment(s). Return ONLY JSON:
 {{"items":[{{"title":"short title","reason":"why it fits","campaign_match":"brief match","hook":"punchy hook line from speech/moment","confidence":"high|medium|low"}}]}}
 BRIEF: {brief[:6000]}
 TRANSCRIPT: {t_text}
@@ -843,12 +847,13 @@ TRANSCRIPT: {t_text}
         pick_num = len(used_windows) + idx + 1
         good_hook = ai_m.get("hook") or pick_good_hook(spoken_txt, brief=brief, clip_index=pick_num - 1)
         results.append({
-            "title": ai_m.get("title") or f"{target_platform} Short #{pick_num} ({s_sec:.0f}s–{e_sec:.0f}s)",
+            "title": ai_m.get("title") or f"Auto Clip #{pick_num} ({s_sec:.0f}s–{e_sec:.0f}s)",
             "start": s_sec,
             "end": e_sec,
+            "mode": "Auto Clip",
             "target_platform": target_platform,
-            "reason": spoken_txt[:150] if spoken_txt else (ai_m.get("reason") or f"Exact {desired_minutes:.2f} min ({dur_actual:.1f}s) segment at {s_sec:.1f}s–{e_sec:.1f}s."),
-            "campaign_match": ai_m.get("campaign_match") or f"Exact {desired_minutes:.2f}m non-repeating segment",
+            "reason": spoken_txt[:150] if spoken_txt else (ai_m.get("reason") or f"Exact {desired_minutes:.2f} min ({dur_actual:.1f}s) auto-cut segment at {s_sec:.1f}s–{e_sec:.1f}s."),
+            "campaign_match": ai_m.get("campaign_match") or f"Exact {desired_minutes:.2f}m auto-clipped spot",
             "hook": str(good_hook)[:85],
             "risk": "",
             "confidence": ai_m.get("confidence") or "high",
@@ -891,9 +896,9 @@ def generate_social_copy(
     clean_tags = " ".join(t if t.startswith("#") else f"#{t.replace(' ', '')}" for t in tags[:6])
     if not clean_tags:
         p_slug = re.sub(r"[^A-Za-z0-9]", "", platform) or "Shorts"
-        clean_tags = f"#Campaign #{p_slug} #Short{clip_index + 1}"
+        clean_tags = f"#Campaign #{p_slug} #Clip{clip_index + 1}"
 
-    clip_title = (clip_info or {}).get("title") or f"Short #{clip_index + 1}"
+    clip_title = (clip_info or {}).get("title") or f"Clip #{clip_index + 1}"
     clip_hook = (clip_info or {}).get("hook") or ""
     clip_start = (clip_info or {}).get("start")
     clip_end = (clip_info or {}).get("end")
@@ -906,7 +911,7 @@ def generate_social_copy(
     if not client:
         angle_lines = [
             f"{clip_hook or clip_title}{window_label}",
-            f"What's in this short: {transcript_text[:140].strip()}" if transcript_text.strip() else f"Focused moment #{clip_index + 1} tailored for {platform}.",
+            f"What's in this clip: {transcript_text[:140].strip()}" if transcript_text.strip() else f"Focused moment #{clip_index + 1} tailored for {platform}.",
             camp_req_line,
             f"Custom note: {req_note}" if req_note else "",
             clean_tags,
@@ -921,12 +926,12 @@ def generate_social_copy(
         ).strip()
         return {"caption": caption, "description": description}
 
-    prompt = f"""You are writing a UNIQUE social media CAPTION and DESCRIPTION specifically for ONE short clip (Short #{clip_index + 1}) on {platform}.
-Make sure this short's caption is distinct from other shorts in the same batch, reflects this short's exact moment/transcript/hook, and satisfies every relevant campaign brief caption/content requirement.
+    prompt = f"""You are writing a UNIQUE social media CAPTION and DESCRIPTION specifically for ONE video clip (Clip #{clip_index + 1}) on {platform}.
+Make sure this clip's caption is distinct from other clips in the same batch, reflects this clip's exact moment/transcript/hook, and satisfies every relevant campaign brief caption/content requirement.
 
-THIS SHORT DETAILS:
+THIS CLIP DETAILS:
 {json.dumps(clip_info or {}, ensure_ascii=False)}
-THIS SHORT'S TRANSCRIPT SEGMENT:
+THIS CLIP'S TRANSCRIPT SEGMENT:
 {transcript_text[:1800]}
 
 CAMPAIGN BRIEF & CAPTION REQUIREMENTS:
@@ -936,14 +941,14 @@ EXTRA USER INSTRUCTIONS:
 {req_note or "None"}
 
 Return ONLY valid JSON:
-{{"caption": "unique platform-ready caption for THIS short incorporating campaign caption requirements and hashtags", "description": "clear full description tailored to THIS short and campaign brief requirements"}}
+{{"caption": "unique platform-ready caption for THIS clip incorporating campaign caption requirements and hashtags", "description": "clear full description tailored to THIS clip and campaign brief requirements"}}
 """
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
         temperature=0.55,
         response_format={"type": "json_object"},
         messages=[
-            {"role": "system", "content": "You write distinct, campaign-compliant social captions and descriptions for individual short video clips."},
+            {"role": "system", "content": "You write distinct, campaign-compliant social captions and descriptions for individual video clips."},
             {"role": "user", "content": prompt},
         ],
     )
@@ -1141,7 +1146,7 @@ def render_video(
     hook_banner_duration: float = 8.0,
     src_w: int = 1920,
     src_h: int = 1080,
-    caption_font_size: int = 28,
+    caption_font_size: int = 30,
     encode_preset: str = "veryfast",
     normalize_audio: bool = False,
     clip_index: int = 0,
@@ -1285,9 +1290,9 @@ def init_state():
         "campaign_feedback": None,
         "go_ahead_clips": False,
         "target_platform_choice": "YouTube Shorts / Reels",
-        "desired_clip_count": 2,
+        "auto_clip_count": 2,
         "desired_clip_minutes": 0.50,
-        "step3_clip_minutes": 0.50,
+        "auto_clip_minutes": 0.50,
         "used_clip_windows": [],
         "hook_mode_choice": "Standard Clip Length (Exact Minutes)",
         "hook_banner_scope": "8-Second Top Banner (0–8s)",
@@ -1299,7 +1304,7 @@ def init_state():
         "broken_parts": [],
         "breaker_part_count": 3,
         "transcript": None,
-        "highlights": [],
+        "auto_candidates": [],
         "clips": [],
         "logo_path": None,
         "logo_name": None,
@@ -1317,13 +1322,13 @@ init_state()
 
 # ----------------------------- HEADER & NAV -----------------------------
 st.markdown(f"""<div class="hero">
-<div style="color:#a5b4fc;font-weight:750;font-size:.76rem;letter-spacing:.13em">3 OR 5 PART BREAKER · CLIP LATER · BURNED-IN BOTTOM SUBTITLES + SRT</div>
+<div style="color:#a5b4fc;font-weight:750;font-size:.76rem;letter-spacing:.13em">AUTO-CLIPPING (EXACT MINUTES) · MANUAL CLIPPING (START → END) · SRT + SUBTITLES</div>
 <h1>🎬 {APP_NAME}</h1>
-<p class="muted">Break into 3 or 5 parts first, clip any part later, with burned-in bottom subtitles, downloadable SRTs, and unique campaign captions per short.</p>
-<span class="pill">3 or 5 part breaker</span>
-<span class="pill">Clip later anytime</span>
-<span class="pill">Burned-in bottom subtitles</span>
-<span class="pill">Downloadable .SRT + unique captions</span>
+<p class="muted">Auto-clip different spots across your video in exact minutes, or manually clip from one timestamp to another.</p>
+<span class="pill">Auto-clip different spots</span>
+<span class="pill">Exact minute length</span>
+<span class="pill">Manual start → end clipper</span>
+<span class="pill">Burned subtitles + .SRT</span>
 </div>""", unsafe_allow_html=True)
 
 if not ffmpeg_ready():
@@ -1332,17 +1337,17 @@ if not ffmpeg_ready():
 with st.sidebar:
     st.title("STUDIO")
     page = st.radio("Navigation", [
-        "Campaign & Clip Workflow",
-        "Editor & Templates",
+        "Campaign & Auto-Clipper",
+        "Manual Clipper (Start → End)",
         "Brand Kit & Settings",
     ], label_visibility="collapsed", key="nav_page_radio")
     st.divider()
     st.metric("Go-Ahead Status", "Approved" if st.session_state.go_ahead_clips else "Pending Review")
     st.metric("Broken Parts Ready", len(st.session_state.broken_parts))
-    st.metric("Generated Shorts", len(st.session_state.clips))
+    st.metric("Generated Clips", len(st.session_state.clips))
 
-# ----------------------------- PAGE 1: CAMPAIGN & CLIP WORKFLOW ---------
-if page == "Campaign & Clip Workflow":
+# ----------------------------- PAGE 1: CAMPAIGN & AUTO-CLIPPER --------
+if page == "Campaign & Auto-Clipper":
     st.subheader("Step 1 · Video (Single Uploader + Live % + 3/5-Part Breaker) + Campaign Requirements")
     left_col, right_col = st.columns([1.15, 1], gap="large")
 
@@ -1362,7 +1367,7 @@ if page == "Campaign & Clip Workflow":
                     st.session_state.video_info = vinfo
                     st.session_state.broken_parts = []
                     st.session_state.transcript = None
-                    st.session_state.highlights = []
+                    st.session_state.auto_candidates = []
                     st.session_state.used_clip_windows = []
                     st.session_state.campaign_feedback = None
                     st.session_state.go_ahead_clips = False
@@ -1391,7 +1396,7 @@ if page == "Campaign & Clip Workflow":
                             float(vi["duration"]),
                             int(st.session_state.breaker_part_count),
                         )
-                        st.success(f"Created {len(st.session_state.broken_parts)} parts! Clip any part below now or later.")
+                        st.success(f"Created {len(st.session_state.broken_parts)} parts! Clip any part in Manual Clipper anytime.")
                     except Exception as exc:
                         st.error(f"Break error: {exc}")
 
@@ -1449,10 +1454,16 @@ if page == "Campaign & Clip Workflow":
                 key="target_platform_choice",
             )
         with c_col:
-            st.radio("Shorts count", [1, 2], horizontal=True, key="desired_clip_count")
+            st.number_input(
+                "Auto-clip count",
+                min_value=1,
+                max_value=6,
+                step=1,
+                key="auto_clip_count",
+            )
         with min_col:
             st.number_input(
-                "Clip length (minutes)",
+                "Desired clip length (minutes)",
                 min_value=0.10,
                 max_value=15.0,
                 step=0.25,
@@ -1486,7 +1497,7 @@ if page == "Campaign & Clip Workflow":
                     with st.spinner("Analysing campaign requirements and inspecting video..."):
                         analysis = ai_campaign_analysis(st.session_state.brief, st.session_state.project_name)
                         st.session_state.brief_analysis = analysis
-                        st.session_state.step3_clip_minutes = float(st.session_state.desired_clip_minutes)
+                        st.session_state.auto_clip_minutes = float(st.session_state.desired_clip_minutes)
 
                         if analysis.get("requires_onscreen_captions"):
                             st.session_state.burn_onscreen_captions = True
@@ -1505,13 +1516,13 @@ if page == "Campaign & Clip Workflow":
                                 except Exception as t_exc:
                                     st.warning(f"Transcription skipped: {t_exc}")
                             sheet = make_contact_sheet(st.session_state.source_video, st.session_state.video_info["duration"], max_frames=6)
-                            st.session_state.highlights = build_non_repeating_candidates(
+                            st.session_state.auto_candidates = build_auto_clip_candidates(
                                 brief=json.dumps(analysis, ensure_ascii=False),
                                 transcript=tr,
                                 contact_sheet=sheet,
                                 duration=st.session_state.video_info["duration"],
                                 target_platform=st.session_state.target_platform_choice,
-                                clip_count=st.session_state.desired_clip_count,
+                                clip_count=int(st.session_state.auto_clip_count),
                                 desired_minutes=float(st.session_state.desired_clip_minutes),
                                 used_windows=st.session_state.used_clip_windows,
                             )
@@ -1521,9 +1532,9 @@ if page == "Campaign & Clip Workflow":
                         else:
                             st.session_state.campaign_feedback = {
                                 "ready": False,
-                                "verdict": "Campaign Analysed — Upload Video to Check Fit & Extract Shorts",
+                                "verdict": "Campaign Analysed — Upload Video to Check Fit & Auto-Clip",
                                 "strengths": [],
-                                "gaps": ["Upload a campaign video on the left to match moments and extract shorts."],
+                                "gaps": ["Upload a campaign video on the left to match moments and auto-clip."],
                                 "warnings": analysis.get("prohibited_content", []) or [],
                             }
                     st.success("Campaign feedback ready.")
@@ -1563,92 +1574,103 @@ if page == "Campaign & Clip Workflow":
         go_col1, go_col2 = st.columns([1.2, 2])
         with go_col1:
             if st.button(
-                "✅ Give Go-Ahead to Extract Shorts",
+                "✅ Give Go-Ahead to Auto-Clip",
                 type="primary",
                 disabled=not bool(st.session_state.video_info),
                 use_container_width=True,
                 key="wf_go_ahead_btn",
             ):
-                st.session_state.step3_clip_minutes = float(st.session_state.desired_clip_minutes)
+                st.session_state.auto_clip_minutes = float(st.session_state.desired_clip_minutes)
                 if st.session_state.video_info:
-                    st.session_state.highlights = build_non_repeating_candidates(
+                    st.session_state.auto_candidates = build_auto_clip_candidates(
                         brief=st.session_state.brief,
                         transcript=st.session_state.transcript,
                         contact_sheet=None,
                         duration=st.session_state.video_info["duration"],
                         target_platform=st.session_state.target_platform_choice,
-                        clip_count=st.session_state.desired_clip_count,
-                        desired_minutes=float(st.session_state.step3_clip_minutes),
+                        clip_count=int(st.session_state.auto_clip_count),
+                        desired_minutes=float(st.session_state.auto_clip_minutes),
                         used_windows=st.session_state.used_clip_windows,
                     )
                 st.session_state.go_ahead_clips = True
 
         with go_col2:
             if st.session_state.go_ahead_clips:
-                exact_s = minutes_to_seconds(float(st.session_state.step3_clip_minutes))
-                st.success(f"Go-ahead granted! Exact clip duration: {float(st.session_state.step3_clip_minutes):.2f} min ({exact_s:.1f}s).")
+                exact_s = minutes_to_seconds(float(st.session_state.auto_clip_minutes))
+                st.success(f"Go-ahead granted! Auto-clip target: {float(st.session_state.auto_clip_minutes):.2f} min ({exact_s:.1f}s) per clip.")
 
-    # Step 3: 1-2 Non-Repeating Clip Extraction
+    # Step 3: True Auto-Clipping (Different spots across video, exact desired minutes)
     if st.session_state.go_ahead_clips and st.session_state.video_info and ffmpeg_ready():
         st.divider()
-        st.subheader(f"Step 3 · Extract 1–2 Fresh Shorts ({st.session_state.target_platform_choice})")
+        st.subheader(f"Step 3 · Auto-Clipper (Different Spots · Exact Desired Minutes)")
         vi = st.session_state.video_info
         dur = max(1.0, float(vi["duration"]))
 
         if st.session_state.burn_onscreen_captions and not st.session_state.transcript and not get_openai_client():
             st.warning("No transcript available because `OPENAI_API_KEY` is not set—bottom subtitles will use transcript text only if available rather than live word-by-word speech.")
 
-        ctrl1, ctrl2, ctrl3 = st.columns([1.2, 1.2, 1])
+        ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([1.1, 1.0, 1.2, 1.0])
         with ctrl1:
             st.number_input(
-                "Exact clip length (minutes)",
+                "Desired clip minutes",
                 min_value=0.10,
                 max_value=15.0,
                 step=0.25,
-                key="step3_clip_minutes",
+                key="auto_clip_minutes",
             )
-        active_minutes = float(st.session_state.step3_clip_minutes)
+        with ctrl2:
+            st.number_input(
+                "How many auto clips",
+                min_value=1,
+                max_value=6,
+                step=1,
+                key="auto_clip_count",
+            )
+        active_minutes = float(st.session_state.auto_clip_minutes)
         exact_target_sec = round(min(dur, minutes_to_seconds(active_minutes)), 1)
 
-        with ctrl2:
-            if st.button("🔄 Pick Fresh Non-Repeating Spots", use_container_width=True, key="pick_fresh_spots_btn"):
-                st.session_state.highlights = build_non_repeating_candidates(
+        with ctrl3:
+            if st.button("🔄 Pick Different Spots", use_container_width=True, key="pick_fresh_spots_btn"):
+                st.session_state.auto_candidates = build_auto_clip_candidates(
                     brief=st.session_state.brief,
                     transcript=st.session_state.transcript,
                     contact_sheet=None,
                     duration=dur,
                     target_platform=st.session_state.target_platform_choice,
-                    clip_count=st.session_state.desired_clip_count,
+                    clip_count=int(st.session_state.auto_clip_count),
                     desired_minutes=active_minutes,
                     used_windows=st.session_state.used_clip_windows,
                 )
-        with ctrl3:
-            if st.button("🧹 Reset Used Ranges", use_container_width=True, key="reset_used_ranges_btn"):
+        with ctrl4:
+            if st.button("🧹 Reset Used Spots", use_container_width=True, key="reset_used_ranges_btn"):
                 st.session_state.used_clip_windows = []
-                st.session_state.highlights = build_non_repeating_candidates(
+                st.session_state.auto_candidates = build_auto_clip_candidates(
                     brief=st.session_state.brief,
                     transcript=st.session_state.transcript,
                     contact_sheet=None,
                     duration=dur,
                     target_platform=st.session_state.target_platform_choice,
-                    clip_count=st.session_state.desired_clip_count,
+                    clip_count=int(st.session_state.auto_clip_count),
                     desired_minutes=active_minutes,
                     used_windows=[],
                 )
 
-        st.caption(f"Target length per short: **{active_minutes:.2f} min = {exact_target_sec:.1f}s** · Default aspect for {st.session_state.target_platform_choice}: **{default_aspect_for_platform(st.session_state.target_platform_choice)}**")
+        st.caption(
+            f"Each auto-clipped segment will be **{active_minutes:.2f} min ({exact_target_sec:.1f}s)** from distinct spots in the video · "
+            f"Default aspect for {st.session_state.target_platform_choice}: **{default_aspect_for_platform(st.session_state.target_platform_choice)}**"
+        )
 
-        cands = st.session_state.highlights or build_non_repeating_candidates(
+        cands = st.session_state.auto_candidates or build_auto_clip_candidates(
             brief=st.session_state.brief,
             transcript=st.session_state.transcript,
             contact_sheet=None,
             duration=dur,
             target_platform=st.session_state.target_platform_choice,
-            clip_count=st.session_state.desired_clip_count,
+            clip_count=int(st.session_state.auto_clip_count),
             desired_minutes=active_minutes,
             used_windows=st.session_state.used_clip_windows,
         )
-        cands = cands[:int(st.session_state.desired_clip_count)]
+        cands = cands[:int(st.session_state.auto_clip_count)]
 
         q_col1, q_col2, q_col3, q_col4 = st.columns(4)
         with q_col1:
@@ -1668,53 +1690,25 @@ if page == "Campaign & Clip Workflow":
         default_asp = default_aspect_for_platform(st.session_state.target_platform_choice)
         default_asp_idx = asp_choices.index(default_asp) if default_asp in asp_choices else 0
 
-        chosen_windows = []
-        run_tag = len(st.session_state.used_clip_windows)
+        # Show preview of distinct auto-picked windows of exact desired_minutes
         max_start_limit = max(0.0, dur - 0.5)
+        auto_windows_to_render: list[tuple[int, str, float, float, str, str, dict]] = []
         for idx, cand in enumerate(cands):
-            with st.container(border=True):
-                st.markdown(f"**Short {idx + 1}: {cand.get('title', f'Short {idx+1}')}**")
-                st.caption(f"Moment: {cand.get('reason', '')}")
-                wc1, wc2, wc3 = st.columns([1, 1, 1.4])
-                with wc1:
-                    init_s = round(min(max_start_limit, max(0.0, float(cand["start"]))), 1)
-                    s_val = st.number_input(
-                        f"Start (sec) — Short {idx+1}",
-                        min_value=0.0,
-                        max_value=max(0.5, max_start_limit),
-                        value=init_s,
-                        step=0.5,
-                        key=f"c_start_{run_tag}_{idx}",
-                    )
-                with wc2:
-                    exact_end = round(min(dur, float(s_val) + exact_target_sec), 1)
-                    e_val = st.number_input(
-                        f"End (sec) — Short {idx+1}",
-                        min_value=0.5,
-                        max_value=max(0.5, dur),
-                        value=max(min(dur, float(s_val) + 0.5), exact_end),
-                        step=0.5,
-                        key=f"c_end_{run_tag}_{idx}",
-                    )
-                with wc3:
-                    asp_val = st.selectbox(
-                        f"Aspect — Short {idx+1}",
-                        asp_choices,
-                        index=default_asp_idx,
-                        key=f"c_asp_{run_tag}_{idx}",
-                    )
-                live_spoken = transcript_slice(st.session_state.transcript, float(s_val), float(e_val))
-                hook_default = cand.get("hook") if (float(s_val) == float(cand["start"]) and cand.get("hook")) else pick_good_hook(
-                    live_spoken, brief=st.session_state.brief, clip_index=run_tag + idx
-                )
-                hook_txt = st.text_input(
-                    f"Top hook banner text — Short {idx+1}",
-                    value=str(hook_default or ""),
-                    key=f"c_hook_txt_{run_tag}_{idx}",
-                )
-                chosen_windows.append((idx + 1, cand.get("title", f"Short_{idx+1}"), float(s_val), float(e_val), asp_val, hook_txt, cand))
+            s_val = round(min(max_start_limit, max(0.0, float(cand["start"]))), 1)
+            e_val = round(min(dur, s_val + exact_target_sec), 1)
+            if e_val <= s_val:
+                e_val = round(min(dur, s_val + 0.5), 1)
+            spoken_now = transcript_slice(st.session_state.transcript, s_val, e_val)
+            hook_txt = cand.get("hook") or pick_good_hook(spoken_now, brief=st.session_state.brief, clip_index=idx)
+            seg_dur = round(e_val - s_val, 1)
+            st.info(
+                f"**Auto Spot {idx + 1}: {cand.get('title', f'Auto Clip {idx+1}')}** — "
+                f"`{fmt_time(s_val)}` → `{fmt_time(e_val)}` (**{seg_dur:.1f}s** / `{active_minutes:.2f} min`) · "
+                f"Hook: *{hook_txt}*"
+            )
+            auto_windows_to_render.append((idx + 1, cand.get("title", f"Auto_Clip_{idx+1}"), s_val, e_val, default_asp, hook_txt, cand))
 
-        if st.button("✂️ Extract & Render Sharp Shorts Now", type="primary", use_container_width=True, key="wf_extract_clips_btn"):
+        if st.button("⚡ Run Auto-Clipper (Render All Distinct Spots Now)", type="primary", use_container_width=True, key="wf_extract_clips_btn"):
             try:
                 if st.session_state.burn_onscreen_captions and not st.session_state.transcript and get_openai_client():
                     try:
@@ -1725,12 +1719,11 @@ if page == "Campaign & Clip Workflow":
 
                 rendered_now = []
                 banner_dur = 8.0 if st.session_state.hook_banner_scope.startswith("8-Second") else 9999.0
-                for num, title, s_v, e_v, asp_v, h_txt, cand_meta in chosen_windows:
+                for num, title, s_v, e_v, asp_v, h_txt, cand_meta in auto_windows_to_render:
                     if e_v <= s_v:
-                        st.warning(f"Short {num}: End time must be greater than start time.")
                         continue
                     clip_num_global = len(st.session_state.clips) + 1
-                    base_stem = f"{safe_name(title)}_short{clip_num_global}"
+                    base_stem = f"{safe_name(title)}_auto{clip_num_global}"
                     out_file = WORK_DIR / f"{base_stem}.mp4"
                     srt_file = WORK_DIR / f"{base_stem}.srt"
                     spoken_now = transcript_slice(st.session_state.transcript, s_v, e_v)
@@ -1747,7 +1740,7 @@ if page == "Campaign & Clip Workflow":
                             max_chars=wrap_chars,
                         )
 
-                    with st.spinner(f"Rendering {asp_v} Short {num} with burned-in bottom subtitles ({s_v:.1f}s – {e_v:.1f}s)..."):
+                    with st.spinner(f"Auto-clipping spot {num}: {s_v:.1f}s – {e_v:.1f}s ({round(e_v - s_v, 1):.1f}s)..."):
                         saved_srt = render_video(
                             st.session_state.source_video,
                             str(out_file),
@@ -1771,6 +1764,7 @@ if page == "Campaign & Clip Workflow":
                     st.session_state.used_clip_windows.append([round(s_v, 1), round(e_v, 1)])
                     clip_meta = {
                         **cand_meta,
+                        "mode": "Auto Clip",
                         "title": title,
                         "start": s_v,
                         "end": e_v,
@@ -1803,136 +1797,26 @@ if page == "Campaign & Clip Workflow":
                     rendered_now.append(rec)
 
                 if rendered_now:
-                    st.success(f"Extracted {len(rendered_now)} sharp short(s) with burned-in bottom subtitles, .SRT files, and unique campaign captions ready below.")
+                    # Queue fresh non-overlapping candidates for the next auto-clip click
+                    st.session_state.auto_candidates = build_auto_clip_candidates(
+                        brief=st.session_state.brief,
+                        transcript=st.session_state.transcript,
+                        contact_sheet=None,
+                        duration=dur,
+                        target_platform=st.session_state.target_platform_choice,
+                        clip_count=int(st.session_state.auto_clip_count),
+                        desired_minutes=active_minutes,
+                        used_windows=st.session_state.used_clip_windows,
+                    )
+                    st.success(f"Auto-clipped {len(rendered_now)} distinct segment(s) at {active_minutes:.2f} min each.")
             except Exception as exc:
-                st.error(f"Clip render error: {exc}")
+                st.error(f"Auto-clip render error: {exc}")
 
-    # Step 4: Generated Shorts + Dedicated Per-Short Caption Generator
-    if st.session_state.clips:
-        st.divider()
-        st.subheader("Step 4 · Generated Shorts & Per-Short Campaign Caption Generator")
-        st.text_area(
-            "Optional extra caption/CTA note for shorts",
-            key="caption_instructions",
-            height=75,
-        )
-
-        act_col1, act_col2 = st.columns([1.4, 1])
-        with act_col1:
-            if st.button("✨ Generate Unique Campaign Captions for All Shorts", key="gen_all_short_captions_btn", use_container_width=True):
-                with st.spinner("Generating tailored campaign captions for each short..."):
-                    for i, cl in enumerate(st.session_state.clips):
-                        c_meta = cl.get("meta") or {"title": cl["name"], "start": cl["start"], "end": cl["end"]}
-                        t_seg = c_meta.get("transcript_excerpt") or transcript_slice(st.session_state.transcript, cl["start"], cl["end"])
-                        pack = generate_social_copy(
-                            platform=st.session_state.target_platform_choice,
-                            brief=st.session_state.brief,
-                            analysis=st.session_state.brief_analysis,
-                            clip_info=c_meta,
-                            transcript_text=t_seg,
-                            custom_instructions=st.session_state.caption_instructions,
-                            clip_index=i,
-                        )
-                        st.session_state.clips[i]["caption"] = pack["caption"]
-                        st.session_state.clips[i]["description"] = pack["description"]
-                st.success("Updated unique campaign captions for every short.")
-        with act_col2:
-            short_zip_items = []
-            for i, cl in enumerate(st.session_state.clips):
-                if Path(cl["path"]).exists():
-                    short_zip_items.append((f"short_{i+1}_{safe_name(cl['name'])}.mp4", cl["path"]))
-                if cl.get("srt_path") and Path(cl["srt_path"]).exists():
-                    short_zip_items.append((f"short_{i+1}_{safe_name(cl['name'])}.srt", cl["srt_path"]))
-            if short_zip_items:
-                st.download_button(
-                    f"📦 Download All Shorts & SRTs (.ZIP)",
-                    build_zip_bytes(short_zip_items),
-                    file_name=f"{safe_name(st.session_state.project_name)}_shorts_srt.zip",
-                    mime="application/zip",
-                    key="wf_dl_all_shorts_zip",
-                    use_container_width=True,
-                )
-
-        for idx, cl in enumerate(st.session_state.clips):
-            with st.container(border=True):
-                c_vid, c_cap = st.columns([1.25, 1.35], gap="large")
-                actual_sec = round(float(cl["end"]) - float(cl["start"]), 1)
-                with c_vid:
-                    st.markdown(f"**Short {idx + 1}: {cl['name']}**")
-                    st.caption(f"{fmt_time(cl['start'])} – {fmt_time(cl['end'])} ({actual_sec:.1f}s) · {cl['aspect']} · {cl['resolution']}")
-                    if Path(cl["path"]).exists():
-                        st.video(cl["path"])
-                        dl_c1, dl_c2 = st.columns(2)
-                        with dl_c1:
-                            with open(cl["path"], "rb") as fh:
-                                st.download_button(
-                                    f"⬇ Short {idx+1} (.MP4)",
-                                    fh,
-                                    file_name=Path(cl["path"]).name,
-                                    mime="video/mp4",
-                                    key=f"wf_dl_clip_{idx}",
-                                    use_container_width=True,
-                                )
-                        with dl_c2:
-                            if cl.get("srt_path") and Path(cl["srt_path"]).exists():
-                                with open(cl["srt_path"], "rb") as sf:
-                                    st.download_button(
-                                        f"📄 Subtitles {idx+1} (.SRT)",
-                                        sf,
-                                        file_name=Path(cl["srt_path"]).name,
-                                        mime="application/x-subrip",
-                                        key=f"wf_dl_srt_{idx}",
-                                        use_container_width=True,
-                                    )
-                with c_cap:
-                    st.markdown("**Caption & Description for This Short**")
-                    if st.button(
-                        f"✨ Get Caption for Short {idx+1} (Campaign-Matched)",
-                        type="primary",
-                        use_container_width=True,
-                        key=f"get_cap_short_{idx}",
-                    ):
-                        c_meta = cl.get("meta") or {"title": cl["name"], "start": cl["start"], "end": cl["end"]}
-                        t_seg = c_meta.get("transcript_excerpt") or transcript_slice(st.session_state.transcript, cl["start"], cl["end"])
-                        with st.spinner(f"Writing campaign-matched caption for Short {idx+1}..."):
-                            pack = generate_social_copy(
-                                platform=st.session_state.target_platform_choice,
-                                brief=st.session_state.brief,
-                                analysis=st.session_state.brief_analysis,
-                                clip_info=c_meta,
-                                transcript_text=t_seg,
-                                custom_instructions=st.session_state.caption_instructions,
-                                clip_index=idx,
-                            )
-                            st.session_state.clips[idx]["caption"] = pack["caption"]
-                            st.session_state.clips[idx]["description"] = pack["description"]
-
-                    edited_cap = st.text_area(
-                        f"Short {idx+1} Caption",
-                        value=cl.get("caption", ""),
-                        height=110,
-                        key=f"short_cap_area_{idx}",
-                    )
-                    edited_desc = st.text_area(
-                        f"Short {idx+1} Description",
-                        value=cl.get("description", ""),
-                        height=135,
-                        key=f"short_desc_area_{idx}",
-                    )
-                    st.session_state.clips[idx]["caption"] = edited_cap
-                    st.session_state.clips[idx]["description"] = edited_desc
-
-                    render_fast_voice_reader(
-                        f"{edited_cap}\n\n{edited_desc}".strip(),
-                        label=f"🔊 Fast Read Short {idx+1} Copy",
-                        uid=f"short_{idx}",
-                    )
-
-# ----------------------------- PAGE 2: EDITOR & TEMPLATES -------------
-elif page == "Editor & Templates":
-    st.subheader("Manual & Sharp Clip Editor (Clip Any Broken Part Now or Later)")
+# ----------------------------- PAGE 2: MANUAL CLIPPER (START -> END) --
+elif page == "Manual Clipper (Start → End)":
+    st.subheader("Manual Clipper — Clip From One Timestamp/Length to Another")
     if not st.session_state.video_info and not st.session_state.broken_parts:
-        st.info("Upload and load a video in 'Campaign & Clip Workflow' first.")
+        st.info("Upload and load a video in 'Campaign & Auto-Clipper' first.")
     else:
         part_sources: list[tuple[str, str, float, int, int]] = []
         for bp in st.session_state.broken_parts:
@@ -1956,7 +1840,7 @@ elif page == "Editor & Templates":
             ))
 
         sel_src_idx = st.selectbox(
-            "Choose broken part or full video to clip",
+            "Choose broken part or full video to manually clip",
             options=list(range(len(part_sources))),
             format_func=lambda i: part_sources[i][0],
             key="ed_source_choice",
@@ -1965,9 +1849,10 @@ elif page == "Editor & Templates":
 
         a, b = st.columns(2)
         with a:
-            start = st.number_input("Start (seconds)", min_value=0.0, max_value=max(0.5, dur_ed - 0.5), value=0.0, step=0.5, key="ed_start_sec")
-            end = st.number_input("End (seconds)", min_value=0.5, max_value=dur_ed, value=min(30.0, dur_ed), step=0.5, key="ed_end_sec")
-            clip_name = st.text_input("Clip name", value=safe_name(Path(st.session_state.video_name or "clip").stem + "_edit"), key="ed_clip_name")
+            start = st.number_input("Start timestamp (seconds)", min_value=0.0, max_value=max(0.5, dur_ed - 0.5), value=0.0, step=0.5, key="ed_start_sec")
+            end = st.number_input("End timestamp (seconds)", min_value=0.5, max_value=dur_ed, value=min(30.0, dur_ed), step=0.5, key="ed_end_sec")
+            st.caption(f"Manual span: **{fmt_time(start)} → {fmt_time(end)}** (**{max(0.0, round(float(end) - float(start), 1)):.1f}s**)")
+            clip_name = st.text_input("Clip name", value=safe_name(Path(st.session_state.video_name or "clip").stem + "_manual"), key="ed_clip_name")
             spoken_ed = transcript_slice(st.session_state.transcript, float(start), float(end))
             hook_line = st.text_input("Top hook banner text", value=pick_good_hook(spoken_ed, brief=st.session_state.brief, clip_index=0), key="ed_hook_line")
             hook_dur_opt = st.selectbox("Top hook duration", ["8s Banner", "Full Clip Banner"], key="ed_hook_dur")
@@ -1978,13 +1863,13 @@ elif page == "Editor & Templates":
             add_logo = st.checkbox("Include saved brand logo", value=bool(st.session_state.logo_path), key="ed_add_logo")
             add_sub = st.checkbox("Burn bottom subtitles + export .SRT", value=True, key="ed_add_sub")
 
-        if st.button("Render Sharp Clip", type="primary", use_container_width=True, key="ed_render_btn"):
+        if st.button("Render Manual Clip (Start → End)", type="primary", use_container_width=True, key="ed_render_btn"):
             if end <= start:
-                st.error("End time must be greater than start time.")
+                st.error("End timestamp must be greater than start timestamp.")
             elif ffmpeg_ready():
                 try:
                     clip_idx = len(st.session_state.clips) + 1
-                    base_stem = f"{safe_name(clip_name)}_{clip_idx}"
+                    base_stem = f"{safe_name(clip_name)}_manual{clip_idx}"
                     out = WORK_DIR / f"{base_stem}.mp4"
                     srt_out = WORK_DIR / f"{base_stem}.srt"
                     spoken_now = transcript_slice(st.session_state.transcript, start, end)
@@ -1999,7 +1884,7 @@ elif page == "Editor & Templates":
                             fallback_text=spoken_now,
                             max_chars=wrap_chars,
                         )
-                    with st.spinner(f"Rendering sharp clip from {src_label}..."):
+                    with st.spinner(f"Rendering manual clip ({start:.1f}s → {end:.1f}s) from {src_label}..."):
                         saved_srt = render_video(
                             active_src_path, str(out), start, end,
                             aspect, resolution, crf,
@@ -2016,6 +1901,7 @@ elif page == "Editor & Templates":
                         )
                     st.session_state.used_clip_windows.append([round(start, 1), round(end, 1)])
                     c_meta = {
+                        "mode": "Manual Clip",
                         "title": clip_name,
                         "source": src_label,
                         "start": start,
@@ -2038,7 +1924,7 @@ elif page == "Editor & Templates":
                         "start": start, "end": end, "aspect": aspect, "resolution": resolution,
                         "meta": c_meta, "caption": pack["caption"], "description": pack["description"],
                     })
-                    st.success("Sharp clip with burned-in bottom subtitles & .SRT rendered.")
+                    st.success("Manual clip rendered.")
                     st.video(str(out))
                 except Exception as exc:
                     st.error(f"Render error: {exc}")
@@ -2061,3 +1947,125 @@ elif page == "Brand Kit & Settings":
         st.success("OPENAI_API_KEY active.")
     else:
         st.info("No OPENAI_API_KEY detected — local campaign/caption fallback mode active.")
+
+# ----------------------------- SHARED GENERATED CLIPS SECTION --------
+if st.session_state.clips:
+    st.divider()
+    st.subheader("Generated Clips (Auto & Manual) + Per-Clip Campaign Captions")
+    st.text_area(
+        "Optional extra caption/CTA note for clips",
+        key="caption_instructions",
+        height=75,
+    )
+
+    act_col1, act_col2 = st.columns([1.4, 1])
+    with act_col1:
+        if st.button("✨ Generate Unique Campaign Captions for All Clips", key="gen_all_short_captions_btn", use_container_width=True):
+            with st.spinner("Generating tailored campaign captions for each clip..."):
+                for i, cl in enumerate(st.session_state.clips):
+                    c_meta = cl.get("meta") or {"title": cl["name"], "start": cl["start"], "end": cl["end"]}
+                    t_seg = c_meta.get("transcript_excerpt") or transcript_slice(st.session_state.transcript, cl["start"], cl["end"])
+                    pack = generate_social_copy(
+                        platform=st.session_state.target_platform_choice,
+                        brief=st.session_state.brief,
+                        analysis=st.session_state.brief_analysis,
+                        clip_info=c_meta,
+                        transcript_text=t_seg,
+                        custom_instructions=st.session_state.caption_instructions,
+                        clip_index=i,
+                    )
+                    st.session_state.clips[i]["caption"] = pack["caption"]
+                    st.session_state.clips[i]["description"] = pack["description"]
+            st.success("Updated unique campaign captions for every clip.")
+    with act_col2:
+        short_zip_items = []
+        for i, cl in enumerate(st.session_state.clips):
+            if Path(cl["path"]).exists():
+                short_zip_items.append((f"clip_{i+1}_{safe_name(cl['name'])}.mp4", cl["path"]))
+            if cl.get("srt_path") and Path(cl["srt_path"]).exists():
+                short_zip_items.append((f"clip_{i+1}_{safe_name(cl['name'])}.srt", cl["srt_path"]))
+        if short_zip_items:
+            st.download_button(
+                f"📦 Download All Clips & SRTs (.ZIP)",
+                build_zip_bytes(short_zip_items),
+                file_name=f"{safe_name(st.session_state.project_name)}_clips_srt.zip",
+                mime="application/zip",
+                key="wf_dl_all_shorts_zip",
+                use_container_width=True,
+            )
+
+    for idx, cl in enumerate(st.session_state.clips):
+        with st.container(border=True):
+            c_vid, c_cap = st.columns([1.25, 1.35], gap="large")
+            actual_sec = round(float(cl["end"]) - float(cl["start"]), 1)
+            clip_mode = (cl.get("meta") or {}).get("mode") or "Clip"
+            with c_vid:
+                st.markdown(f"**Clip {idx + 1} [{clip_mode}]: {cl['name']}**")
+                st.caption(f"{fmt_time(cl['start'])} → {fmt_time(cl['end'])} ({actual_sec:.1f}s) · {cl['aspect']} · {cl['resolution']}")
+                if Path(cl["path"]).exists():
+                    st.video(cl["path"])
+                    dl_c1, dl_c2 = st.columns(2)
+                    with dl_c1:
+                        with open(cl["path"], "rb") as fh:
+                            st.download_button(
+                                f"⬇ Clip {idx+1} (.MP4)",
+                                fh,
+                                file_name=Path(cl["path"]).name,
+                                mime="video/mp4",
+                                key=f"wf_dl_clip_{idx}",
+                                use_container_width=True,
+                            )
+                    with dl_c2:
+                        if cl.get("srt_path") and Path(cl["srt_path"]).exists():
+                            with open(cl["srt_path"], "rb") as sf:
+                                st.download_button(
+                                    f"📄 Subtitles {idx+1} (.SRT)",
+                                    sf,
+                                    file_name=Path(cl["srt_path"]).name,
+                                    mime="application/x-subrip",
+                                    key=f"wf_dl_srt_{idx}",
+                                    use_container_width=True,
+                                )
+            with c_cap:
+                st.markdown("**Caption & Description for This Clip**")
+                if st.button(
+                    f"✨ Get Caption for Clip {idx+1} (Campaign-Matched)",
+                    type="primary",
+                    use_container_width=True,
+                    key=f"get_cap_short_{idx}",
+                ):
+                    c_meta = cl.get("meta") or {"title": cl["name"], "start": cl["start"], "end": cl["end"]}
+                    t_seg = c_meta.get("transcript_excerpt") or transcript_slice(st.session_state.transcript, cl["start"], cl["end"])
+                    with st.spinner(f"Writing campaign-matched caption for Clip {idx+1}..."):
+                        pack = generate_social_copy(
+                            platform=st.session_state.target_platform_choice,
+                            brief=st.session_state.brief,
+                            analysis=st.session_state.brief_analysis,
+                            clip_info=c_meta,
+                            transcript_text=t_seg,
+                            custom_instructions=st.session_state.caption_instructions,
+                            clip_index=idx,
+                        )
+                        st.session_state.clips[idx]["caption"] = pack["caption"]
+                        st.session_state.clips[idx]["description"] = pack["description"]
+
+                edited_cap = st.text_area(
+                    f"Clip {idx+1} Caption",
+                    value=cl.get("caption", ""),
+                    height=110,
+                    key=f"short_cap_area_{idx}",
+                )
+                edited_desc = st.text_area(
+                    f"Clip {idx+1} Description",
+                    value=cl.get("description", ""),
+                    height=135,
+                    key=f"short_desc_area_{idx}",
+                )
+                st.session_state.clips[idx]["caption"] = edited_cap
+                st.session_state.clips[idx]["description"] = edited_desc
+
+                render_fast_voice_reader(
+                    f"{edited_cap}\n\n{edited_desc}".strip(),
+                    label=f"🔊 Fast Read Clip {idx+1} Copy",
+                    uid=f"short_{idx}",
+                )
