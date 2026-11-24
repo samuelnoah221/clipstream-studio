@@ -916,7 +916,7 @@ def heuristic_campaign_analysis(brief: str, project_name: str) -> dict:
         "campaign_name": project_name.strip() or "Campaign Brief",
         "plain_english_summary": (
             f"Campaign across {', '.join(platforms)} ({len(lines)} brief line(s)). "
-            f"Section 3 stitches clips → Section 4 gives instant download & multi-style captions → Section 5 optional English subtitles & Stage 6 voiceover."
+            f"Section 3 stitches clips → Section 4 gives instant download & multi-style captions → Section 5 burn-in English subtitles & Stage 6 voiceover."
         ),
         "deliverables": ["Multi-moment peak stitch clips with multi-style captions & instant download"],
         "platforms": platforms,
@@ -935,7 +935,7 @@ def heuristic_campaign_analysis(brief: str, project_name: str) -> dict:
         "unclear_or_conflicting_points": [] if len(brief.strip()) >= 30 else ["Brief is short—add more details on hooks, captions, or rules for sharper campaign alignment."],
         "pre_publish_checklist": [
             "Download extracted clips in Section 4 or generate style-specific captions",
-            "Optionally burn Section 5 English subtitles or add Stage 6 voiceover",
+            "Use Section 5 to burn English subtitles or Stage 6 to add voiceover",
             "Check YouTube, Instagram, and Facebook captions/tags",
         ],
     }
@@ -1000,7 +1000,7 @@ def evaluate_video_against_campaign(analysis: dict, video_info: dict, transcript
     t_text = ((transcript or {}).get("text") or "").lower()
 
     if transcript and t_text.strip():
-        strengths.append(f"Speech transcript captured ({len(t_text.split())} words) for optional Section 5 English burn-in subtitles & .SRT.")
+        strengths.append(f"Speech transcript captured ({len(t_text.split())} words) for Section 5 English burn-in subtitles & .SRT.")
         for req in (must_items + req_scenes)[:5]:
             key_words = [
                 kw for kw in re.findall(r"[a-z]{4,}", req.lower())
@@ -1011,7 +1011,7 @@ def evaluate_video_against_campaign(analysis: dict, video_info: dict, transcript
             else:
                 gaps.append(f"Verify spoken/visual coverage for requirement: {req}")
     else:
-        gaps.append("No speech transcript yet—add OPENAI_API_KEY in Streamlit Secrets/env for automatic speech transcription.")
+        gaps.append("No speech transcript yet—Section 5 can still burn English subtitles from clip text/hooks or add OPENAI_API_KEY for Whisper speech sync.")
 
     return {
         "ready": True,
@@ -1130,7 +1130,6 @@ def generate_multi_platform_copy(
     clip_index: int = 0,
     caption_style: str = "Hook / Viral",
 ) -> dict:
-    """Generates tailored copy for YouTube, Instagram, and Facebook in the requested caption style."""
     client = get_openai_client()
     tags = (analysis or {}).get("hashtags") or []
     clean_tags = " ".join(t if t.startswith("#") else f"#{t.replace(' ', '')}" for t in tags[:6])
@@ -1163,7 +1162,7 @@ def generate_multi_platform_copy(
         elif caption_style == "Campaign / CTA":
             lead = f"{clip_hook or clip_title}{window_label} — {camp_req_line or moment_line}"
             cta_line = "Check the brief link/details and share with someone who needs to see this."
-        else:  # Hook / Viral
+        else:
             lead = f"WAIT FOR IT: {clip_hook or clip_title}{window_label} — {moment_line}"
             cta_line = "Watch till the end and tag your crew."
 
@@ -1228,15 +1227,20 @@ Return ONLY valid JSON:
     }
 
 
-def normalize_english_subtitle_text(text: str) -> str:
-    cleaned = re.sub(r"[^\x20-\x7E\u2014\u2013\u2018\u2019\u201c\u201d]", " ", str(text or ""))
-    cleaned = cleaned.replace("\u2014", " — ").replace("\u2013", " - ")
+def normalize_english_subtitle_text(text: str, ascii_only: bool = False) -> str:
+    if ascii_only:
+        cleaned = str(text or "").replace("\u2014", " - ").replace("\u2013", " - ")
+        cleaned = cleaned.replace("\u2018", "'").replace("\u2019", "'").replace("\u201c", '"').replace("\u201d", '"')
+        cleaned = re.sub(r"[^\x20-\x7E]", " ", cleaned)
+    else:
+        cleaned = re.sub(r"[^\x20-\x7E\u2014\u2013\u2018\u2019\u201c\u201d]", " ", str(text or ""))
+        cleaned = cleaned.replace("\u2014", " — ").replace("\u2013", " - ")
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned
 
 
-def wrap_text_lines(text: str, max_chars: int = 26, max_lines: int = 2) -> list[str]:
-    words = normalize_english_subtitle_text(text).split()
+def wrap_text_lines(text: str, max_chars: int = 26, max_lines: int = 2, ascii_only: bool = False) -> list[str]:
+    words = normalize_english_subtitle_text(text, ascii_only=ascii_only).split()
     if not words:
         return []
     lines: list[str] = []
@@ -1328,12 +1332,14 @@ def build_stitched_caption_cues(
     transcript: dict | None,
     moments: list[dict],
     max_chars: int = 26,
+    fallback_text: str = "",
+    clip_duration: float = 15.0,
 ) -> list[tuple[float, float, str]]:
     stitched_cues: list[tuple[float, float, str]] = []
     timeline_offset = 0.0
     for m in moments:
-        m_start = float(m["start"])
-        m_end = float(m["end"])
+        m_start = float(m.get("start", 0.0) or 0.0)
+        m_end = float(m.get("end", m_start + 3.0) or (m_start + 3.0))
         m_dur = max(0.5, round(m_end - m_start, 2))
         local_cues = build_caption_cues(
             transcript=transcript,
@@ -1349,6 +1355,16 @@ def build_stitched_caption_cues(
                 c_txt,
             ))
         timeline_offset = round(timeline_offset + m_dur, 2)
+
+    if not stitched_cues and normalize_english_subtitle_text(fallback_text):
+        stitched_cues = build_caption_cues(
+            transcript=None,
+            start=0.0,
+            end=max(1.0, float(clip_duration or timeline_offset or 15.0)),
+            fallback_text=fallback_text,
+            max_chars=max_chars,
+        )
+
     return stitched_cues[:40]
 
 
@@ -1440,14 +1456,21 @@ def build_frame_stage_filter(
         return (
             f"[{in_label}]scale={out_w}:{out_h}:flags=lanczos,setsar=1[{out_label}]"
         )
+    # Enhanced Fit All (Full Frame + Ambient Blur): layered ambient backdrop + subtle vignette + crisp centered full frame
     bg_lbl = f"{out_label}_bg"
     fg_lbl = f"{out_label}_fg"
+    composed_lbl = f"{out_label}_comp"
+    is_vertical = out_h > out_w
+    vignette_step = f",vignette=PI/4.5" if is_vertical else ""
     return (
         f"[{in_label}]split[{bg_lbl}_raw][{fg_lbl}_raw];"
-        f"[{bg_lbl}_raw]scale={out_w}:{out_h}:force_original_aspect_ratio=increase:flags=fast_bilinear,"
-        f"crop={out_w}:{out_h}:(iw-{out_w})/2:(ih-{out_h})/2,boxblur=24:4,eq=brightness=-0.08:saturation=0.9,setsar=1[{bg_lbl}];"
-        f"[{fg_lbl}_raw]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease:flags=lanczos,setsar=1[{fg_lbl}];"
-        f"[{bg_lbl}][{fg_lbl}]overlay=(W-w)/2:(H-h)/2:shortest=1[{out_label}]"
+        f"[{bg_lbl}_raw]scale={out_w}:{out_h}:force_original_aspect_ratio=increase:flags=lanczos,"
+        f"crop={out_w}:{out_h}:(iw-{out_w})/2:(ih-{out_h})/2,gblur=sigma=28:steps=2,"
+        f"eq=brightness=-0.12:saturation=1.08:contrast=1.05{vignette_step},setsar=1[{bg_lbl}];"
+        f"[{fg_lbl}_raw]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease:flags=lanczos,"
+        f"eq=contrast=1.03:saturation=1.04,setsar=1[{fg_lbl}];"
+        f"[{bg_lbl}][{fg_lbl}]overlay=(W-w)/2:(H-h)/2:shortest=1[{composed_lbl}];"
+        f"[{composed_lbl}]drawbox=x=0:y=0:w={out_w}:h=4:color=white@0.12:t=fill[{out_label}]"
     )
 
 
@@ -1464,6 +1487,7 @@ def append_overlays_and_subs(
     caption_font_size: int,
     srt_output_path: str | None,
     temp_text_files: list[Path],
+    ascii_only: bool = False,
 ) -> tuple[str, str | None]:
     current = current_label
     srt_file: Path | None = None
@@ -1472,7 +1496,7 @@ def append_overlays_and_subs(
     if sys_font:
         font_opt = f":fontfile='{sys_font}'"
 
-    hook_lines = wrap_text_lines(hook_banner_text, max_chars=24, max_lines=2)
+    hook_lines = wrap_text_lines(hook_banner_text, max_chars=24, max_lines=2, ascii_only=ascii_only)
     if hook_lines:
         hook_font_px = max(20, min(36, int(out_h * 0.025)))
         hook_step = int(hook_font_px * 1.28)
@@ -1489,7 +1513,7 @@ def append_overlays_and_subs(
             hook_filters.append(
                 f"drawtext=textfile='{hook_file_esc}'{font_opt}:fontcolor=white:fontsize={hook_font_px}:"
                 f"x=max(24\\,(w-text_w)/2):y={y_hook}:"
-                f"box=1:boxcolor=black@0.72:boxborderw=8:"
+                f"box=1:boxcolor=black@0.75:boxborderw=8:"
                 f"enable='between(t,0,{active_end:.2f})'"
             )
 
@@ -1517,7 +1541,7 @@ def append_overlays_and_subs(
         for c_start, c_end, c_text in cues[:40]:
             c_a = max(0.0, min(clip_duration, float(c_start)))
             c_b = max(c_a + 0.15, min(clip_duration, float(c_end)))
-            lines_list = wrap_text_lines(" ".join(c_text.splitlines()), max_chars=26, max_lines=2)
+            lines_list = wrap_text_lines(" ".join(c_text.splitlines()), max_chars=26, max_lines=2, ascii_only=ascii_only)
             if not lines_list:
                 continue
             total_block_h = line_step * len(lines_list)
@@ -1529,9 +1553,9 @@ def append_overlays_and_subs(
                 cue_file_esc = escape_ffmpeg_path(cue_file)
                 y_pos = max(24, base_y + (l_i * line_step))
                 sub_filters.append(
-                    f"drawtext=textfile='{cue_file_esc}'{font_opt}:fontcolor=white:fontsize={sub_px}:"
+                    f"drawtext=textfile='{cue_file_esc}'{font_opt}:fontcolor=#FDE047:fontsize={sub_px}:"
                     f"x=max(24\\,(w-text_w)/2):y={y_pos}:"
-                    f"box=1:boxcolor=black@0.68:boxborderw=7:"
+                    f"box=1:boxcolor=black@0.78:boxborderw=8:"
                     f"enable='between(t,{c_a:.2f},{c_b:.2f})'"
                 )
 
@@ -1616,64 +1640,69 @@ def render_video(
     clip_duration = max(0.5, round(float(end) - float(start), 1))
     out_w, out_h = resolve_target_dimensions(aspect, resolution, src_w, src_h)
 
-    graph: list[str] = [build_frame_stage_filter("0:v", out_w, out_h, aspect, "vstage", fit_mode=fit_mode)]
-    inputs: list[str] = ["-ss", str(round(float(start), 2)), "-i", source]
-    has_logo = bool(logo and Path(logo).exists())
-    if has_logo:
-        inputs += ["-i", str(logo)]
+    for ascii_flag in (False, True):
+        graph: list[str] = [build_frame_stage_filter("0:v", out_w, out_h, aspect, "vstage", fit_mode=fit_mode)]
+        inputs: list[str] = ["-ss", str(round(float(start), 2)), "-i", source]
+        has_logo = bool(logo and Path(logo).exists())
+        if has_logo:
+            inputs += ["-i", str(logo)]
 
-    temp_text_files: list[Path] = []
-    try:
-        current, saved_srt = append_overlays_and_subs(
-            graph=graph,
-            current_label="vstage",
-            clip_duration=clip_duration,
-            out_w=out_w,
-            out_h=out_h,
-            logo=logo,
-            cues=cues,
-            hook_banner_text=hook_banner_text,
-            hook_banner_duration=hook_banner_duration,
-            caption_font_size=caption_font_size,
-            srt_output_path=srt_output_path,
-            temp_text_files=temp_text_files,
-        )
+        temp_text_files: list[Path] = []
+        try:
+            current, saved_srt = append_overlays_and_subs(
+                graph=graph,
+                current_label="vstage",
+                clip_duration=clip_duration,
+                out_w=out_w,
+                out_h=out_h,
+                logo=logo,
+                cues=cues,
+                hook_banner_text=hook_banner_text,
+                hook_banner_duration=hook_banner_duration,
+                caption_font_size=caption_font_size,
+                srt_output_path=srt_output_path,
+                temp_text_files=temp_text_files,
+                ascii_only=ascii_flag,
+            )
 
-        a_label, custom_audio = build_audio_stage(
-            graph=graph,
-            inputs=inputs,
-            input_spec="0:a?",
-            clip_duration=clip_duration,
-            mute_original=mute_original,
-            voiceover_path=voiceover_path,
-            normalize_audio=normalize_audio,
-        )
+            a_label, custom_audio = build_audio_stage(
+                graph=graph,
+                inputs=inputs,
+                input_spec="0:a?",
+                clip_duration=clip_duration,
+                mute_original=mute_original,
+                voiceover_path=voiceover_path,
+                normalize_audio=normalize_audio,
+            )
 
-        args = ["ffmpeg", "-y", *inputs]
-        if custom_audio:
-            args += ["-filter_complex", ";".join(graph), "-map", f"[{current}]", "-map", a_label]
-        else:
-            args += ["-filter_complex", ";".join(graph), "-map", f"[{current}]", "-map", "0:a?"]
+            args = ["ffmpeg", "-y", *inputs]
+            if custom_audio:
+                args += ["-filter_complex", ";".join(graph), "-map", f"[{current}]", "-map", a_label]
+            else:
+                args += ["-filter_complex", ";".join(graph), "-map", f"[{current}]", "-map", "0:a?"]
 
-        args += [
-            "-t", str(clip_duration),
-            "-c:v", "libx264",
-            "-preset", encode_preset,
-            "-crf", str(int(crf)),
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac",
-            "-b:a", "128k",
-            "-movflags", "+faststart",
-            output,
-        ]
-        p = run_cmd(args, timeout=600)
-        if p.returncode or not Path(output).exists():
-            raise RuntimeError(p.stderr[-2500:] or "FFmpeg render failed.")
-        return saved_srt
-    finally:
-        for tf in temp_text_files:
-            tf.unlink(missing_ok=True)
-        gc.collect()
+            args += [
+                "-t", str(clip_duration),
+                "-c:v", "libx264",
+                "-preset", encode_preset,
+                "-crf", str(int(crf)),
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac",
+                "-b:a", "128k",
+                "-movflags", "+faststart",
+                output,
+            ]
+            p = run_cmd(args, timeout=600)
+            if p.returncode == 0 and Path(output).exists() and Path(output).stat().st_size > 0:
+                return saved_srt
+            if ascii_flag:
+                raise RuntimeError(p.stderr[-2500:] or "FFmpeg render failed.")
+        finally:
+            for tf in temp_text_files:
+                tf.unlink(missing_ok=True)
+            gc.collect()
+
+    return None
 
 
 def render_stitched_clip(
@@ -1702,85 +1731,216 @@ def render_stitched_clip(
         raise RuntimeError("No peak moments selected to stitch.")
 
     out_w, out_h = resolve_target_dimensions(aspect, resolution, src_w, src_h)
-    graph: list[str] = []
-    concat_inputs: list[str] = []
-    total_dur = 0.0
 
-    for idx, m in enumerate(moments):
-        s_v = round(max(0.0, float(m["start"])), 2)
-        e_v = round(max(s_v + 0.5, float(m["end"])), 2)
-        seg_d = round(e_v - s_v, 2)
-        total_dur = round(total_dur + seg_d, 2)
+    for ascii_flag in (False, True):
+        graph: list[str] = []
+        concat_inputs: list[str] = []
+        total_dur = 0.0
 
-        v_trim = f"vt{idx}"
-        v_stage = f"vs{idx}"
-        a_trim = f"at{idx}"
+        for idx, m in enumerate(moments):
+            s_v = round(max(0.0, float(m["start"])), 2)
+            e_v = round(max(s_v + 0.5, float(m["end"])), 2)
+            seg_d = round(e_v - s_v, 2)
+            total_dur = round(total_dur + seg_d, 2)
+
+            v_trim = f"vt{idx}"
+            v_stage = f"vs{idx}"
+            a_trim = f"at{idx}"
+            graph.append(
+                f"[0:v]trim=start={s_v:.2f}:end={e_v:.2f},setpts=PTS-STARTPTS[{v_trim}]"
+            )
+            graph.append(build_frame_stage_filter(v_trim, out_w, out_h, aspect, v_stage, fit_mode=fit_mode))
+            graph.append(
+                f"[0:a]atrim=start={s_v:.2f}:end={e_v:.2f},asetpts=PTS-STARTPTS,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[{a_trim}]"
+            )
+            concat_inputs.append(f"[{v_stage}][{a_trim}]")
+
+        n_seg = len(moments)
         graph.append(
-            f"[0:v]trim=start={s_v:.2f}:end={e_v:.2f},setpts=PTS-STARTPTS[{v_trim}]"
+            f"{''.join(concat_inputs)}concat=n={n_seg}:v=1:a=1[vconcat][aconcat]"
         )
-        graph.append(build_frame_stage_filter(v_trim, out_w, out_h, aspect, v_stage, fit_mode=fit_mode))
-        graph.append(
-            f"[0:a]atrim=start={s_v:.2f}:end={e_v:.2f},asetpts=PTS-STARTPTS,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[{a_trim}]"
-        )
-        concat_inputs.append(f"[{v_stage}][{a_trim}]")
 
-    n_seg = len(moments)
-    graph.append(
-        f"{''.join(concat_inputs)}concat=n={n_seg}:v=1:a=1[vconcat][aconcat]"
-    )
+        inputs: list[str] = ["-i", source]
+        has_logo = bool(logo and Path(logo).exists())
+        if has_logo:
+            inputs += ["-i", str(logo)]
 
-    inputs: list[str] = ["-i", source]
-    has_logo = bool(logo and Path(logo).exists())
-    if has_logo:
-        inputs += ["-i", str(logo)]
+        temp_text_files: list[Path] = []
+        try:
+            current, saved_srt = append_overlays_and_subs(
+                graph=graph,
+                current_label="vconcat",
+                clip_duration=max(0.5, total_dur),
+                out_w=out_w,
+                out_h=out_h,
+                logo=logo,
+                cues=cues,
+                hook_banner_text=hook_banner_text,
+                hook_banner_duration=hook_banner_duration,
+                caption_font_size=caption_font_size,
+                srt_output_path=srt_output_path,
+                temp_text_files=temp_text_files,
+                ascii_only=ascii_flag,
+            )
 
-    temp_text_files: list[Path] = []
+            a_label, custom_audio = build_audio_stage(
+                graph=graph,
+                inputs=inputs,
+                input_spec="aconcat",
+                clip_duration=max(0.5, total_dur),
+                mute_original=mute_original,
+                voiceover_path=voiceover_path,
+                normalize_audio=False,
+            )
+
+            args = ["ffmpeg", "-y", *inputs, "-filter_complex", ";".join(graph), "-map", f"[{current}]"]
+            args += ["-map", a_label] if custom_audio else ["-map", "[aconcat]"]
+            args += [
+                "-c:v", "libx264",
+                "-preset", encode_preset,
+                "-crf", str(int(crf)),
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac",
+                "-b:a", "128k",
+                "-movflags", "+faststart",
+                output,
+            ]
+            p = run_cmd(args, timeout=600)
+            if p.returncode == 0 and Path(output).exists() and Path(output).stat().st_size > 0:
+                return saved_srt
+            if ascii_flag:
+                raise RuntimeError(p.stderr[-2500:] or "FFmpeg stitched render failed.")
+        finally:
+            for tf in temp_text_files:
+                tf.unlink(missing_ok=True)
+            gc.collect()
+
+    return None
+
+
+def burn_subtitles_into_clip(
+    clip_rec: dict,
+    transcript: dict | None,
+    caption_font_size: int = 28,
+) -> tuple[dict, str]:
+    """Burns English subtitles onto an already-extracted clip safely without crashing."""
+    src_p = clip_rec.get("path") or ""
+    if not src_p or not Path(src_p).exists():
+        return clip_rec, "Skipped (clip video file not found)."
+    if not ffmpeg_ready():
+        return clip_rec, "Skipped (FFmpeg not available)."
+
     try:
-        current, saved_srt = append_overlays_and_subs(
-            graph=graph,
-            current_label="vconcat",
-            clip_duration=max(0.5, total_dur),
-            out_w=out_w,
-            out_h=out_h,
-            logo=logo,
-            cues=cues,
-            hook_banner_text=hook_banner_text,
-            hook_banner_duration=hook_banner_duration,
-            caption_font_size=caption_font_size,
-            srt_output_path=srt_output_path,
-            temp_text_files=temp_text_files,
+        info = probe_video(src_p)
+        clip_dur = max(0.8, float(info.get("duration") or max(0.8, float(clip_rec.get("end", 15)) - float(clip_rec.get("start", 0)))))
+        w_px = max(2, int(info.get("width") or 720))
+        h_px = max(2, int(info.get("height") or 1280))
+    except Exception:
+        clip_dur = max(0.8, round(float(clip_rec.get("end", 15)) - float(clip_rec.get("start", 0)), 1))
+        w_px, h_px = 720, 1280
+
+    c_meta = dict(clip_rec.get("meta") or {})
+    moments = c_meta.get("moments") or []
+    wrap_chars = 26 if h_px >= w_px else 36
+
+    fallback_bits = [
+        c_meta.get("transcript_excerpt") or "",
+        " ".join(str(m.get("text") or "") for m in moments),
+        c_meta.get("hook") or "",
+        clip_rec.get("caption") or "",
+        clip_rec.get("name") or "English subtitle highlight",
+    ]
+    fallback_txt = next((normalize_english_subtitle_text(b) for b in fallback_bits if normalize_english_subtitle_text(b)), "English highlight clip")
+
+    if moments:
+        cues = build_stitched_caption_cues(
+            transcript=transcript,
+            moments=moments,
+            max_chars=wrap_chars,
+            fallback_text=fallback_txt,
+            clip_duration=clip_dur,
+        )
+    else:
+        cues = build_caption_cues(
+            transcript=transcript,
+            start=float(clip_rec.get("start", 0.0) or 0.0),
+            end=float(clip_rec.get("start", 0.0) or 0.0) + clip_dur,
+            fallback_text=fallback_txt,
+            max_chars=wrap_chars,
         )
 
-        a_label, custom_audio = build_audio_stage(
-            graph=graph,
-            inputs=inputs,
-            input_spec="aconcat",
-            clip_duration=max(0.5, total_dur),
-            mute_original=mute_original,
-            voiceover_path=voiceover_path,
-            normalize_audio=False,
-        )
+    if not cues:
+        cues = [(0.0, round(clip_dur, 2), wrap_caption_lines(fallback_txt, max_chars=wrap_chars, max_lines=2))]
 
-        args = ["ffmpeg", "-y", *inputs, "-filter_complex", ";".join(graph), "-map", f"[{current}]"]
-        args += ["-map", a_label] if custom_audio else ["-map", "[aconcat]"]
-        args += [
-            "-c:v", "libx264",
-            "-preset", encode_preset,
-            "-crf", str(int(crf)),
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac",
-            "-b:a", "128k",
-            "-movflags", "+faststart",
-            output,
-        ]
-        p = run_cmd(args, timeout=600)
-        if p.returncode or not Path(output).exists():
-            raise RuntimeError(p.stderr[-2500:] or "FFmpeg stitched render failed.")
-        return saved_srt
-    finally:
-        for tf in temp_text_files:
-            tf.unlink(missing_ok=True)
-        gc.collect()
+    ws_dir = workspace_dir(st.session_state.get("workspace_key", "default"))
+    stem = f"{safe_name(Path(src_p).stem)}_en_sub_{next(tempfile._get_candidate_names())}"
+    out_mp4 = ws_dir / f"{stem}.mp4"
+    out_srt = ws_dir / f"{stem}.srt"
+
+    write_srt_file(cues, clip_dur, out_srt)
+
+    for ascii_flag in (False, True):
+        temp_files: list[Path] = []
+        try:
+            font_opt = ""
+            sys_font = find_system_font()
+            if sys_font:
+                font_opt = f":fontfile='{sys_font}'"
+
+            scale_ratio = h_px / 1280.0
+            sub_px = max(20, min(38, int(round(int(caption_font_size) * max(0.8, scale_ratio)))))
+            bottom_margin = max(48, min(int(h_px * 0.10), int(round(h_px * 0.065))))
+            line_step = int(sub_px * 1.26)
+            sub_filters: list[str] = []
+
+            for c_start, c_end, c_text in cues[:40]:
+                c_a = max(0.0, min(clip_dur, float(c_start)))
+                c_b = max(c_a + 0.15, min(clip_dur, float(c_end)))
+                lines_list = wrap_text_lines(" ".join(c_text.splitlines()), max_chars=wrap_chars, max_lines=2, ascii_only=ascii_flag)
+                if not lines_list:
+                    continue
+                total_block_h = line_step * len(lines_list)
+                base_y = h_px - bottom_margin - total_block_h
+                for l_i, raw_ln in enumerate(lines_list):
+                    t_path = WORK_DIR / f"s5_{next(tempfile._get_candidate_names())}.txt"
+                    t_path.write_text(raw_ln, encoding="utf-8")
+                    temp_files.append(t_path)
+                    t_esc = escape_ffmpeg_path(t_path)
+                    y_pos = max(24, base_y + (l_i * line_step))
+                    sub_filters.append(
+                        f"drawtext=textfile='{t_esc}'{font_opt}:fontcolor=#FDE047:fontsize={sub_px}:"
+                        f"x=max(24\\,(w-text_w)/2):y={y_pos}:"
+                        f"box=1:boxcolor=black@0.80:boxborderw=8:"
+                        f"enable='between(t,{c_a:.2f},{c_b:.2f})'"
+                    )
+
+            if not sub_filters:
+                break
+
+            cmd = [
+                "ffmpeg", "-y", "-i", src_p,
+                "-vf", ",".join(sub_filters),
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+                "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart",
+                str(out_mp4),
+            ]
+            res = run_cmd(cmd, timeout=600)
+            if res.returncode == 0 and out_mp4.exists() and out_mp4.stat().st_size > 0:
+                updated = dict(clip_rec)
+                updated["path"] = str(out_mp4)
+                updated["srt_path"] = str(out_srt)
+                c_meta["subtitles_burned_en"] = True
+                updated["meta"] = c_meta
+                return updated, f"Burned {len(cues)} English subtitle cue(s) into {out_mp4.name}."
+        except Exception as exc:
+            if ascii_flag:
+                return clip_rec, f"Subtitle burn-in fallback notice: {exc}"
+        finally:
+            for tf in temp_files:
+                tf.unlink(missing_ok=True)
+            gc.collect()
+
+    return clip_rec, "Could not burn subtitles on this file—kept original clip safe."
 
 
 def sync_auto_clip_count(source_key: str):
@@ -1854,10 +2014,10 @@ init_state()
 st.markdown(f"""<div class="hero">
 <div style="color:#a5b4fc;font-weight:750;font-size:.76rem;letter-spacing:.13em">SECTION 3 STITCH · SECTION 4 CAPTIONS & DOWNLOAD · SECTION 5 ENGLISH SUBTITLES · STAGE 6 VOICEOVER</div>
 <h1>🎬 {APP_NAME}</h1>
-<p class="muted">Generate stitched clips in Section 3, download right away or generate different kinds of captions in Section 4, and optionally burn English subtitles (Section 5) or add voiceover (Stage 6).</p>
-<span class="pill">Clean 9:16 Fit</span>
+<p class="muted">Generate stitched clips in Section 3, download right away or generate different kinds of captions in Section 4, and burn English subtitles in Section 5 or add voiceover in Stage 6.</p>
+<span class="pill">Enhanced 9:16 Vertical</span>
 <span class="pill">Section 4: Multi-Style Captions & Download</span>
-<span class="pill">Section 5: Optional English Subtitles</span>
+<span class="pill">Section 5: Active English Burn-In</span>
 <span class="pill">Stage 6: Mute & Voiceover Inside</span>
 </div>""", unsafe_allow_html=True)
 
@@ -2188,7 +2348,7 @@ if page == "Campaign & Auto-Clipper":
         with go_col2:
             if st.session_state.go_ahead_clips:
                 exact_s = minutes_to_seconds(float(st.session_state.auto_clip_minutes))
-                st.success(f"Go-ahead granted! Section 3 will stitch clips totaling ~{float(st.session_state.auto_clip_minutes):.2f} min ({exact_s:.1f}s) with clean 9:16 fit.")
+                st.success(f"Go-ahead granted! Section 3 will stitch clips totaling ~{float(st.session_state.auto_clip_minutes):.2f} min ({exact_s:.1f}s) with enhanced 9:16 fit.")
 
     # Section 3: Auto-Clipper (Generate / Stitch Clips)
     if st.session_state.go_ahead_clips and st.session_state.video_info and ffmpeg_ready():
@@ -2308,7 +2468,7 @@ if page == "Campaign & Auto-Clipper":
                 use_subs_now = bool(st.session_state.get("burn_subtitles_chk_v2", False))
                 if use_subs_now and not st.session_state.transcript and get_openai_client():
                     try:
-                        with st.spinner("Transcribing spoken audio for optional English subtitles..."):
+                        with st.spinner("Transcribing spoken audio for English subtitles..."):
                             st.session_state.transcript = transcribe_video(st.session_state.source_video)
                     except Exception:
                         pass
@@ -2352,6 +2512,8 @@ if page == "Campaign & Auto-Clipper":
                         transcript=st.session_state.transcript,
                         moments=moments,
                         max_chars=wrap_chars,
+                        fallback_text=all_spoken or final_hook,
+                        clip_duration=stitched_sec,
                     ) if use_subs_now else []
 
                     with st.spinner(f"Stitching {len(moments)} peak moments into Clip {clip_num_global} ({stitched_sec:.1f}s) in {default_asp}..."):
@@ -2389,6 +2551,7 @@ if page == "Campaign & Auto-Clipper":
                         "aspect": default_asp,
                         "fit_mode": fit_mode,
                         "muted": bool(st.session_state.get("mute_original_audio", False)),
+                        "subtitles_burned_en": bool(use_subs_now and saved_srt),
                         "hook": final_hook,
                         "transcript_excerpt": all_spoken,
                     }
@@ -2511,7 +2674,7 @@ elif page == "Manual Clipper (Start → End)":
                             transcript=st.session_state.transcript,
                             start=start,
                             end=end,
-                            fallback_text=spoken_now,
+                            fallback_text=spoken_now or final_hook,
                             max_chars=wrap_chars,
                         )
                     vo_ed_path = st.session_state.get("voiceover_audio_path")
@@ -2543,6 +2706,7 @@ elif page == "Manual Clipper (Start → End)":
                         "aspect": aspect,
                         "fit_mode": fit_mode_ed,
                         "muted": bool(mute_ed),
+                        "subtitles_burned_en": bool(add_sub and saved_srt),
                         "hook": final_hook,
                         "transcript_excerpt": spoken_now,
                     }
@@ -2665,11 +2829,12 @@ if st.session_state.clips:
             with c_vid:
                 st.markdown(f"**Clip {idx + 1} [{clip_mode}]: {cl['name']}**")
                 mute_tag = " · Muted Audio" if c_meta.get("muted") else ""
+                sub_tag = " · EN Subtitles Burned" if c_meta.get("subtitles_burned_en") else ""
                 if moments_list:
                     m_txt = " + ".join(f"{float(m['start']):.0f}s–{float(m['end']):.0f}s" for m in moments_list)
-                    st.caption(f"Stitched: {m_txt} ({actual_sec:.1f}s total) · {cl['aspect']} · {cl['resolution']}{mute_tag}")
+                    st.caption(f"Stitched: {m_txt} ({actual_sec:.1f}s total) · {cl['aspect']} · {cl['resolution']}{mute_tag}{sub_tag}")
                 else:
-                    st.caption(f"{fmt_time(cl['start'])} → {fmt_time(cl['end'])} ({actual_sec:.1f}s) · {cl['aspect']} · {cl['resolution']}{mute_tag}")
+                    st.caption(f"{fmt_time(cl['start'])} → {fmt_time(cl['end'])} ({actual_sec:.1f}s) · {cl['aspect']} · {cl['resolution']}{mute_tag}{sub_tag}")
                 if Path(cl["path"]).exists():
                     st.video(cl["path"])
                     dl_c1, dl_c2 = st.columns(2)
@@ -2763,11 +2928,11 @@ if st.session_state.clips:
 
 # ----------------------------- SECTION 5 & STAGE 6 (OPTIONAL NEXT) -----
 st.divider()
-st.subheader("Section 5 · Optional English Burn-In Subtitles (Non-Blocking)")
-s5_c1, s5_c2, s5_c3 = st.columns([1.3, 1.0, 1.2])
+st.subheader("Section 5 · Active English Subtitle Burn-In (Non-Blocking)")
+s5_c1, s5_c2, s5_c3 = st.columns([1.2, 1.0, 1.2])
 with s5_c1:
     st.checkbox(
-        "Enable Burn-In Subtitles (Optional)",
+        "Auto-include English subtitles on future renders",
         key="burn_subtitles_chk_v2",
     )
 with s5_c2:
@@ -2777,12 +2942,45 @@ with s5_c2:
         key="subtitle_language",
     )
 with s5_c3:
-    st.slider(
+    s5_font_sz = st.slider(
         "Subtitle size (non-blocking lower zone)",
         20, 36, int(st.session_state.get("onscreen_caption_size", 28)),
         key="onscreen_caption_size",
     )
-st.caption("Optional step: when checked, English subtitles are generated and burned cleanly in the lower margin without blocking the video or top hook.")
+
+if st.session_state.clips:
+    s5_target_options = ["All Extracted Clips"] + [f"Clip {i+1}: {c['name']}" for i, c in enumerate(st.session_state.clips)]
+    s5_act1, s5_act2 = st.columns([1.4, 1.2])
+    with s5_act1:
+        s5_target = st.selectbox("Target clip(s) for burn-in", s5_target_options, key="s5_burn_target_sel")
+    with s5_act2:
+        st.write("")
+        burn_now_clicked = st.button(
+            "🔥 Burn In English Subtitles Now",
+            type="primary",
+            use_container_width=True,
+            key="s5_burn_now_btn",
+        )
+
+    if burn_now_clicked:
+        indices = list(range(len(st.session_state.clips))) if s5_target == "All Extracted Clips" else [int(s5_target.split(":")[0].replace("Clip", "").strip()) - 1]
+        status_msgs: list[str] = []
+        with st.spinner("Burning English subtitles into selected clip(s)..."):
+            for i_clip in indices:
+                if 0 <= i_clip < len(st.session_state.clips):
+                    updated_rec, msg = burn_subtitles_into_clip(
+                        clip_rec=st.session_state.clips[i_clip],
+                        transcript=st.session_state.transcript,
+                        caption_font_size=int(s5_font_sz),
+                    )
+                    st.session_state.clips[i_clip] = updated_rec
+                    status_msgs.append(f"Clip {i_clip+1}: {msg}")
+        save_workspace_state()
+        for m_line in status_msgs:
+            st.success(m_line)
+        st.rerun()
+else:
+    st.caption("Generate or manually render a clip first, then click **Burn In English Subtitles Now** here to burn English subtitles into your clip(s).")
 
 st.divider()
 st.subheader("Stage 6 · Mute Video Override & Voiceover Inside")
