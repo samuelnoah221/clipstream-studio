@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import gc
 import html
 import io
 import json
@@ -10,6 +11,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from datetime import timedelta
 from pathlib import Path
 
@@ -38,7 +40,6 @@ st.markdown("""
 .hero h1{margin:0;letter-spacing:-1.2px;font-size:2.25rem}
 .muted{color:#a5b0c4;font-size:.9rem}
 .pill{display:inline-block;border:1px solid #46516d;color:#c7d2fe;border-radius:30px;padding:4px 10px;font-size:.78rem;margin:4px 5px 0 0}
-.panel{background:#151b29;border:1px solid #2b354b;border-radius:14px;padding:15px}
 </style>
 """, unsafe_allow_html=True)
 
@@ -100,16 +101,89 @@ def find_system_font() -> str | None:
             return Path(p).resolve().as_posix().replace(":", "\\:")
     return None
 
-def save_upload(uploaded, suffix: str | None = None) -> Path:
+def render_browser_file_meter(max_mb: int = 2048):
+    components.html(
+        f"""
+        <div style="font-family:system-ui,-apple-system,sans-serif;background:#151b29;border:1px solid #2b354b;border-radius:12px;padding:12px;color:#f4f5fa;">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;font-size:13px;">
+            <span id="f_lbl">Pick a video to see local file read %</span>
+            <strong id="f_pct" style="color:#a5b4fc;">0%</strong>
+          </div>
+          <div style="width:100%;height:10px;background:#090c13;border-radius:999px;overflow:hidden;border:1px solid #293449;">
+            <div id="f_bar" style="width:0%;height:100%;background:linear-gradient(90deg,#6366f1,#22c55e);transition:width 0.1s ease;"></div>
+          </div>
+          <div id="f_meta" style="margin-top:6px;font-size:12px;color:#94a3b8;">Max size: {max_mb} MB</div>
+          <input id="f_input" type="file" accept="video/*" style="margin-top:8px;font-size:12px;color:#cbd5e1;" />
+        </div>
+        <script>
+          const input = document.getElementById("f_input");
+          const bar = document.getElementById("f_bar");
+          const pct = document.getElementById("f_pct");
+          const lbl = document.getElementById("f_lbl");
+          const meta = document.getElementById("f_meta");
+
+          input.addEventListener("change", () => {{
+            const file = input.files && input.files[0];
+            if (!file) return;
+            const total = file.size || 1;
+            const totalMb = (total / (1024 * 1024)).toFixed(1);
+            let offset = 0;
+            const step = 8 * 1024 * 1024;
+            lbl.textContent = "Reading " + file.name + "...";
+
+            function nextSlice() {{
+              if (offset >= total) {{
+                bar.style.width = "100%";
+                pct.textContent = "100%";
+                meta.textContent = totalMb + " / " + totalMb + " MB";
+                lbl.textContent = "Ready: " + file.name + " (use uploader below & click Load Video)";
+                return;
+              }}
+              const slice = file.slice(offset, offset + step);
+              const reader = new FileReader();
+              reader.onload = (ev) => {{
+                const bytes = (ev.target.result && ev.target.result.byteLength) || slice.size;
+                offset += bytes;
+                const p = Math.min(100, Math.round((offset / total) * 100));
+                bar.style.width = p + "%";
+                pct.textContent = p + "%";
+                meta.textContent = (offset / (1024 * 1024)).toFixed(1) + " / " + totalMb + " MB";
+                requestAnimationFrame(nextSlice);
+              }};
+              reader.readAsArrayBuffer(slice);
+            }}
+            nextSlice();
+          }});
+        </script>
+        """,
+        height=125,
+    )
+
+def save_upload(uploaded, suffix: str | None = None, show_progress: bool = False) -> Path:
     ext = suffix or Path(uploaded.name).suffix.lower() or ".bin"
-    path = WORK_DIR / f"{next(tempfile._get_candidate_names())}{ext}"
+    path = WORK_DIR / f"{next(tempfile._get_candidate_names())}_{int(time.time())}{ext}"
+    total_bytes = max(1, int(getattr(uploaded, "size", 0) or 0))
+    written = 0
+    chunk_size = 4 * 1024 * 1024
+
+    bar = st.progress(0, text="Saving file to disk: 0%") if show_progress else None
     uploaded.seek(0)
     with path.open("wb") as handle:
         while True:
-            chunk = uploaded.read(16 * 1024 * 1024)
+            chunk = uploaded.read(chunk_size)
             if not chunk:
                 break
             handle.write(chunk)
+            written += len(chunk)
+            if bar is not None:
+                pct = min(100, int((written / total_bytes) * 100))
+                bar.progress(
+                    pct,
+                    text=f"Saving file to disk: {pct}% ({written / (1024*1024):.1f} / {total_bytes / (1024*1024):.1f} MB)",
+                )
+    if bar is not None:
+        bar.progress(100, text="Saved file to disk: 100%")
+    gc.collect()
     return path
 
 def probe_video(path: str) -> dict:
@@ -135,7 +209,6 @@ def probe_video(path: str) -> dict:
     }
 
 def split_video_into_two_parts(source: str, duration: float, split_sec: float | None = None) -> tuple[dict, dict]:
-    """Losslessly split a large video into 2 parts using stream copy (-c copy) to avoid heavy re-encode RAM spikes."""
     src_path = Path(source)
     if not src_path.exists():
         raise RuntimeError("Source video file is missing.")
@@ -165,6 +238,7 @@ def split_video_into_two_parts(source: str, duration: float, split_sec: float | 
 
     info1 = probe_video(str(part1_path))
     info2 = probe_video(str(part2_path))
+    gc.collect()
     return (
         {"label": "Part 1", "path": str(part1_path), "start_in_source": 0.0, "end_in_source": mid, "info": info1},
         {"label": "Part 2", "path": str(part2_path), "start_in_source": mid, "end_in_source": dur, "info": info2},
@@ -183,11 +257,10 @@ def mix_two_parts_into_one(
     src_w: int = 1920,
     src_h: int = 1080,
     caption_font_size: int = 28,
-    encode_preset: str = "medium",
-    normalize_audio: bool = True,
+    encode_preset: str = "fast",
+    normalize_audio: bool = False,
     max_duration: float | None = None,
 ):
-    """Combine Part 1 and Part 2 into a single sharp short or video with optional hook & changing bottom captions."""
     if not Path(part1_path).exists() or not Path(part2_path).exists():
         raise RuntimeError("One or both split parts are missing.")
 
@@ -200,8 +273,8 @@ def mix_two_parts_into_one(
     try:
         m_cmd = [
             "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "256k", str(merged_raw)
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k", str(merged_raw)
         ]
         pm = run_cmd(m_cmd, timeout=1800)
         if pm.returncode or not merged_raw.exists():
@@ -232,6 +305,7 @@ def mix_two_parts_into_one(
     finally:
         list_file.unlink(missing_ok=True)
         merged_raw.unlink(missing_ok=True)
+        gc.collect()
 
 def get_openai_client():
     key = None
@@ -252,8 +326,8 @@ def extract_document_text(uploaded) -> str:
     name, raw = uploaded.name.lower(), uploaded.getvalue()
     if name.endswith(".pdf"):
         import fitz
-        doc = fitz.open(stream=raw, filetype="pdf")
-        return "\n\n".join(page.get_text() for page in doc).strip()
+        with fitz.open(stream=raw, filetype="pdf") as doc:
+            return "\n\n".join(page.get_text() for page in doc).strip()
     if name.endswith(".docx"):
         from docx import Document
         doc = Document(io.BytesIO(raw))
@@ -263,7 +337,8 @@ def extract_document_text(uploaded) -> str:
     if name.endswith((".png", ".jpg", ".jpeg", ".webp")):
         from PIL import Image
         import pytesseract
-        return pytesseract.image_to_string(Image.open(io.BytesIO(raw))).strip()
+        with Image.open(io.BytesIO(raw)) as im:
+            return pytesseract.image_to_string(im).strip()
     raise ValueError("Unsupported file type. Use PDF, DOCX, TXT, MD, CSV or an image.")
 
 def parse_json_response(content: str) -> dict:
@@ -602,41 +677,45 @@ def transcribe_video(video_path: str) -> dict:
     finally:
         audio_path.unlink(missing_ok=True)
 
-def make_contact_sheet(video_path: str, duration: float, max_frames: int = 9) -> Path:
+def make_contact_sheet(video_path: str, duration: float, max_frames: int = 6) -> Path:
     from PIL import Image, ImageDraw
-    count = max(1, min(max_frames, int(duration // 12) + 1))
+    count = max(1, min(max_frames, int(duration // 20) + 1))
     interval = max(1.0, duration / count)
     paths = []
-    for i in range(count):
-        ts = min(max(0.0, duration - 0.1), i * interval)
-        frame = WORK_DIR / f"frame_{next(tempfile._get_candidate_names())}.jpg"
-        p = run_cmd(["ffmpeg", "-y", "-ss", str(ts), "-i", video_path, "-frames:v", "1", "-vf", "scale=320:-1", "-q:v", "5", str(frame)], timeout=90)
-        if p.returncode == 0 and frame.exists():
-            paths.append((ts, frame))
-    if not paths:
-        raise RuntimeError("Could not extract video preview frames.")
-    tiles = []
-    for ts, path in paths:
-        im = Image.open(path).convert("RGB")
-        draw = ImageDraw.Draw(im)
-        draw.rectangle((0, 0, 110, 24), fill=(0, 0, 0))
-        draw.text((7, 5), f"{ts:.1f}s", fill=(255, 255, 255))
-        tiles.append(im)
-    cols = 3
-    rows = (len(tiles) + cols - 1) // cols
-    w, h = 320, tiles[0].height
-    sheet = Image.new("RGB", (cols * w, rows * (h + 26)), (18, 22, 32))
-    draw = ImageDraw.Draw(sheet)
-    for i, im in enumerate(tiles):
-        x = (i % cols) * w
-        y = (i // cols) * (h + 26)
-        sheet.paste(im, (x, y))
-        draw.text((x + 6, y + h + 5), f"Frame {i+1}", fill=(220, 225, 240))
-    out = WORK_DIR / f"contact_{next(tempfile._get_candidate_names())}.jpg"
-    sheet.save(out, quality=82)
-    for _, p in paths:
-        p.unlink(missing_ok=True)
-    return out
+    try:
+        for i in range(count):
+            ts = min(max(0.0, duration - 0.1), i * interval)
+            frame = WORK_DIR / f"frame_{next(tempfile._get_candidate_names())}.jpg"
+            p = run_cmd(["ffmpeg", "-y", "-ss", str(ts), "-i", video_path, "-frames:v", "1", "-vf", "scale=240:-1", "-q:v", "6", str(frame)], timeout=90)
+            if p.returncode == 0 and frame.exists():
+                paths.append((ts, frame))
+        if not paths:
+            raise RuntimeError("Could not extract video preview frames.")
+        tiles = []
+        for ts, path in paths:
+            with Image.open(path) as raw_im:
+                im = raw_im.convert("RGB")
+            draw = ImageDraw.Draw(im)
+            draw.rectangle((0, 0, 95, 22), fill=(0, 0, 0))
+            draw.text((6, 4), f"{ts:.1f}s", fill=(255, 255, 255))
+            tiles.append(im)
+        cols = 3
+        rows = (len(tiles) + cols - 1) // cols
+        w, h = 240, tiles[0].height
+        sheet = Image.new("RGB", (cols * w, rows * (h + 24)), (18, 22, 32))
+        draw = ImageDraw.Draw(sheet)
+        for i, im in enumerate(tiles):
+            x = (i % cols) * w
+            y = (i // cols) * (h + 24)
+            sheet.paste(im, (x, y))
+            draw.text((x + 6, y + h + 4), f"Frame {i+1}", fill=(220, 225, 240))
+        out = WORK_DIR / f"contact_{next(tempfile._get_candidate_names())}.jpg"
+        sheet.save(out, quality=80)
+        return out
+    finally:
+        for _, p in paths:
+            p.unlink(missing_ok=True)
+        gc.collect()
 
 def build_non_repeating_candidates(
     brief: str,
@@ -663,12 +742,12 @@ def build_non_repeating_candidates(
         try:
             segs = (transcript or {}).get("segments", []) or []
             t_lines = [f"[{float(s.get('start',0)):.1f}-{float(s.get('end',0)):.1f}] {s.get('text','')}" for s in segs]
-            t_text = "\n".join(t_lines)[:18000] or (transcript or {}).get("text", "")[:18000]
+            t_text = "\n".join(t_lines)[:12000] or (transcript or {}).get("text", "")[:12000]
             img_b64 = base64.b64encode(contact_sheet.read_bytes()).decode("utf-8")
             prompt = f"""Given target platform {target_platform}, exact requested clip duration {desired_minutes:.2f} min ({minutes_to_seconds(desired_minutes):.1f}s), and previously used ranges {used_windows},
 write distinct short titles and high-retention hooks based on what is actually said/shown in each window for {count} fresh clip(s). Return ONLY JSON:
 {{"items":[{{"title":"short title","reason":"why it fits","campaign_match":"brief match","hook":"punchy hook line from speech/moment","confidence":"high|medium|low"}}]}}
-BRIEF: {brief[:8000]}
+BRIEF: {brief[:6000]}
 TRANSCRIPT: {t_text}
 """
             resp = client.chat.completions.create(
@@ -682,6 +761,8 @@ TRANSCRIPT: {t_text}
             ai_meta_list = parse_json_response(resp.choices[0].message.content or "{}").get("items", []) or []
         except Exception:
             ai_meta_list = []
+        finally:
+            contact_sheet.unlink(missing_ok=True)
 
     results = []
     for idx, (s_sec, e_sec, spoken_txt) in enumerate(fresh_slots):
@@ -887,7 +968,7 @@ def build_caption_cues(
             if b_end > b_start + 0.15:
                 cues.append((b_start, b_end, wrap_caption_lines(beats[i % len(beats)], max_chars=32, max_lines=2)))
 
-    return cues[:60]
+    return cues[:36]
 
 def resolve_sharp_dimensions(
     aspect: str,
@@ -895,7 +976,6 @@ def resolve_sharp_dimensions(
     src_w: int,
     src_h: int,
     clip_index: int = 0,
-    clip_duration: float = 15.0,
 ) -> tuple[str | None, str | None, int, int]:
     src_w = max(2, int(src_w or 1920))
     src_h = max(2, int(src_h or 1080))
@@ -971,8 +1051,8 @@ def render_video(
     src_w: int = 1920,
     src_h: int = 1080,
     caption_font_size: int = 28,
-    encode_preset: str = "medium",
-    normalize_audio: bool = True,
+    encode_preset: str = "fast",
+    normalize_audio: bool = False,
     clip_index: int = 0,
 ):
     if not source or not Path(source).exists():
@@ -980,7 +1060,7 @@ def render_video(
 
     clip_duration = max(0.5, round(float(end) - float(start), 1))
     crop, dims, out_w, out_h = resolve_sharp_dimensions(
-        aspect, resolution, src_w, src_h, clip_index=clip_index, clip_duration=clip_duration
+        aspect, resolution, src_w, src_h, clip_index=clip_index
     )
 
     graph: list[str] = []
@@ -1079,7 +1159,7 @@ def render_video(
             "-crf", str(int(crf)),
             "-pix_fmt", "yuv420p",
             "-c:a", "aac",
-            "-b:a", "256k",
+            "-b:a", "192k",
             "-movflags", "+faststart",
             output
         ]
@@ -1089,6 +1169,7 @@ def render_video(
     finally:
         for tf in temp_text_files:
             tf.unlink(missing_ok=True)
+        gc.collect()
 
 def init_state():
     defaults = {
@@ -1128,17 +1209,17 @@ init_state()
 
 # ----------------------------- HEADER & NAV -----------------------------
 st.markdown(f"""<div class="hero">
-<div style="color:#a5b4fc;font-weight:750;font-size:.76rem;letter-spacing:.13em">UP TO 2GB UPLOAD · SPLIT INTO 2 PARTS & MIX INTO ONE · CHANGING BOTTOM CAPTIONS · SHARP OUTPUT</div>
+<div style="color:#a5b4fc;font-weight:750;font-size:.76rem;letter-spacing:.13em">UPLOAD % METER · 2-PART SPLIT & MIX · CHANGING BOTTOM CAPTIONS</div>
 <h1>🎬 {APP_NAME}</h1>
-<p class="muted">Up to 2GB video uploads + split large videos into 2 parts & mix both into one sharp short/video + changing speech-synced bottom captions + unique campaign captions per short.</p>
-<span class="pill">Up to 2GB upload</span>
+<p class="muted">Upload percentage meter + 2-part split & mix into one sharp short/video + changing speech-synced bottom captions + unique campaign captions per short.</p>
+<span class="pill">Upload % meter</span>
 <span class="pill">Split 2 parts & mix</span>
 <span class="pill">Changing bottom captions</span>
 <span class="pill">Unique caption per short</span>
 </div>""", unsafe_allow_html=True)
 
 if not ffmpeg_ready():
-    st.error("FFmpeg and ffprobe are required for video processing. Streamlit Cloud installs them from packages.txt; install them locally and add bin to PATH.")
+    st.error("FFmpeg and ffprobe are required for video processing. Add `ffmpeg` to `packages.txt` on Streamlit Cloud or install it locally.")
 
 with st.sidebar:
     st.title("STUDIO")
@@ -1154,22 +1235,23 @@ with st.sidebar:
 
 # ----------------------------- PAGE 1: CAMPAIGN & CLIP WORKFLOW ---------
 if page == "Campaign & Clip Workflow":
-    st.subheader("Step 1 · Video (with 2-Part Split & Mix Option) + Campaign Requirements")
+    st.subheader("Step 1 · Video (with Upload % & 2-Part Split/Mix) + Campaign Requirements")
     left_col, right_col = st.columns([1.15, 1], gap="large")
 
     with left_col:
         st.text_input("Project / Campaign Name", key="project_name")
         st.checkbox(
-            "Enable 2-part split & mix (recommended for large 1GB–2GB files)",
+            "Enable 2-part split & mix (recommended for large files)",
             key="split_mode_enabled"
         )
-        video_up = st.file_uploader("Upload campaign video (up to 2GB)", type=["mp4", "mov", "mkv", "webm", "m4v"], key="wf_video_up")
+        render_browser_file_meter(MAX_UPLOAD_MB)
+        video_up = st.file_uploader("Upload campaign video", type=["mp4", "mov", "mkv", "webm", "m4v"], key="wf_video_up")
         if video_up and video_up.size > MAX_UPLOAD_MB * 1024 * 1024:
-            st.error(f"File exceeds {MAX_UPLOAD_MB} MB (2GB) limit.")
+            st.error(f"File exceeds {MAX_UPLOAD_MB} MB limit.")
         elif video_up and st.button("Load Video", type="primary", key="wf_load_video"):
             try:
-                with st.spinner("Saving and inspecting video..."):
-                    vpath = save_upload(video_up)
+                vpath = save_upload(video_up, show_progress=True)
+                with st.spinner("Inspecting video metadata..."):
                     vinfo = probe_video(str(vpath))
                     st.session_state.source_video = str(vpath)
                     st.session_state.video_name = video_up.name
@@ -1187,10 +1269,10 @@ if page == "Campaign & Clip Workflow":
         if st.session_state.video_info and st.session_state.source_video and Path(st.session_state.source_video).exists():
             vi = st.session_state.video_info
             size_mb = round((vi.get("size") or Path(st.session_state.source_video).stat().st_size) / (1024 * 1024), 1)
-            if size_mb < 600:
+            if size_mb < 200:
                 st.video(st.session_state.source_video)
             else:
-                st.info(f"Large file ({size_mb} MB) loaded on disk—preview skipped to save memory. Use **Break Video into 2 Parts** below for smooth processing.")
+                st.info(f"Large file ({size_mb} MB) saved to disk—inline preview paused to save RAM. Use **Break Video into 2 Parts** below.")
             m1, m2, m3 = st.columns(3)
             m1.metric("Duration", fmt_time(vi["duration"]))
             m2.metric("Resolution", f"{vi['width']}x{vi['height']}")
@@ -1245,8 +1327,8 @@ if page == "Campaign & Clip Workflow":
                                 src_w=int(vi.get("width") or 1920),
                                 src_h=int(vi.get("height") or 1080),
                                 caption_font_size=int(st.session_state.onscreen_caption_size),
-                                encode_preset="medium",
-                                normalize_audio=True,
+                                encode_preset="fast",
+                                normalize_audio=False,
                             )
 
                         c_meta = {
@@ -1367,7 +1449,7 @@ if page == "Campaign & Clip Workflow":
                                 st.session_state.transcript = tr
                             except Exception:
                                 tr = None
-                            sheet = make_contact_sheet(st.session_state.source_video, st.session_state.video_info["duration"], max_frames=9)
+                            sheet = make_contact_sheet(st.session_state.source_video, st.session_state.video_info["duration"], max_frames=6)
                             st.session_state.highlights = build_non_repeating_candidates(
                                 brief=json.dumps(analysis, ensure_ascii=False),
                                 transcript=tr,
@@ -1500,9 +1582,6 @@ if page == "Campaign & Clip Workflow":
                 st.rerun()
 
         st.caption(f"Target length per short: **{active_minutes:.2f} min = {exact_target_sec:.1f}s** · Default aspect for {st.session_state.target_platform_choice}: **{default_aspect_for_platform(st.session_state.target_platform_choice)}**")
-        if st.session_state.used_clip_windows:
-            used_str = ", ".join(f"{w[0]:.1f}s–{w[1]:.1f}s" for w in st.session_state.used_clip_windows)
-            st.caption(f"Already used ranges avoided automatically: {used_str}")
 
         cands = st.session_state.highlights or build_non_repeating_candidates(
             brief=st.session_state.brief,
@@ -1526,7 +1605,7 @@ if page == "Campaign & Clip Workflow":
         with q_col2:
             sharp_crf = st.slider("Quality CRF (15 = crispest)", 15, 22, 16, key="wf_sharp_crf")
         with q_col3:
-            encode_preset = st.selectbox("Encode speed/quality", ["medium", "slow", "fast"], key="wf_encode_preset")
+            encode_preset = st.selectbox("Encode speed/quality", ["fast", "medium", "ultrafast"], key="wf_encode_preset")
         with q_col4:
             cap_size = st.slider("Bottom caption size", 20, 42, int(st.session_state.onscreen_caption_size), key="wf_cap_size")
 
@@ -1609,7 +1688,7 @@ if page == "Campaign & Clip Workflow":
                             fallback_text=f"{spoken_now} {st.session_state.brief}".strip(),
                         )
 
-                    with st.spinner(f"Rendering {asp_v} Short {num} ({s_v:.1f}s – {e_v:.1f}s = {round(e_v - s_v, 1):.1f}s)..."):
+                    with st.spinner(f"Rendering {asp_v} Short {num} ({s_v:.1f}s – {e_v:.1f}s)..."):
                         render_video(
                             st.session_state.source_video,
                             str(out_file),
@@ -1626,7 +1705,7 @@ if page == "Campaign & Clip Workflow":
                             src_h=int(vi.get("height") or 1080),
                             caption_font_size=int(cap_size),
                             encode_preset=encode_preset,
-                            normalize_audio=True,
+                            normalize_audio=False,
                             clip_index=clip_num_global - 1,
                         )
                     st.session_state.used_clip_windows.append([round(s_v, 1), round(e_v, 1)])
@@ -1663,16 +1742,6 @@ if page == "Campaign & Clip Workflow":
                     rendered_now.append(rec)
 
                 if rendered_now:
-                    st.session_state.highlights = build_non_repeating_candidates(
-                        brief=st.session_state.brief,
-                        transcript=st.session_state.transcript,
-                        contact_sheet=None,
-                        duration=dur,
-                        target_platform=st.session_state.target_platform_choice,
-                        clip_count=st.session_state.desired_clip_count,
-                        desired_minutes=active_minutes,
-                        used_windows=st.session_state.used_clip_windows,
-                    )
                     st.success(f"Extracted {len(rendered_now)} sharp short(s) with unique campaign captions ready below.")
                     st.rerun()
             except Exception as exc:
@@ -1682,13 +1751,10 @@ if page == "Campaign & Clip Workflow":
     if st.session_state.clips:
         st.divider()
         st.subheader("Step 4 · Generated Shorts & Per-Short Campaign Caption Generator")
-        st.caption("Each short has its own independent caption & description tailored to that short's moment and your campaign brief.")
-
         st.text_area(
-            "Optional extra caption/CTA note for shorts (applied when you click Get Caption for a Short)",
+            "Optional extra caption/CTA note for shorts",
             key="caption_instructions",
             height=75,
-            placeholder="Example: Highlight the discount code, mention the link in bio/description, and keep it punchy for YouTube Shorts."
         )
 
         if st.button("✨ Generate Unique Campaign Captions for All Shorts", key="gen_all_short_captions_btn"):
@@ -1783,7 +1849,7 @@ elif page == "Editor & Templates":
         dur_ed = max(1.0, float(vi["duration"]))
         if st.session_state.source_video and Path(st.session_state.source_video).exists():
             size_ed_mb = round((vi.get("size") or Path(st.session_state.source_video).stat().st_size) / (1024 * 1024), 1)
-            if size_ed_mb < 600:
+            if size_ed_mb < 200:
                 st.video(st.session_state.source_video)
         a, b = st.columns(2)
         with a:
@@ -1828,7 +1894,7 @@ elif page == "Editor & Templates":
                             src_w=int(vi.get("width") or 1920),
                             src_h=int(vi.get("height") or 1080),
                             caption_font_size=int(st.session_state.onscreen_caption_size),
-                            normalize_audio=True,
+                            normalize_audio=False,
                             clip_index=clip_idx - 1,
                         )
                     st.session_state.used_clip_windows.append([round(start, 1), round(end, 1)])
@@ -1874,6 +1940,6 @@ elif page == "Brand Kit & Settings":
     st.text_input("Brand Accent Colour", key="brand_colour")
     st.divider()
     if get_openai_client():
-        st.success("OPENAI_API_KEY active — full AI campaign + speech-synced captions + hook & per-short copy generation enabled.")
+        st.success("OPENAI_API_KEY active.")
     else:
-        st.info("No OPENAI_API_KEY detected — smart local mode is active for campaign triage, non-repeating picks, hook picking, changing bottom captions, and per-short campaign-aware captions.")
+        st.info("No OPENAI_API_KEY detected — local campaign/caption fallback mode active.")
