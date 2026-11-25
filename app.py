@@ -275,6 +275,7 @@ def save_workspace_state(ws_key: str | None = None) -> Path:
         "burn_subtitles_chk_v2": bool(st.session_state.get("burn_subtitles_chk_v2", False)),
         "subtitle_language": st.session_state.get("subtitle_language", "English (Default)"),
         "onscreen_caption_size": int(st.session_state.get("onscreen_caption_size", 28)),
+        "subtitle_accent_colour": st.session_state.get("subtitle_accent_colour", "Creator Yellow"),
         "vertical_fit_mode": fit_val,
         "mute_original_audio": bool(st.session_state.get("mute_original_audio", False)),
         "voiceover_source_mode": st.session_state.get("voiceover_source_mode", "Uploaded Voice Track"),
@@ -312,7 +313,7 @@ def load_workspace_state(ws_key: str) -> bool:
         "go_ahead_clips", "target_platform_choice", "desired_clip_minutes",
         "auto_clip_minutes", "used_clip_windows", "hook_banner_scope",
         "burn_subtitles_chk_v2", "subtitle_language", "onscreen_caption_size",
-        "vertical_fit_mode", "mute_original_audio", "voiceover_source_mode",
+        "subtitle_accent_colour", "vertical_fit_mode", "mute_original_audio", "voiceover_source_mode",
         "voiceover_script_text", "voiceover_audio_name",
         "video_name", "video_info", "broken_parts", "transcript",
         "auto_candidates", "logo_name", "brand_name", "brand_colour",
@@ -1042,10 +1043,22 @@ def transcribe_video(video_path: str) -> dict:
     audio_path = extract_audio(video_path)
     try:
         with audio_path.open("rb") as f:
-            result = client.audio.transcriptions.create(
-                model="whisper-1", file=f, response_format="verbose_json",
-                timestamp_granularities=["segment"],
-            )
+            try:
+                result = client.audio.transcriptions.create(
+                    model="whisper-1", file=f, response_format="verbose_json",
+                    timestamp_granularities=["word", "segment"],
+                )
+            except Exception as word_timing_error:
+                # Keep transcription working on API/SDK combinations that
+                # reject word-level timestamps; segment timing remains usable.
+                f.seek(0)
+                try:
+                    result = client.audio.transcriptions.create(
+                        model="whisper-1", file=f, response_format="verbose_json",
+                        timestamp_granularities=["segment"],
+                    )
+                except Exception:
+                    raise word_timing_error
         if isinstance(result, dict):
             return result
         if hasattr(result, "model_dump"):
@@ -1265,17 +1278,69 @@ def wrap_caption_lines(text: str, max_chars: int = 26, max_lines: int = 2) -> st
     return "\n".join(wrap_text_lines(text, max_chars=max_chars, max_lines=max_lines))
 
 
+
 def build_caption_cues(
     transcript: dict | None,
     start: float,
     end: float,
     fallback_text: str = "",
     max_chars: int = 26,
-) -> list[tuple[float, float, str]]:
+) -> list[tuple]:
     clip_dur = max(0.5, round(end - start, 2))
-    cues: list[tuple[float, float, str]] = []
+    cues: list[tuple] = []
+    tr = transcript or {}
 
-    raw_segs = (transcript or {}).get("segments") or []
+    # Prefer Whisper's word timestamps for tighter alignment. If the API
+    # response has no word array, safely fall back to segment timestamps.
+    raw_words = tr.get("words") or []
+    timed_words = []
+    for word_obj in raw_words:
+        try:
+            a = float(word_obj.get("start", 0.0) or 0.0)
+            b = float(word_obj.get("end", 0.0) or 0.0)
+            word = normalize_english_subtitle_text(str(word_obj.get("word", word_obj.get("text", ""))))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if word and b > start and a < end and b > a:
+            timed_words.append({
+                "start": max(0.0, a - start),
+                "end": min(clip_dur, b - start),
+                "word": word,
+            })
+
+    if timed_words:
+        # Four-word phrase blocks stay readable while each word's highlight
+        # follows its own Whisper timestamp rather than a guessed sentence split.
+        for idx in range(0, len(timed_words), 4):
+            group = timed_words[idx:idx + 4]
+            if not group:
+                continue
+            cue_start = max(0.0, float(group[0]["start"]))
+            cue_end = min(clip_dur, float(group[-1]["end"]))
+            if cue_end <= cue_start + 0.08:
+                continue
+            words = [str(w["word"]) for w in group]
+            text = wrap_caption_lines(" ".join(words), max_chars=max_chars, max_lines=2)
+            durations = []
+            for j, item in enumerate(group):
+                if j + 1 < len(group):
+                    next_start = float(group[j + 1]["start"])
+                    duration = max(0.04, next_start - float(item["start"]))
+                else:
+                    duration = max(0.04, float(item["end"]) - float(item["start"]))
+                durations.append(duration)
+            # Fit the karaoke durations to the actual event length to avoid
+            # a highlight continuing after the phrase disappears.
+            total = sum(durations) or (cue_end - cue_start)
+            event_len = cue_end - cue_start
+            durations = [max(0.03, d * event_len / total) for d in durations]
+            if text:
+                cues.append((round(cue_start, 2), round(cue_end, 2), text, durations))
+
+    if cues:
+        return cues[:80]
+
+    raw_segs = tr.get("segments") or []
     overlapping = []
     for sg in raw_segs:
         a = float(sg.get("start", 0.0) or 0.0)
@@ -1325,7 +1390,7 @@ def build_caption_cues(
                 if wrapped and b_end > b_start + 0.12:
                     cues.append((b_start, b_end, wrapped))
 
-    return cues[:40]
+    return cues[:80]
 
 
 def build_stitched_caption_cues(
@@ -1348,12 +1413,21 @@ def build_stitched_caption_cues(
             fallback_text=m.get("text") or "",
             max_chars=max_chars,
         )
-        for c_a, c_b, c_txt in local_cues:
-            stitched_cues.append((
-                round(timeline_offset + c_a, 2),
-                round(timeline_offset + min(m_dur, c_b), 2),
-                c_txt,
-            ))
+        for cue in local_cues:
+            c_a, c_b, c_txt = cue[:3]
+            if len(cue) > 3:
+                stitched_cues.append((
+                    round(timeline_offset + c_a, 2),
+                    round(timeline_offset + min(m_dur, c_b), 2),
+                    c_txt,
+                    cue[3],
+                ))
+            else:
+                stitched_cues.append((
+                    round(timeline_offset + c_a, 2),
+                    round(timeline_offset + min(m_dur, c_b), 2),
+                    c_txt,
+                ))
         timeline_offset = round(timeline_offset + m_dur, 2)
 
     if not stitched_cues and normalize_english_subtitle_text(fallback_text):
@@ -1371,7 +1445,8 @@ def build_stitched_caption_cues(
 def write_srt_file(cues: list[tuple[float, float, str]], clip_duration: float, srt_path: Path) -> Path:
     blocks: list[str] = []
     idx = 1
-    for c_start, c_end, c_text in cues:
+    for cue in cues:
+        c_start, c_end, c_text = cue[:3]
         a_sec = max(0.0, min(clip_duration, float(c_start)))
         b_sec = max(a_sec + 0.15, min(clip_duration, float(c_end)))
         clean_lines = "\n".join(
@@ -1474,6 +1549,164 @@ def build_frame_stage_filter(
     )
 
 
+
+SUBTITLE_ACCENT_PALETTE = {
+    "Creator Yellow": "&H0000D7FF",  # bright warm yellow (ASS uses BGR)
+    "Electric Cyan": "&H00FFFF00",
+    "Lime Pop": "&H0000FF45",
+    "White": "&H00FFFFFF",
+}
+
+
+def _ass_safe_text(value: str) -> str:
+    """Escape text for ASS dialogue lines without allowing user text to inject tags."""
+    clean = normalize_english_subtitle_text(value)
+    clean = clean.replace("{", "(").replace("}", ")")
+    clean = clean.replace("\\", "")
+    return clean
+
+
+def write_creator_ass_file(
+    cues: list[tuple[float, float, str]],
+    clip_duration: float,
+    out_w: int,
+    out_h: int,
+    font_size: int,
+    output_path: Path,
+    accent_colour: str = "Creator Yellow",
+) -> Path:
+    """
+    Create creator-style subtitles: bold white text, active-word yellow highlight,
+    thick black outline and soft shadow. Word timing is interpolated inside each
+    Whisper segment/cue because Whisper provides segment-level, not word-level, timing.
+    """
+    accent = SUBTITLE_ACCENT_PALETTE.get(accent_colour, SUBTITLE_ACCENT_PALETTE["Creator Yellow"])
+    scale = max(0.75, min(2.0, float(out_h) / 1280.0))
+    font_px = max(24, min(76, int(round(int(font_size) * scale))))
+    # Keep captions clear of common Reels/Shorts bottom UI overlays.
+    margin_v = max(58, int(round(out_h * (0.115 if out_h >= out_w else 0.075))))
+    header = f"""[Script Info]
+Title: ClipStream Studio Creator Captions
+ScriptType: v4.00+
+WrapStyle: 2
+ScaledBorderAndShadow: yes
+PlayResX: {max(2, int(out_w))}
+PlayResY: {max(2, int(out_h))}
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Creator,Arial,{font_px},{accent},&H00FFFFFF,&H00101010,&H64000000,-1,0,0,0,100,100,0,0,1,3.2,1.4,2,48,48,{margin_v},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+    def ass_time(seconds: float) -> str:
+        cs = max(0, int(round(seconds * 100)))
+        hh, rem = divmod(cs, 360000)
+        mm, rem = divmod(rem, 6000)
+        ss, cc = divmod(rem, 100)
+        return f"{hh}:{mm:02d}:{ss:02d}.{cc:02d}"
+
+    events = []
+    for cue in (cues or [])[:120]:
+        cue_start, cue_end, cue_text = cue[:3]
+        start = max(0.0, min(float(clip_duration), float(cue_start)))
+        end = max(start + 0.12, min(float(clip_duration), float(cue_end)))
+        if end <= start:
+            continue
+
+        # Re-wrap to the actual output width. The old implementation placed
+        # long phrases on one line, which could run beyond the frame edges.
+        safe_text = _ass_safe_text(str(cue_text or "").replace("\\N", " "))
+        max_chars = max(16, min(30, int(out_w / max(1.0, font_px * 0.58))))
+        wrapped_lines = wrap_text_lines(safe_text, max_chars=max_chars, max_lines=2)
+        words_by_line = [line.split() for line in wrapped_lines if line.strip()]
+        words = [word for line_words in words_by_line for word in line_words]
+        if not words:
+            continue
+
+        weights = [max(1, len(re.sub(r"[^A-Za-z0-9]", "", word))) for word in words]
+        total_weight = sum(weights) or len(words)
+        supplied_word_durations = cue[3] if len(cue) > 3 and isinstance(cue[3], (list, tuple)) else None
+        if supplied_word_durations and len(supplied_word_durations) == len(words):
+            raw_cs = [max(1, int(round(float(d) * 100))) for d in supplied_word_durations]
+            total_cs = max(len(words), int(round((end - start) * 100)))
+            raw_sum = sum(raw_cs) or total_cs
+            duration_values = [max(1, int(round(value * total_cs / raw_sum))) for value in raw_cs]
+            # Correct rounding drift on the final word so the highlight ends with the cue.
+            duration_values[-1] = max(1, total_cs - sum(duration_values[:-1]))
+        else:
+            total_cs = max(len(words), int(round((end - start) * 100)))
+            remaining = total_cs
+            duration_values = []
+            for idx, weight in enumerate(weights):
+                if idx == len(words) - 1:
+                    duration_cs = max(1, remaining)
+                else:
+                    duration_cs = max(1, int(round(total_cs * weight / total_weight)))
+                    duration_cs = min(duration_cs, max(1, remaining - (len(words) - idx - 1)))
+                remaining -= duration_cs
+                duration_values.append(duration_cs)
+
+        karaoke_parts = [
+            f"{{\\kf{duration_cs}}}{word}"
+            for word, duration_cs in zip(words, duration_values)
+        ]
+        # Insert ASS line breaks at the same points selected by the wrapper.
+        karaoke_lines = []
+        word_cursor = 0
+        for line_words in words_by_line:
+            line_count = len(line_words)
+            karaoke_lines.append(" ".join(karaoke_parts[word_cursor:word_cursor + line_count]))
+            word_cursor += line_count
+        karaoke_text = r"\\N".join(karaoke_lines)
+        events.append(
+            f"Dialogue: 0,{ass_time(start)},{ass_time(end)},Creator,,0,0,0,,{{\\an2\\q2}}{karaoke_text}"
+        )
+
+    output_path.write_text(header + "\n".join(events) + "\n", encoding="utf-8")
+    return output_path
+
+
+def _drawtext_subtitle_filters(
+    cues: list[tuple[float, float, str]],
+    clip_duration: float,
+    out_h: int,
+    caption_font_size: int,
+    temp_files: list[Path],
+    ascii_only: bool = False,
+) -> list[str]:
+    """Compatibility fallback for FFmpeg builds without libass subtitles support."""
+    sys_font = find_system_font()
+    font_opt = f":fontfile='{sys_font}'" if sys_font else ""
+    scale_ratio = max(0.8, float(out_h) / 1280.0)
+    sub_px = max(22, min(54, int(round(int(caption_font_size) * scale_ratio))))
+    bottom_margin = max(52, int(round(out_h * 0.115)))
+    line_step = int(sub_px * 1.22)
+    filters = []
+    for cue in (cues or [])[:80]:
+        c_start, c_end, c_text = cue[:3]
+        c_a = max(0.0, min(clip_duration, float(c_start)))
+        c_b = max(c_a + 0.15, min(clip_duration, float(c_end)))
+        lines_list = wrap_text_lines(" ".join(str(c_text).splitlines()), max_chars=26, max_lines=2, ascii_only=ascii_only)
+        if not lines_list:
+            continue
+        base_y = out_h - bottom_margin - line_step * len(lines_list)
+        for line_idx, line in enumerate(lines_list):
+            text_path = WORK_DIR / f"caption_fallback_{next(tempfile._get_candidate_names())}.txt"
+            text_path.write_text(line, encoding="utf-8")
+            temp_files.append(text_path)
+            escaped = escape_ffmpeg_path(text_path)
+            y_pos = max(24, base_y + line_idx * line_step)
+            filters.append(
+                f"drawtext=textfile='{escaped}'{font_opt}:fontcolor=white:fontsize={sub_px}:"
+                f"x=max(24\\,(w-text_w)/2):y={y_pos}:"
+                f"borderw=4:bordercolor=black@0.98:shadowcolor=black@0.75:shadowx=2:shadowy=2:"
+                f"enable='between(t,{c_a:.2f},{c_b:.2f})'"
+            )
+    return filters
+
+
 def append_overlays_and_subs(
     graph: list[str],
     current_label: str,
@@ -1488,6 +1721,8 @@ def append_overlays_and_subs(
     srt_output_path: str | None,
     temp_text_files: list[Path],
     ascii_only: bool = False,
+    use_ass: bool = True,
+    subtitle_accent_colour: str = "Creator Yellow",
 ) -> tuple[str, str | None]:
     current = current_label
     srt_file: Path | None = None
@@ -1532,36 +1767,28 @@ def append_overlays_and_subs(
         if srt_output_path:
             srt_file = write_srt_file(cues, clip_duration, Path(srt_output_path))
 
-        scale_ratio = out_h / 1280.0
-        sub_px = max(20, min(38, int(round(int(caption_font_size) * max(0.8, scale_ratio)))))
-        bottom_margin = max(48, min(int(out_h * 0.10), int(round(out_h * 0.065))))
-        line_step = int(sub_px * 1.26)
-        sub_filters: list[str] = []
-
-        for c_start, c_end, c_text in cues[:40]:
-            c_a = max(0.0, min(clip_duration, float(c_start)))
-            c_b = max(c_a + 0.15, min(clip_duration, float(c_end)))
-            lines_list = wrap_text_lines(" ".join(c_text.splitlines()), max_chars=26, max_lines=2, ascii_only=ascii_only)
-            if not lines_list:
-                continue
-            total_block_h = line_step * len(lines_list)
-            base_y = out_h - bottom_margin - total_block_h
-            for l_i, raw_ln in enumerate(lines_list):
-                cue_file = WORK_DIR / f"cue_{next(tempfile._get_candidate_names())}.txt"
-                cue_file.write_text(raw_ln, encoding="utf-8")
-                temp_text_files.append(cue_file)
-                cue_file_esc = escape_ffmpeg_path(cue_file)
-                y_pos = max(24, base_y + (l_i * line_step))
-                sub_filters.append(
-                    f"drawtext=textfile='{cue_file_esc}'{font_opt}:fontcolor=#FDE047:fontsize={sub_px}:"
-                    f"x=max(24\\,(w-text_w)/2):y={y_pos}:"
-                    f"box=1:boxcolor=black@0.78:boxborderw=8:"
-                    f"enable='between(t,{c_a:.2f},{c_b:.2f})'"
-                )
-
-        if sub_filters:
-            graph.append(f"[{current}]{','.join(sub_filters)}[vsub]")
+        if use_ass:
+            ass_path = WORK_DIR / f"captions_{next(tempfile._get_candidate_names())}.ass"
+            write_creator_ass_file(
+                cues=cues,
+                clip_duration=clip_duration,
+                out_w=out_w,
+                out_h=out_h,
+                font_size=caption_font_size,
+                output_path=ass_path,
+                accent_colour=subtitle_accent_colour,
+            )
+            temp_text_files.append(ass_path)
+            ass_escaped = escape_ffmpeg_path(ass_path)
+            graph.append(f"[{current}]subtitles=filename='{ass_escaped}'[vsub]")
             current = "vsub"
+        else:
+            sub_filters = _drawtext_subtitle_filters(
+                cues, clip_duration, out_h, caption_font_size, temp_text_files, ascii_only=ascii_only
+            )
+            if sub_filters:
+                graph.append(f"[{current}]{','.join(sub_filters)}[vsub]")
+                current = "vsub"
 
     return current, (str(srt_file) if srt_file and srt_file.exists() else None)
 
@@ -1633,6 +1860,7 @@ def render_video(
     fit_mode: str = "Fit All (Full Frame + Ambient Blur)",
     mute_original: bool = False,
     voiceover_path: str | None = None,
+    subtitle_accent_colour: str = "Creator Yellow",
 ) -> str | None:
     if not source or not Path(source).exists():
         raise RuntimeError("Source or broken-part video file is missing. Load or break the video again.")
@@ -1640,7 +1868,8 @@ def render_video(
     clip_duration = max(0.5, round(float(end) - float(start), 1))
     out_w, out_h = resolve_target_dimensions(aspect, resolution, src_w, src_h)
 
-    for ascii_flag in (False, True):
+    for ass_mode in (True, False):
+        ascii_flag = not ass_mode
         graph: list[str] = [build_frame_stage_filter("0:v", out_w, out_h, aspect, "vstage", fit_mode=fit_mode)]
         inputs: list[str] = ["-ss", str(round(float(start), 2)), "-i", source]
         has_logo = bool(logo and Path(logo).exists())
@@ -1663,6 +1892,8 @@ def render_video(
                 srt_output_path=srt_output_path,
                 temp_text_files=temp_text_files,
                 ascii_only=ascii_flag,
+                use_ass=ass_mode,
+                subtitle_accent_colour=subtitle_accent_colour,
             )
 
             a_label, custom_audio = build_audio_stage(
@@ -1724,6 +1955,7 @@ def render_stitched_clip(
     fit_mode: str = "Fit All (Full Frame + Ambient Blur)",
     mute_original: bool = False,
     voiceover_path: str | None = None,
+    subtitle_accent_colour: str = "Creator Yellow",
 ) -> str | None:
     if not source or not Path(source).exists():
         raise RuntimeError("Source video file is missing.")
@@ -1732,7 +1964,8 @@ def render_stitched_clip(
 
     out_w, out_h = resolve_target_dimensions(aspect, resolution, src_w, src_h)
 
-    for ascii_flag in (False, True):
+    for ass_mode in (True, False):
+        ascii_flag = not ass_mode
         graph: list[str] = []
         concat_inputs: list[str] = []
         total_dur = 0.0
@@ -1781,6 +2014,8 @@ def render_stitched_clip(
                 srt_output_path=srt_output_path,
                 temp_text_files=temp_text_files,
                 ascii_only=ascii_flag,
+                use_ass=ass_mode,
+                subtitle_accent_colour=subtitle_accent_colour,
             )
 
             a_label, custom_audio = build_audio_stage(
@@ -1818,31 +2053,35 @@ def render_stitched_clip(
     return None
 
 
+
 def burn_subtitles_into_clip(
     clip_rec: dict,
     transcript: dict | None,
     caption_font_size: int = 28,
+    subtitle_accent_colour: str = "Creator Yellow",
 ) -> tuple[dict, str]:
-    """Burns English subtitles onto an already-extracted clip safely without crashing."""
+    """Burn creator-style, speech-synchronised captions without overwriting the source clip."""
     src_p = clip_rec.get("path") or ""
     if not src_p or not Path(src_p).exists():
         return clip_rec, "Skipped (clip video file not found)."
     if not ffmpeg_ready():
         return clip_rec, "Skipped (FFmpeg not available)."
 
+    c_meta = dict(clip_rec.get("meta") or {})
+    if c_meta.get("subtitles_burned_en"):
+        return clip_rec, "Subtitles are already burned into this clip. Re-render the clip to change their style; this avoids double subtitles."
+
     try:
         info = probe_video(src_p)
         clip_dur = max(0.8, float(info.get("duration") or max(0.8, float(clip_rec.get("end", 15)) - float(clip_rec.get("start", 0)))))
-        w_px = max(2, int(info.get("width") or 720))
-        h_px = max(2, int(info.get("height") or 1280))
+        w_px = max(2, int(info.get("width", 0) or 720))
+        h_px = max(2, int(info.get("height", 0) or 1280))
     except Exception:
         clip_dur = max(0.8, round(float(clip_rec.get("end", 15)) - float(clip_rec.get("start", 0)), 1))
         w_px, h_px = 720, 1280
 
-    c_meta = dict(clip_rec.get("meta") or {})
     moments = c_meta.get("moments") or []
-    wrap_chars = 26 if h_px >= w_px else 36
-
+    wrap_chars = 28 if h_px >= w_px else 38
     fallback_bits = [
         c_meta.get("transcript_excerpt") or "",
         " ".join(str(m.get("text") or "") for m in moments),
@@ -1861,10 +2100,14 @@ def burn_subtitles_into_clip(
             clip_duration=clip_dur,
         )
     else:
+        # Manual clips from a broken source part must translate local clip time
+        # back to the original full-video transcript timeline.
+        source_offset = float(c_meta.get("source_offset", 0.0) or 0.0)
+        clip_start = float(clip_rec.get("start", 0.0) or 0.0) + source_offset
         cues = build_caption_cues(
             transcript=transcript,
-            start=float(clip_rec.get("start", 0.0) or 0.0),
-            end=float(clip_rec.get("start", 0.0) or 0.0) + clip_dur,
+            start=clip_start,
+            end=clip_start + clip_dur,
             fallback_text=fallback_txt,
             max_chars=wrap_chars,
         )
@@ -1873,74 +2116,57 @@ def burn_subtitles_into_clip(
         cues = [(0.0, round(clip_dur, 2), wrap_caption_lines(fallback_txt, max_chars=wrap_chars, max_lines=2))]
 
     ws_dir = workspace_dir(st.session_state.get("workspace_key", "default"))
-    stem = f"{safe_name(Path(src_p).stem)}_en_sub_{next(tempfile._get_candidate_names())}"
+    stem = f"{safe_name(Path(src_p).stem)}_creator_sub_{next(tempfile._get_candidate_names())}"
     out_mp4 = ws_dir / f"{stem}.mp4"
     out_srt = ws_dir / f"{stem}.srt"
-
+    out_ass = ws_dir / f"{stem}.ass"
     write_srt_file(cues, clip_dur, out_srt)
 
-    for ascii_flag in (False, True):
+    updated = dict(clip_rec)
+    updated_meta = dict(c_meta)
+    for ass_mode in (True, False):
         temp_files: list[Path] = []
         try:
-            font_opt = ""
-            sys_font = find_system_font()
-            if sys_font:
-                font_opt = f":fontfile='{sys_font}'"
-
-            scale_ratio = h_px / 1280.0
-            sub_px = max(20, min(38, int(round(int(caption_font_size) * max(0.8, scale_ratio)))))
-            bottom_margin = max(48, min(int(h_px * 0.10), int(round(h_px * 0.065))))
-            line_step = int(sub_px * 1.26)
-            sub_filters: list[str] = []
-
-            for c_start, c_end, c_text in cues[:40]:
-                c_a = max(0.0, min(clip_dur, float(c_start)))
-                c_b = max(c_a + 0.15, min(clip_dur, float(c_end)))
-                lines_list = wrap_text_lines(" ".join(c_text.splitlines()), max_chars=wrap_chars, max_lines=2, ascii_only=ascii_flag)
-                if not lines_list:
-                    continue
-                total_block_h = line_step * len(lines_list)
-                base_y = h_px - bottom_margin - total_block_h
-                for l_i, raw_ln in enumerate(lines_list):
-                    t_path = WORK_DIR / f"s5_{next(tempfile._get_candidate_names())}.txt"
-                    t_path.write_text(raw_ln, encoding="utf-8")
-                    temp_files.append(t_path)
-                    t_esc = escape_ffmpeg_path(t_path)
-                    y_pos = max(24, base_y + (l_i * line_step))
-                    sub_filters.append(
-                        f"drawtext=textfile='{t_esc}'{font_opt}:fontcolor=#FDE047:fontsize={sub_px}:"
-                        f"x=max(24\\,(w-text_w)/2):y={y_pos}:"
-                        f"box=1:boxcolor=black@0.80:boxborderw=8:"
-                        f"enable='between(t,{c_a:.2f},{c_b:.2f})'"
-                    )
-
-            if not sub_filters:
-                break
+            if ass_mode:
+                write_creator_ass_file(
+                    cues, clip_dur, w_px, h_px, caption_font_size, out_ass, subtitle_accent_colour
+                )
+                vf = f"subtitles=filename='{escape_ffmpeg_path(out_ass)}'"
+            else:
+                fallback_filters = _drawtext_subtitle_filters(
+                    cues, clip_dur, h_px, caption_font_size, temp_files, ascii_only=True
+                )
+                if not fallback_filters:
+                    return clip_rec, "No readable subtitle cues were available."
+                vf = ",".join(fallback_filters)
 
             cmd = [
                 "ffmpeg", "-y", "-i", src_p,
-                "-vf", ",".join(sub_filters),
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
-                "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart",
-                str(out_mp4),
+                "-vf", vf,
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+                "-pix_fmt", "yuv420p", "-c:a", "copy",
+                "-movflags", "+faststart", str(out_mp4),
             ]
-            res = run_cmd(cmd, timeout=600)
+            res = run_cmd(cmd, timeout=900)
             if res.returncode == 0 and out_mp4.exists() and out_mp4.stat().st_size > 0:
-                updated = dict(clip_rec)
                 updated["path"] = str(out_mp4)
                 updated["srt_path"] = str(out_srt)
-                c_meta["subtitles_burned_en"] = True
-                updated["meta"] = c_meta
-                return updated, f"Burned {len(cues)} English subtitle cue(s) into {out_mp4.name}."
+                updated["ass_path"] = str(out_ass) if ass_mode else None
+                updated_meta["subtitles_burned_en"] = True
+                updated_meta["subtitle_style"] = "Creator Bold / Word Highlight" if ass_mode else "Creator Bold / Compatibility Fallback"
+                updated["meta"] = updated_meta
+                return updated, f"Burned {len(cues)} timed subtitle cue(s) with {updated_meta['subtitle_style']}."
+            if not ass_mode:
+                return clip_rec, (res.stderr[-1600:] or "Subtitle burn-in failed; original clip was kept safe.")
         except Exception as exc:
-            if ascii_flag:
-                return clip_rec, f"Subtitle burn-in fallback notice: {exc}"
+            if not ass_mode:
+                return clip_rec, f"Subtitle burn-in failed; original clip was kept safe: {exc}"
         finally:
             for tf in temp_files:
                 tf.unlink(missing_ok=True)
             gc.collect()
 
-    return clip_rec, "Could not burn subtitles on this file—kept original clip safe."
+    return clip_rec, "Could not burn subtitles—original clip was kept safe."
 
 
 def sync_auto_clip_count(source_key: str):
@@ -1974,7 +2200,8 @@ def init_state():
         "pending_hook_banner_scope": None,
         "burn_subtitles_chk_v2": False,
         "subtitle_language": "English (Default)",
-        "onscreen_caption_size": 28,
+        "onscreen_caption_size": 32,
+        "subtitle_accent_colour": "Creator Yellow",
         "vertical_fit_mode": "Fit All (Full Frame + Ambient Blur)",
         "mute_original_audio": False,
         "voiceover_source_mode": "Uploaded Voice Track",
@@ -2536,6 +2763,7 @@ if page == "Campaign & Auto-Clipper":
                             fit_mode=fit_mode,
                             mute_original=bool(st.session_state.get("mute_original_audio", False)),
                             voiceover_path=active_vo_path,
+                            subtitle_accent_colour=st.session_state.get("subtitle_accent_colour", "Creator Yellow"),
                         )
 
                     for m in moments:
@@ -2608,7 +2836,7 @@ elif page == "Manual Clipper (Start → End)":
     if not st.session_state.video_info and not st.session_state.broken_parts:
         st.info("Upload and load a video in 'Campaign & Auto-Clipper' first.")
     else:
-        part_sources: list[tuple[str, str, float, int, int]] = []
+        part_sources: list[tuple[str, str, float, int, int, float]] = []
         for bp in st.session_state.broken_parts:
             if Path(bp["path"]).exists():
                 bp_info = bp.get("info") or {}
@@ -2618,6 +2846,7 @@ elif page == "Manual Clipper (Start → End)":
                     max(1.0, float(bp_info.get("duration") or 1.0)),
                     int(bp_info.get("width") or 1280),
                     int(bp_info.get("height") or 720),
+                    float(bp.get("start_in_source", 0.0) or 0.0),
                 ))
         if st.session_state.source_video and Path(st.session_state.source_video).exists() and st.session_state.video_info:
             vi_ed = st.session_state.video_info
@@ -2627,6 +2856,7 @@ elif page == "Manual Clipper (Start → End)":
                 max(1.0, float(vi_ed.get("duration") or 1.0)),
                 int(vi_ed.get("width") or 1280),
                 int(vi_ed.get("height") or 720),
+                0.0,
             ))
 
         sel_src_idx = st.selectbox(
@@ -2635,7 +2865,7 @@ elif page == "Manual Clipper (Start → End)":
             format_func=lambda i: part_sources[i][0],
             key="ed_source_choice",
         )
-        src_label, active_src_path, dur_ed, src_w_ed, src_h_ed = part_sources[int(sel_src_idx)]
+        src_label, active_src_path, dur_ed, src_w_ed, src_h_ed, src_offset_ed = part_sources[int(sel_src_idx)]
 
         a, b = st.columns(2)
         with a:
@@ -2643,7 +2873,11 @@ elif page == "Manual Clipper (Start → End)":
             end = st.number_input("End timestamp (seconds)", min_value=0.5, max_value=dur_ed, value=min(30.0, dur_ed), step=0.5, key="ed_end_sec")
             st.caption(f"Manual span: **{fmt_time(start)} → {fmt_time(end)}** (**{max(0.0, round(float(end) - float(start), 1)):.1f}s**)")
             clip_name = st.text_input("Clip name", value=safe_name(Path(st.session_state.video_name or "clip").stem + "_manual"), key="ed_clip_name")
-            spoken_ed = transcript_slice(st.session_state.transcript, float(start), float(end))
+            spoken_ed = transcript_slice(
+                st.session_state.transcript,
+                float(start) + float(src_offset_ed),
+                float(end) + float(src_offset_ed),
+            )
             hook_line = st.text_input("Top hook banner text", value=pick_good_hook(spoken_ed, brief=st.session_state.brief, clip_index=0), key="ed_hook_line")
             hook_dur_opt = st.selectbox("Top hook duration", ["8s Banner", "Full Clip Banner"], key="ed_hook_dur")
         with b:
@@ -2665,15 +2899,21 @@ elif page == "Manual Clipper (Start → End)":
                     base_stem = f"{safe_name(clip_name)}_manual{clip_idx}"
                     out = ws_dir / f"{base_stem}.mp4"
                     srt_out = ws_dir / f"{base_stem}.srt"
-                    spoken_now = normalize_english_subtitle_text(transcript_slice(st.session_state.transcript, start, end))
+                    spoken_now = normalize_english_subtitle_text(
+                        transcript_slice(
+                            st.session_state.transcript,
+                            float(start) + float(src_offset_ed),
+                            float(end) + float(src_offset_ed),
+                        )
+                    )
                     final_hook = normalize_english_subtitle_text((hook_line or "").strip()) or pick_good_hook(spoken_now, brief=st.session_state.brief, clip_index=clip_idx - 1)
                     wrap_chars = 26 if aspect in {"9:16 Vertical", "4:5 Portrait", "1:1 Square"} else 36
                     cues = []
                     if add_sub:
                         cues = build_caption_cues(
                             transcript=st.session_state.transcript,
-                            start=start,
-                            end=end,
+                            start=float(start) + float(src_offset_ed),
+                            end=float(end) + float(src_offset_ed),
                             fallback_text=spoken_now or final_hook,
                             max_chars=wrap_chars,
                         )
@@ -2695,6 +2935,7 @@ elif page == "Manual Clipper (Start → End)":
                             fit_mode=fit_mode_ed,
                             mute_original=bool(mute_ed),
                             voiceover_path=vo_ed_path if (vo_ed_path and Path(vo_ed_path).exists()) else None,
+                            subtitle_accent_colour=st.session_state.get("subtitle_accent_colour", "Creator Yellow"),
                         )
                     st.session_state.used_clip_windows.append([round(start, 1), round(end, 1)])
                     c_meta = {
@@ -2703,6 +2944,7 @@ elif page == "Manual Clipper (Start → End)":
                         "source": src_label,
                         "start": start,
                         "end": end,
+                        "source_offset": float(src_offset_ed),
                         "aspect": aspect,
                         "fit_mode": fit_mode_ed,
                         "muted": bool(mute_ed),
@@ -2721,7 +2963,7 @@ elif page == "Manual Clipper (Start → End)":
                     )
                     st.session_state.clips.append({
                         "name": f"{clip_name} ({aspect})", "path": str(out), "srt_path": saved_srt,
-                        "start": start, "end": end, "aspect": aspect, "resolution": resolution,
+                        "start": start, "end": end, "source_offset": float(src_offset_ed), "aspect": aspect, "resolution": resolution,
                         "meta": c_meta,
                         "youtube": copy_pack["youtube"],
                         "instagram": copy_pack["instagram"],
@@ -2928,8 +3170,8 @@ if st.session_state.clips:
 
 # ----------------------------- SECTION 5 & STAGE 6 (OPTIONAL NEXT) -----
 st.divider()
-st.subheader("Section 5 · Active English Subtitle Burn-In (Non-Blocking)")
-s5_c1, s5_c2, s5_c3 = st.columns([1.2, 1.0, 1.2])
+st.subheader("Section 5 · Creator-Style English Captions & Burn-In")
+s5_c1, s5_c2, s5_c3, s5_c4 = st.columns([1.25, 1.0, 1.2, 1.15])
 with s5_c1:
     st.checkbox(
         "Auto-include English subtitles on future renders",
@@ -2943,10 +3185,18 @@ with s5_c2:
     )
 with s5_c3:
     s5_font_sz = st.slider(
-        "Subtitle size (non-blocking lower zone)",
-        20, 36, int(st.session_state.get("onscreen_caption_size", 28)),
+        "Caption size",
+        20, 48, max(20, min(48, int(st.session_state.get("onscreen_caption_size", 32)))),
         key="onscreen_caption_size",
     )
+with s5_c4:
+    st.selectbox(
+        "Highlight colour",
+        list(SUBTITLE_ACCENT_PALETTE.keys()),
+        key="subtitle_accent_colour",
+    )
+
+st.caption("Creator Bold style: bold white words, animated highlight colour, strong black outline and shadow. Captions sit above the bottom platform controls.")
 
 if st.session_state.clips:
     s5_target_options = ["All Extracted Clips"] + [f"Clip {i+1}: {c['name']}" for i, c in enumerate(st.session_state.clips)]
@@ -2972,6 +3222,7 @@ if st.session_state.clips:
                         clip_rec=st.session_state.clips[i_clip],
                         transcript=st.session_state.transcript,
                         caption_font_size=int(s5_font_sz),
+                        subtitle_accent_colour=st.session_state.get("subtitle_accent_colour", "Creator Yellow"),
                     )
                     st.session_state.clips[i_clip] = updated_rec
                     status_msgs.append(f"Clip {i_clip+1}: {msg}")
