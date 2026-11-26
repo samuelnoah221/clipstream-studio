@@ -1,4 +1,9 @@
-from __future__ import annotations
+import ast
+import re
+
+# Build the complete, unified, conflict-free app_2.py and verify syntax + run unit tests on hooks & captions
+
+updated_code = '''from __future__ import annotations
 
 import gc
 import hashlib
@@ -47,27 +52,19 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-CAMPAIGN_HOOK_BANK = [
-    "His first hit said everything",
-    "Zero hesitation—straight to it",
-    "Watch his reaction right now",
-    "Bro did NOT expect that hit",
-    "Being high on GTA hits different",
-    "Bro locked in on a new level",
-    "The high just kicked in on GTA",
-    "GTA moments hit harder like this",
-    "One whiff and chat went crazy",
-    "Opening the jar is priceless",
-    "Smelling jars before GTA chaos",
-    "Look at the cloud off that hit",
-    "How is that vapor still going?!",
-    "Chat went wild on that blow",
-    "Ben and chat hyped off that",
-    "Hash Butler dropping real game",
-    "Puffco + GTA undefeated combo",
-    "Best banter with Hash Butler",
-    "GTA chaos meets a big rip",
-]
+HOOK_STOPWORDS = {
+    "about", "after", "again", "also", "been", "before", "being", "between",
+    "both", "could", "did", "does", "doing", "down", "during", "each", "even",
+    "from", "have", "here", "into", "just", "like", "make", "more", "most",
+    "much", "must", "need", "only", "other", "over", "really", "right", "same",
+    "should", "some", "such", "than", "that", "their", "them", "then", "there",
+    "these", "they", "this", "those", "through", "under", "very", "want", "well",
+    "what", "when", "where", "which", "while", "with", "would", "your",
+}
+
+HOOK_FILLER_STARTERS = {
+    "and", "but", "so", "or", "um", "uh", "like", "well", "okay", "yeah", "alright",
+}
 
 FIT_MODES = [
     "Fit All (Full Frame + Ambient Blur)",
@@ -167,7 +164,7 @@ def safe_name(value: str) -> str:
 
 def escape_ffmpeg_path(p: Path) -> str:
     resolved = p.resolve().as_posix()
-    resolved = resolved.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+    resolved = resolved.replace("\\\\", "/").replace(":", "\\\\:").replace("'", "\\\\'")
     return resolved
 
 
@@ -421,7 +418,6 @@ def attach_uploader_percentage_bar(max_mb: int = 2048):
 
               const total = Math.max(1, file.size || 1);
               const totalMb = (total / (1024 * 1024)).toFixed(1);
-              // Cap browser scan at 64 MB for giant files so large uploads stay responsive
               const scanLimit = Math.min(total, 64 * 1024 * 1024);
               const step = 16 * 1024 * 1024;
               let offset = 0;
@@ -630,7 +626,7 @@ def get_openai_client():
 
 
 def synthesize_voiceover_file(script_text: str) -> Path | None:
-    clean_txt = re.sub(r"\s+", " ", (script_text or "").strip())
+    clean_txt = re.sub(r"\\s+", " ", (script_text or "").strip())
     if not clean_txt:
         return None
     ws_dir = workspace_dir(st.session_state.get("workspace_key", "default"))
@@ -671,11 +667,11 @@ def extract_document_text(uploaded) -> str:
     if name.endswith(".pdf"):
         import fitz
         with fitz.open(stream=raw, filetype="pdf") as doc:
-            return "\n\n".join(page.get_text() for page in doc).strip()
+            return "\\n\\n".join(page.get_text() for page in doc).strip()
     if name.endswith(".docx"):
         from docx import Document
         doc = Document(io.BytesIO(raw))
-        return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+        return "\\n".join(p.text for p in doc.paragraphs if p.text.strip())
     if name.endswith((".txt", ".md", ".csv")):
         return raw.decode("utf-8", errors="replace")
     if name.endswith((".png", ".jpg", ".jpeg", ".webp")):
@@ -688,8 +684,8 @@ def extract_document_text(uploaded) -> str:
 
 def parse_json_response(content: str) -> dict:
     text = content.strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
+    text = re.sub(r"^```(?:json)?\\s*", "", text)
+    text = re.sub(r"\\s*```$", "", text)
     start, end = text.find("{"), text.rfind("}")
     if start < 0 or end < start:
         raise ValueError("AI response did not contain valid JSON.")
@@ -702,7 +698,7 @@ def render_fast_voice_reader(text: str, label: str = "🔊 Fast Readout (Zero Da
         st.caption("Nothing to read yet.")
         return
     payload = json.dumps(clean[:3500], ensure_ascii=False)
-    payload = payload.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+    payload = payload.replace("<", "\\\\u003c").replace(">", "\\\\u003e").replace("&", "\\\\u0026")
     safe_label = html.escape(label)
     safe_uid = re.sub(r"[^a-zA-Z0-9_]", "", uid) or "tts"
     components.html(
@@ -742,7 +738,7 @@ def render_fast_voice_reader(text: str, label: str = "🔊 Fast Readout (Zero Da
     )
 
 
-# ----------------------------- AUTO-CLIPPING HELPERS -----------------
+# ----------------------------- AUTO-CLIPPING & GROUNDED HOOK HELPERS --
 def overlaps_used(start: float, end: float, used_windows: list[list[float]], min_gap: float = 2.0) -> bool:
     for u_start, u_end in used_windows:
         if start < (u_end + min_gap) and end > (u_start - min_gap):
@@ -757,7 +753,7 @@ def transcript_slice(transcript: dict | None, start: float, end: float) -> str:
         s_a = float(sg.get("start", 0.0) or 0.0)
         s_b = float(sg.get("end", 0.0) or 0.0)
         if s_b > start and s_a < end:
-            txt = re.sub(r"\s+", " ", str(sg.get("text", "")).strip())
+            txt = re.sub(r"\\s+", " ", str(sg.get("text", "")).strip())
             if txt:
                 parts.append(txt)
     joined = " ".join(parts).strip()
@@ -767,27 +763,114 @@ def transcript_slice(transcript: dict | None, start: float, end: float) -> str:
     return full_txt[:350]
 
 
-def pick_good_hook(spoken_text: str, brief: str = "", clip_index: int = 0) -> str:
-    low_all = f"{spoken_text} {brief}".lower()
-    if any(w in low_all for w in ["butler", "rayquan", "tray"]):
-        hooks = ["Hash Butler dropping real game", "Best banter with Hash Butler", "GTA chaos meets a big rip"]
-        return hooks[clip_index % len(hooks)]
-    if any(w in low_all for w in ["puffco", "proxy", "pivot", "dab", "cloud", "vapor", "hit"]):
-        hooks = ["His first hit said everything", "Look at the cloud off that hit", "Zero hesitation—straight to it", "How is that vapor still going?!"]
-        return hooks[clip_index % len(hooks)]
-    if any(w in low_all for w in ["jar", "smell", "hash", "alien", "tech"]):
-        hooks = ["One whiff and chat went crazy", "Opening the jar is priceless", "Bro locked in on a new level"]
-        return hooks[clip_index % len(hooks)]
-    if any(w in low_all for w in ["gta", "game", "high"]):
-        hooks = ["Being high on GTA hits different", "Bro locked in on a new level", "The high just kicked in on GTA", "GTA moments hit harder like this"]
-        return hooks[clip_index % len(hooks)]
+def _extract_key_terms(text: str, limit: int = 6) -> list[str]:
+    counts: dict[str, int] = {}
+    for tok in re.findall(r"[A-Za-z][A-Za-z0-9'-]{2,}", str(text or "").lower()):
+        clean = tok.strip("'-")
+        if len(clean) < 3 or clean in HOOK_STOPWORDS:
+            continue
+        counts[clean] = counts.get(clean, 0) + 1
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], -len(kv[0]), kv[0]))
+    return [w for w, _ in ranked[:limit]]
 
-    clean_speech = re.sub(r"\s+", " ", (spoken_text or "").strip())
-    if clean_speech and len(clean_speech.split()) >= 3:
-        wds = clean_speech.split()[:5]
-        return (" ".join(wds) + ("..." if len(clean_speech.split()) > 5 else ""))[:44]
 
-    return CAMPAIGN_HOOK_BANK[clip_index % len(CAMPAIGN_HOOK_BANK)]
+def _extract_best_spoken_hook(spoken_text: str) -> str:
+    clean = re.sub(r"\\s+", " ", str(spoken_text or "")).strip()
+    if not clean:
+        return ""
+
+    clauses = [c.strip(" ,;:-") for c in re.split(r"[.!?\\n]+|,\\s+", clean) if len(c.strip()) >= 8]
+    best_phrase = ""
+    best_score = -999.0
+
+    for clause in clauses:
+        words = clause.split()
+        if len(words) < 3:
+            continue
+
+        candidate_words = words[:6]
+        while len(candidate_words) > 3 and candidate_words[0].lower() in HOOK_FILLER_STARTERS:
+            candidate_words.pop(0)
+
+        phrase = " ".join(candidate_words).strip()
+        if not phrase:
+            continue
+
+        content_words = [
+            w for w in candidate_words
+            if len(re.sub(r"[^A-Za-z]", "", w)) >= 3 and w.lower() not in HOOK_STOPWORDS
+        ]
+        score = float(len(content_words)) * 2.0
+        if 3 <= len(candidate_words) <= 6:
+            score += 2.5
+        if any(ch.isdigit() for ch in phrase):
+            score += 1.5
+        if len(phrase) <= 42:
+            score += 1.0
+        else:
+            score -= 2.0
+
+        if score > best_score:
+            best_score = score
+            best_phrase = phrase[:44]
+
+    if best_phrase:
+        return best_phrase
+
+    words = clean.split()
+    return (" ".join(words[:5]) + ("..." if len(words) > 5 else ""))[:44]
+
+
+def _extract_brief_hook(brief: str, analysis: dict | None = None, clip_index: int = 0) -> str:
+    candidates: list[str] = []
+    an = analysis if isinstance(analysis, dict) else {}
+
+    for field in ("must_include", "required_scenes_or_moments", "deliverables", "caption_requirements"):
+        for item in (an.get(field) or []):
+            s = re.sub(r"\\s+", " ", str(item or "")).strip(" -•*\\t")
+            if 6 <= len(s) <= 44:
+                candidates.append(s)
+
+    summary = str(an.get("plain_english_summary") or "").strip()
+    if summary:
+        terms = _extract_key_terms(summary, limit=3)
+        if terms:
+            candidates.append(" ".join(w.capitalize() for w in terms)[:44])
+
+    for line in str(brief or "").splitlines():
+        ln = re.sub(r"\\s+", " ", line).strip(" -•*\\t")
+        if 6 <= len(ln) <= 44 and not ln.startswith("#"):
+            candidates.append(ln)
+
+    terms = _extract_key_terms(brief or "", limit=4)
+    if terms:
+        candidates.append(f"Key focus: {' · '.join(w.capitalize() for w in terms[:2])}"[:44])
+
+    if not candidates:
+        return f"Highlight Moment #{clip_index + 1}"
+    return candidates[clip_index % len(candidates)][:44]
+
+
+def pick_good_hook(
+    spoken_text: str,
+    brief: str = "",
+    analysis: dict | None = None,
+    clip_index: int = 0,
+) -> str:
+    """
+    Pick a hook grounded in the clip's spoken transcript first, then the campaign brief/analysis.
+    Never falls back to unrelated canned topics.
+    """
+    spoken_hook = _extract_best_spoken_hook(spoken_text)
+    brief_hook = _extract_brief_hook(brief, analysis=analysis, clip_index=clip_index)
+
+    if spoken_hook and brief_hook:
+        if clip_index % 3 == 2 and len(brief_hook) <= 40:
+            return brief_hook
+        return spoken_hook
+    if spoken_hook:
+        return spoken_hook
+    return brief_hook
 
 
 def build_stitched_peak_moments(
@@ -870,6 +953,7 @@ def build_auto_clip_candidates(
     desired_minutes: float,
     used_windows: list[list[float]],
     allow_overlap: bool = False,
+    analysis: dict | None = None,
 ) -> list[dict]:
     count = max(1, min(6, int(clip_count)))
     results: list[dict] = []
@@ -891,7 +975,12 @@ def build_auto_clip_candidates(
         stitched_dur = round(sum(max(0.1, m["end"] - m["start"]) for m in moments), 1)
         all_spoken = " ".join(m["text"] for m in moments if m.get("text")).strip()
         span_summary = ", ".join(f"{m['start']:.0f}s–{m['end']:.0f}s" for m in moments)
-        good_hook = pick_good_hook(all_spoken, brief=brief, clip_index=pick_num - 1)
+        good_hook = pick_good_hook(
+            all_spoken,
+            brief=brief,
+            analysis=analysis,
+            clip_index=pick_num - 1,
+        )
 
         results.append({
             "title": f"Peak Stitch #{pick_num} ({len(moments)} moments)",
@@ -939,7 +1028,7 @@ def heuristic_campaign_analysis(brief: str, project_name: str) -> dict:
     )
 
     hashtags = sorted(set(re.findall(r"#[A-Za-z0-9_]+", brief)))[:10]
-    lines = [ln.strip(" -•*\t") for ln in brief.splitlines() if ln.strip()]
+    lines = [ln.strip(" -•*\\t") for ln in brief.splitlines() if ln.strip()]
     must_include = [ln for ln in lines if any(w in ln.lower() for w in ["include", "must", "mention", "call to action", "cta", "show", "hook", "caption"])][:6]
     prohibited = [ln for ln in lines if any(w in ln.lower() for w in ["avoid", "don't", "do not", "never", "prohibited", "no "])][:6]
     caption_reqs = [ln for ln in lines if any(w in ln.lower() for w in ["caption", "hashtag", "tag", "description", "link", "mention"])][:6]
@@ -1162,7 +1251,117 @@ def build_campaign_caption_context(analysis: dict | None, brief: str) -> str:
             parts.append(f"{label}: " + "; ".join(str(v) for v in vals[:8]))
     if brief.strip():
         parts.append(f"Raw Brief Notes: {brief.strip()[:1500]}")
-    return "\n".join(parts)
+    return "\\n".join(parts)
+
+
+def _build_grounded_fallback_copy(
+    brief: str,
+    analysis: dict | None,
+    clip_info: dict | None,
+    transcript_text: str,
+    custom_instructions: str = "",
+    clip_index: int = 0,
+    caption_style: str = "Hook / Viral",
+) -> dict:
+    an = analysis if isinstance(analysis, dict) else {}
+    c_info = clip_info if isinstance(clip_info, dict) else {}
+    raw_tags = list(an.get("hashtags") or [])
+    key_terms = _extract_key_terms(f"{transcript_text or ''} {brief or ''}", limit=4)
+
+    tags: list[str] = []
+    for t in raw_tags[:6]:
+        t_clean = re.sub(r"[^A-Za-z0-9_#]", "", str(t or ""))
+        if t_clean:
+            tags.append(t_clean if t_clean.startswith("#") else f"#{t_clean}")
+    for kw in key_terms:
+        if len(tags) >= 5:
+            break
+        cand_tag = f"#{re.sub(r'[^A-Za-z0-9]', '', kw).capitalize()}"
+        if len(cand_tag) > 2 and cand_tag.lower() not in {x.lower() for x in tags}:
+            tags.append(cand_tag)
+    if not tags:
+        tags = ["#Shorts", "#Reels", f"#Clip{clip_index + 1}"]
+    clean_tags = " ".join(tags[:6])
+
+    clip_title = c_info.get("title") or f"Clip #{clip_index + 1}"
+    clip_hook = c_info.get("hook") or pick_good_hook(
+        transcript_text, brief=brief, analysis=an, clip_index=clip_index
+    )
+    moments = c_info.get("moments") or []
+    if moments:
+        window_label = " (" + " + ".join(f"{float(m['start']):.0f}s–{float(m['end']):.0f}s" for m in moments) + ")"
+    else:
+        s_val = c_info.get("start")
+        e_val = c_info.get("end")
+        window_label = f" ({float(s_val):.0f}s–{float(e_val):.0f}s)" if s_val is not None and e_val is not None else ""
+
+    spoken_summary = re.sub(r"\\s+", " ", str(transcript_text or "").strip())
+    if len(spoken_summary) > 220:
+        spoken_summary = spoken_summary[:217].rsplit(" ", 1)[0] + "..."
+
+    must_items = [str(x).strip() for x in (an.get("must_include") or []) if str(x).strip()][:3]
+    cap_reqs = [str(x).strip() for x in (an.get("caption_requirements") or []) if str(x).strip()][:3]
+    camp_note = ""
+    if must_items or cap_reqs:
+        combined_reqs = must_items + [r for r in cap_reqs if r not in must_items]
+        camp_note = "Brief check: " + "; ".join(combined_reqs[:3])
+
+    req_note = str(custom_instructions or "").strip()
+    context_line = (
+        spoken_summary
+        or str(an.get("plain_english_summary") or "").strip()[:180]
+        or f"Highlights from {clip_title}{window_label}."
+    )
+
+    if caption_style == "Engaging / Story":
+        lead = f"{clip_hook}{window_label} — {context_line}"
+        cta = "Which moment stood out most here, and what would you add? Share in the comments."
+    elif caption_style == "Short & Punchy":
+        lead = f"{clip_hook}{window_label}"
+        cta = ""
+    elif caption_style == "Campaign / CTA":
+        lead = f"{clip_hook}{window_label} — {context_line}"
+        cta = camp_note or "Follow the campaign details and share this clip with someone who needs it."
+    else:
+        lead = f"{clip_hook}{window_label}: {context_line}"
+        cta = "Watch through to the end and share if this caught your attention."
+
+    yt_title = f"{clip_hook} | {clean_tags.split()[0] if clean_tags else '#Shorts'}"[:95]
+    yt_body = "\\n\\n".join([p for p in [
+        f"Clip: {clip_title}{window_label}",
+        lead,
+        cta,
+        camp_note if caption_style != "Campaign / CTA" else "",
+        req_note,
+        clean_tags,
+    ] if p]).strip()
+
+    ig_body = "\\n\\n".join([p for p in [
+        lead,
+        cta,
+        camp_note if caption_style != "Campaign / CTA" else "",
+        req_note,
+        clean_tags,
+    ] if p]).strip()
+
+    fb_body = "\\n\\n".join([p for p in [
+        f"{clip_hook}{window_label}",
+        context_line,
+        cta,
+        camp_note if caption_style != "Campaign / CTA" else "",
+        req_note,
+        clean_tags,
+    ] if p]).strip()
+
+    full_yt = f"{yt_title}\\n\\n{yt_body}".strip()
+    return {
+        "caption_style": caption_style,
+        "youtube": full_yt,
+        "instagram": ig_body,
+        "facebook": fb_body,
+        "caption": ig_body,
+        "description": full_yt,
+    }
 
 
 def generate_multi_platform_copy(
@@ -1174,72 +1373,42 @@ def generate_multi_platform_copy(
     clip_index: int = 0,
     caption_style: str = "Hook / Viral",
 ) -> dict:
-    client = get_openai_client()
-    tags = (analysis or {}).get("hashtags") or []
-    clean_tags = " ".join(t if t.startswith("#") else f"#{t.replace(' ', '')}" for t in tags[:6])
-    if not clean_tags:
-        clean_tags = f"#Shorts #Reels #Campaign #Clip{clip_index + 1}"
-
-    clip_title = (clip_info or {}).get("title") or f"Clip #{clip_index + 1}"
-    clip_hook = (clip_info or {}).get("hook") or ""
-    moments = (clip_info or {}).get("moments") or []
-    if moments:
-        window_label = " (" + " + ".join(f"{float(m['start']):.0f}s–{float(m['end']):.0f}s" for m in moments) + ")"
-    else:
-        clip_start = (clip_info or {}).get("start")
-        clip_end = (clip_info or {}).get("end")
-        window_label = f" ({float(clip_start):.0f}s–{float(clip_end):.0f}s)" if clip_start is not None and clip_end is not None else ""
-
-    req_note = custom_instructions.strip()
-    camp_ctx = build_campaign_caption_context(analysis, brief)
-    camp_reqs_list = (analysis or {}).get("caption_requirements") or (analysis or {}).get("must_include") or []
-    camp_req_line = f"Campaign rules: {'; '.join(str(x) for x in camp_reqs_list[:4])}." if camp_reqs_list else ""
-    moment_line = transcript_text[:150].strip() if transcript_text.strip() else f"Peak highlights #{clip_index + 1}"
-
+    fallback = _build_grounded_fallback_copy(
+        brief=brief,
+        analysis=analysis,
+        clip_info=clip_info,
+        transcript_text=transcript_text,
+        custom_instructions=custom_instructions,
+        clip_index=clip_index,
+        caption_style=caption_style,
+    )
+    try:
+        client = get_openai_client()
+    except Exception:
+        return fallback
     if not client:
-        if caption_style == "Engaging / Story":
-            lead = f"Story behind {clip_title}{window_label}: {moment_line}"
-            cta_line = "What part stood out most to you? Drop a comment below."
-        elif caption_style == "Short & Punchy":
-            lead = f"{clip_hook or clip_title}{window_label}"
-            cta_line = ""
-        elif caption_style == "Campaign / CTA":
-            lead = f"{clip_hook or clip_title}{window_label} — {camp_req_line or moment_line}"
-            cta_line = "Check the brief link/details and share with someone who needs to see this."
-        else:
-            lead = f"WAIT FOR IT: {clip_hook or clip_title}{window_label} — {moment_line}"
-            cta_line = "Watch till the end and tag your crew."
+        return fallback
 
-        yt_title = f"{clip_hook or clip_title} [{caption_style}] #Shorts"[:95]
-        yt_desc = "\n\n".join([p for p in [lead, cta_line, req_note, clean_tags] if p]).strip()
-        ig_caption = "\n\n".join([p for p in [lead, cta_line, req_note, clean_tags] if p]).strip()
-        fb_post = "\n\n".join([p for p in [lead, cta_line, camp_req_line, req_note, clean_tags] if p]).strip()
+    camp_ctx = build_campaign_caption_context(analysis, brief)
+    prompt = f"""You are writing tailored social copy for ONE specific video clip (Clip #{clip_index + 1}) in style "{caption_style}" for YouTube, Instagram, and Facebook.
 
-        return {
-            "caption_style": caption_style,
-            "youtube": f"{yt_title}\n\n{yt_desc}",
-            "instagram": ig_caption,
-            "facebook": fb_post,
-            "caption": ig_caption,
-            "description": yt_desc,
-        }
-
-    prompt = f"""You are writing tailored social copy for ONE video clip (Clip #{clip_index + 1}) in style "{caption_style}" across THREE platforms:
-1) YouTube (Shorts/Video title + description with searchable keywords & hashtags)
-2) Instagram (Reels/Feed caption with hook, engagement line, and hashtags)
-3) Facebook (Reels/Post caption with conversational framing & hashtags)
+Strict grounding rules:
+- Base the copy ONLY on THIS CLIP'S details, THIS CLIP'S transcript/spoken moments, and the CAMPAIGN BRIEF & CAPTION REQUIREMENTS below.
+- Do NOT invent facts, products, games, or topics that are not in the transcript or campaign brief.
+- Match the requested caption style ("{caption_style}") and honor any campaign hashtags, must-include items, or caption rules.
 
 CAPTION STYLE: {caption_style}
 THIS CLIP DETAILS:
 {json.dumps(clip_info or {}, ensure_ascii=False)}
-THIS CLIP'S TRANSCRIPT SEGMENTS:
-{transcript_text[:1800]}
+
+THIS CLIP'S TRANSCRIPT / SPOKEN MOMENTS:
+{(transcript_text or "").strip()[:1800] or "No transcript available; rely on clip details and campaign brief."}
 
 CAMPAIGN BRIEF & CAPTION REQUIREMENTS:
 {camp_ctx[:3500]}
 
 EXTRA USER INSTRUCTIONS:
-{req_note or "None"}
+{(custom_instructions or "").strip() or "None"}
 
 Return ONLY valid JSON:
 {{
@@ -1248,52 +1417,60 @@ Return ONLY valid JSON:
   "facebook": "Facebook post/reel caption ready to paste"
 }}
 """
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        temperature=0.6,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": "You write distinct, platform-native social copy for YouTube, Instagram, and Facebook."},
-            {"role": "user", "content": prompt},
-        ],
-    )
-    parsed = parse_json_response(resp.choices[0].message.content or "{}")
-    yt = str(parsed.get("youtube", "")).strip()
-    ig = str(parsed.get("instagram", "")).strip()
-    fb = str(parsed.get("facebook", "")).strip()
-    return {
-        "caption_style": caption_style,
-        "youtube": yt,
-        "instagram": ig,
-        "facebook": fb,
-        "caption": ig or yt,
-        "description": yt or fb,
-    }
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.45,
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You write accurate, grounded, platform-native social copy strictly aligned with provided clip transcripts and campaign briefs.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+        )
+        parsed = parse_json_response(resp.choices[0].message.content or "{}")
+        yt = str(parsed.get("youtube", "")).strip()
+        ig = str(parsed.get("instagram", "")).strip()
+        fb = str(parsed.get("facebook", "")).strip()
+        if not (yt or ig or fb):
+            return fallback
+        return {
+            "caption_style": caption_style,
+            "youtube": yt or fallback["youtube"],
+            "instagram": ig or fallback["instagram"],
+            "facebook": fb or fallback["facebook"],
+            "caption": ig or yt or fallback["caption"],
+            "description": yt or fb or fallback["description"],
+        }
+    except Exception:
+        return fallback
 
 
 def build_clips_manifest_text(clips: list[dict], project_name: str) -> str:
     lines = [f"Project: {project_name}", f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}", "=" * 50]
     for i, cl in enumerate(clips, start=1):
-        lines.append(f"\n--- Clip {i}: {cl.get('name', 'Clip')} ---")
+        lines.append(f"\\n--- Clip {i}: {cl.get('name', 'Clip')} ---")
         if cl.get("youtube"):
-            lines.append(f"[YouTube]\n{cl['youtube']}")
+            lines.append(f"[YouTube]\\n{cl['youtube']}")
         if cl.get("instagram"):
-            lines.append(f"[Instagram]\n{cl['instagram']}")
+            lines.append(f"[Instagram]\\n{cl['instagram']}")
         if cl.get("facebook"):
-            lines.append(f"[Facebook]\n{cl['facebook']}")
-    return "\n".join(lines)
+            lines.append(f"[Facebook]\\n{cl['facebook']}")
+    return "\\n".join(lines)
 
 
 # ----------------------------- SUBTITLE & FRAME PIPELINE --------------
 def normalize_english_subtitle_text(text: str, ascii_only: bool = False) -> str:
     if ascii_only:
-        cleaned = str(text or "").replace("\u2014", " - ").replace("\u2013", " - ")
-        cleaned = cleaned.replace("\u2018", "'").replace("\u2019", "'").replace("\u201c", '"').replace("\u201d", '"')
-        cleaned = re.sub(r"[^\x20-\x7E]", " ", cleaned)
+        cleaned = str(text or "").replace("\\u2014", " - ").replace("\\u2013", " - ")
+        cleaned = cleaned.replace("\\u2018", "'").replace("\\u2019", "'").replace("\\u201c", '"').replace("\\u201d", '"')
+        cleaned = re.sub(r"[^\\x20-\\x7E]", " ", cleaned)
     else:
-        cleaned = re.sub(r"[^\x20-\x7E\u2014\u2013\u2018\u2019\u201c\u201d]", " ", str(text or ""))
-        cleaned = cleaned.replace("\u2014", " — ").replace("\u2013", " - ")
-    return re.sub(r"\s+", " ", cleaned).strip()
+        cleaned = re.sub(r"[^\\x20-\\x7E\\u2014\\u2013\\u2018\\u2019\\u201c\\u201d]", " ", str(text or ""))
+        cleaned = cleaned.replace("\\u2014", " — ").replace("\\u2013", " - ")
+    return re.sub(r"\\s+", " ", cleaned).strip()
 
 
 def wrap_text_lines(text: str, max_chars: int = 26, max_lines: int = 2, ascii_only: bool = False) -> list[str]:
@@ -1319,16 +1496,16 @@ def wrap_text_lines(text: str, max_chars: int = 26, max_lines: int = 2, ascii_on
 
 
 def wrap_caption_lines(text: str, max_chars: int = 26, max_lines: int = 2) -> str:
-    return "\n".join(wrap_text_lines(text, max_chars=max_chars, max_lines=max_lines))
+    return "\\n".join(wrap_text_lines(text, max_chars=max_chars, max_lines=max_lines))
 
 
 def parse_srt_file(srt_path: str | Path) -> list[tuple[float, float, str]]:
     path = Path(srt_path)
     raw = path.read_text(encoding="utf-8-sig", errors="replace")
-    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
-    blocks = re.split(r"\n\s*\n", raw.strip())
+    raw = raw.replace("\\r\\n", "\\n").replace("\\r", "\\n")
+    blocks = re.split(r"\\n\\s*\\n", raw.strip())
     cues: list[tuple[float, float, str]] = []
-    time_re = re.compile(r"(?P<a>\d{1,2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(?P<b>\d{1,2}:\d{2}:\d{2}[,.]\d{3})")
+    time_re = re.compile(r"(?P<a>\\d{1,2}:\\d{2}:\\d{2}[,.]\\d{3})\\s*-->\\s*(?P<b>\\d{1,2}:\\d{2}:\\d{2}[,.]\\d{3})")
 
     def to_seconds(value: str) -> float:
         hh, mm, tail = value.replace(",", ".").split(":")
@@ -1336,7 +1513,7 @@ def parse_srt_file(srt_path: str | Path) -> list[tuple[float, float, str]]:
         return int(hh) * 3600 + int(mm) * 60 + int(ss) + int(ms) / 1000
 
     for block in blocks:
-        lines = [ln.strip("\ufeff") for ln in block.split("\n") if ln.strip()]
+        lines = [ln.strip("\\ufeff") for ln in block.split("\\n") if ln.strip()]
         if not lines:
             continue
         time_idx = next((i for i, ln in enumerate(lines) if time_re.search(ln)), None)
@@ -1456,7 +1633,7 @@ def build_caption_cues(
             overlapping.append((rel_a, rel_b, txt))
 
     for rel_a, rel_b, txt in overlapping:
-        clauses = [p.strip() for p in re.split(r"(?<=[.!?])\s+|,\s+|\s+-\s+|\s+—\s+", txt) if p.strip()]
+        clauses = [p.strip() for p in re.split(r"(?<=[.!?])\\s+|,\\s+|\\s+-\\s+|\\s+—\\s+", txt) if p.strip()]
         chunks: list[str] = []
         for cl in clauses:
             words = cl.split()
@@ -1551,17 +1728,17 @@ def write_srt_file(cues: list[tuple[float, float, str]], clip_duration: float, s
         c_start, c_end, c_text = cue[:3]
         a_sec = max(0.0, min(clip_duration, float(c_start)))
         b_sec = max(a_sec + 0.15, min(clip_duration, float(c_end)))
-        clean_lines = "\n".join(
+        clean_lines = "\\n".join(
             normalize_english_subtitle_text(ln)
             for ln in (c_text or "").splitlines()
             if normalize_english_subtitle_text(ln)
         )
         if not clean_lines:
             continue
-        blocks.append(f"{idx}\n{fmt_srt_time(a_sec)} --> {fmt_srt_time(b_sec)}\n{clean_lines}\n")
+        blocks.append(f"{idx}\\n{fmt_srt_time(a_sec)} --> {fmt_srt_time(b_sec)}\\n{clean_lines}\\n")
         idx += 1
 
-    srt_path.write_text("\n".join(blocks), encoding="utf-8")
+    srt_path.write_text("\\n".join(blocks), encoding="utf-8")
     return srt_path
 
 
@@ -1636,7 +1813,7 @@ def build_frame_stage_filter(
 
 def _ass_safe_text(value: str) -> str:
     clean = normalize_english_subtitle_text(value)
-    return clean.replace("{", "(").replace("}", ")").replace("\\", "")
+    return clean.replace("{", "(").replace("}", ")").replace("\\\\", "")
 
 
 def write_creator_ass_file(
@@ -1682,7 +1859,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         if end <= start:
             continue
 
-        safe_text = _ass_safe_text(str(cue_text or "").replace("\\N", " "))
+        safe_text = _ass_safe_text(str(cue_text or "").replace("\\\\N", " "))
         max_chars = max(16, min(30, int(out_w / max(1.0, font_px * 0.58))))
         wrapped_lines = wrap_text_lines(safe_text, max_chars=max_chars, max_lines=2)
         words_by_line = [line.split() for line in wrapped_lines if line.strip()]
@@ -1712,17 +1889,17 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 remaining -= duration_cs
                 duration_values.append(duration_cs)
 
-        karaoke_parts = [f"{{\\kf{duration_cs}}}{word}" for word, duration_cs in zip(words, duration_values)]
+        karaoke_parts = [f"{{\\\\kf{duration_cs}}}{word}" for word, duration_cs in zip(words, duration_values)]
         karaoke_lines = []
         word_cursor = 0
         for line_words in words_by_line:
             line_count = len(line_words)
             karaoke_lines.append(" ".join(karaoke_parts[word_cursor:word_cursor + line_count]))
             word_cursor += line_count
-        karaoke_text = r"\\N".join(karaoke_lines)
-        events.append(f"Dialogue: 0,{ass_time(start)},{ass_time(end)},Creator,,0,0,0,,{{\\an2\\q2}}{karaoke_text}")
+        karaoke_text = r"\\\\N".join(karaoke_lines)
+        events.append(f"Dialogue: 0,{ass_time(start)},{ass_time(end)},Creator,,0,0,0,,{{\\\\an2\\\\q2}}{karaoke_text}")
 
-    output_path.write_text(header + "\n".join(events) + "\n", encoding="utf-8")
+    output_path.write_text(header + "\\n".join(events) + "\\n", encoding="utf-8")
     return output_path
 
 
@@ -1757,7 +1934,7 @@ def _drawtext_subtitle_filters(
             y_pos = max(24, base_y + line_idx * line_step)
             filters.append(
                 f"drawtext=textfile='{escaped}'{font_opt}:fontcolor=white:fontsize={sub_px}:"
-                f"x=max(24\\,(w-text_w)/2):y={y_pos}:"
+                f"x=max(24\\\\,(w-text_w)/2):y={y_pos}:"
                 f"borderw=4:bordercolor=black@0.98:shadowcolor=black@0.75:shadowx=2:shadowy=2:"
                 f"enable='between(t,{c_a:.2f},{c_b:.2f})'"
             )
@@ -1805,7 +1982,7 @@ def append_overlays_and_subs(
             y_hook = top_y + (h_i * hook_step)
             hook_filters.append(
                 f"drawtext=textfile='{hook_file_esc}'{font_opt}:fontcolor=white:fontsize={hook_font_px}:"
-                f"x=max(24\\,(w-text_w)/2):y={y_hook}:"
+                f"x=max(24\\\\,(w-text_w)/2):y={y_hook}:"
                 f"box=1:boxcolor=black@0.75:boxborderw=8:"
                 f"enable='between(t,0,{active_end:.2f})'"
             )
@@ -2064,7 +2241,6 @@ def render_stitched_clip(
             ]
             res = run_cmd(seg_cmd, timeout=300)
             if res.returncode != 0 or not seg_out.exists() or seg_out.stat().st_size == 0:
-                # Fallback if source has no audio stream at all
                 no_aud_graph = (
                     f"{vf_seg};"
                     f"anullsrc=r=44100:cl=stereo:d={seg_d:.2f},aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[aseg]"
@@ -2085,7 +2261,7 @@ def render_stitched_clip(
         if status_cb:
             status_cb("Joining stitched segments...")
         list_lines = [f"file '{sf.resolve().as_posix().replace(chr(39), chr(39)+chr(92)+chr(39)+chr(39))}'" for sf in seg_files]
-        concat_list_path.write_text("\n".join(list_lines) + "\n", encoding="utf-8")
+        concat_list_path.write_text("\\n".join(list_lines) + "\\n", encoding="utf-8")
 
         join_res = run_cmd([
             "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-fflags", "+genpts",
@@ -2094,7 +2270,6 @@ def render_stitched_clip(
             "-movflags", "+faststart", str(joined_raw_path),
         ], timeout=300)
         if join_res.returncode != 0 or not joined_raw_path.exists():
-            # Re-encode join if stream copy fails
             join_res = run_cmd([
                 "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-fflags", "+genpts",
                 "-i", str(concat_list_path),
@@ -2118,7 +2293,7 @@ def render_stitched_clip(
 
         for ass_mode in (True, False):
             ascii_flag = not ass_mode
-            graph: list[str] = [f"[0:v]setsar=1[vbase]"]
+            graph: list[str] = ["[0:v]setsar=1[vbase]"]
             inputs: list[str] = ["-i", str(joined_raw_path)]
             logo_idx: int | None = None
             if has_logo:
@@ -2524,11 +2699,11 @@ if page == "Campaign & Auto-Clipper":
             extracted = []
             for bf in brief_files:
                 try:
-                    extracted.append(f"--- {bf.name} ---\n{extract_document_text(bf)}")
+                    extracted.append(f"--- {bf.name} ---\\n{extract_document_text(bf)}")
                 except Exception as exc:
                     st.warning(f"{bf.name}: {exc}")
             if extracted:
-                st.session_state.brief = (st.session_state.brief + "\n\n" + "\n\n".join(extracted)).strip()
+                st.session_state.brief = (st.session_state.brief + "\\n\\n" + "\\n\\n".join(extracted)).strip()
                 save_workspace_state(checkpoint_label="brief_extracted")
 
         st.text_area(
@@ -2609,7 +2784,7 @@ if page == "Campaign & Auto-Clipper":
                                     st.warning(f"Transcription skipped: {t_exc}")
                             sheet = make_contact_sheet(st.session_state.source_video, st.session_state.video_info["duration"], max_frames=6)
                             st.session_state.auto_candidates = build_auto_clip_candidates(
-                                brief=json.dumps(analysis, ensure_ascii=False),
+                                brief=st.session_state.brief,
                                 transcript=tr,
                                 contact_sheet=sheet,
                                 duration=st.session_state.video_info["duration"],
@@ -2618,6 +2793,7 @@ if page == "Campaign & Auto-Clipper":
                                 desired_minutes=float(st.session_state.desired_clip_minutes),
                                 used_windows=st.session_state.used_clip_windows,
                                 allow_overlap=bool(st.session_state.get("allow_overlap_windows", False)),
+                                analysis=analysis,
                             )
                             st.session_state.campaign_feedback = evaluate_video_against_campaign(
                                 analysis, st.session_state.video_info, st.session_state.transcript
@@ -2686,6 +2862,7 @@ if page == "Campaign & Auto-Clipper":
                         desired_minutes=float(st.session_state.auto_clip_minutes),
                         used_windows=st.session_state.used_clip_windows,
                         allow_overlap=bool(st.session_state.get("allow_overlap_windows", False)),
+                        analysis=st.session_state.brief_analysis,
                     )
                 st.session_state.go_ahead_clips = True
                 save_workspace_state(checkpoint_label="go_ahead")
@@ -2731,6 +2908,7 @@ if page == "Campaign & Auto-Clipper":
                     desired_minutes=active_minutes,
                     used_windows=st.session_state.used_clip_windows,
                     allow_overlap=bool(st.session_state.get("allow_overlap_windows", False)),
+                    analysis=st.session_state.brief_analysis,
                 )
                 save_workspace_state(checkpoint_label="fresh_spots")
         with ctrl4:
@@ -2746,6 +2924,7 @@ if page == "Campaign & Auto-Clipper":
                     desired_minutes=active_minutes,
                     used_windows=[],
                     allow_overlap=bool(st.session_state.get("allow_overlap_windows", False)),
+                    analysis=st.session_state.brief_analysis,
                 )
                 save_workspace_state(checkpoint_label="reset_windows")
 
@@ -2767,6 +2946,7 @@ if page == "Campaign & Auto-Clipper":
             desired_minutes=active_minutes,
             used_windows=st.session_state.used_clip_windows,
             allow_overlap=bool(st.session_state.get("allow_overlap_windows", False)),
+            analysis=st.session_state.brief_analysis,
         )
         cands = cands[:active_count]
 
@@ -2801,7 +2981,7 @@ if page == "Campaign & Auto-Clipper":
             )
             st.info(
                 f"**{cand.get('title', f'Peak Stitch #{idx+1}')}** — Total: **{stitched_sec:.1f}s** (`{active_minutes:.2f} min`) · "
-                f"Fitted Hook: *{cand.get('hook', '')}*\n\nStitched spots: {chain_str}"
+                f"Fitted Hook: *{cand.get('hook', '')}*\\n\\nStitched spots: {chain_str}"
             )
 
         if st.button("⚡ Generate / Stitch Clips in Section 3", type="primary", width="stretch", key="wf_extract_clips_btn"):
@@ -2849,7 +3029,12 @@ if page == "Campaign & Auto-Clipper":
                     m.get("text") or transcript_slice(st.session_state.transcript, float(m["start"]), float(m["end"]))
                     for m in moments
                 ))
-                final_hook = normalize_english_subtitle_text((cand.get("hook") or "").strip()) or pick_good_hook(all_spoken, brief=st.session_state.brief, clip_index=clip_num_global - 1)
+                final_hook = normalize_english_subtitle_text((cand.get("hook") or "").strip()) or pick_good_hook(
+                    all_spoken,
+                    brief=st.session_state.brief,
+                    analysis=st.session_state.brief_analysis,
+                    clip_index=clip_num_global - 1,
+                )
 
                 wrap_chars = 26 if default_asp in {"9:16 Vertical", "4:5 Portrait", "1:1 Square"} else 36
                 if st.session_state.get("full_srt_cues"):
@@ -2926,6 +3111,7 @@ if page == "Campaign & Auto-Clipper":
                         "aspect": default_asp,
                         "resolution": sharp_res,
                         "meta": clip_meta,
+                        "caption_style": copy_pack["caption_style"],
                         "youtube": copy_pack["youtube"],
                         "instagram": copy_pack["instagram"],
                         "facebook": copy_pack["facebook"],
@@ -2955,6 +3141,7 @@ if page == "Campaign & Auto-Clipper":
                     desired_minutes=active_minutes,
                     used_windows=st.session_state.used_clip_windows,
                     allow_overlap=bool(st.session_state.get("allow_overlap_windows", False)),
+                    analysis=st.session_state.brief_analysis,
                 )
                 save_workspace_state(checkpoint_label="section3_rendered")
                 st.success(f"Generated {len(rendered_now)} clip(s) in {time.time() - t0:.1f}s. Open **Videos Extracted** to download or generate captions.")
@@ -3011,7 +3198,16 @@ elif page == "Manual Clipper (Start → End)":
                 float(start) + float(src_offset_ed),
                 float(end) + float(src_offset_ed),
             )
-            hook_line = st.text_input("Top hook banner text", value=pick_good_hook(spoken_ed, brief=st.session_state.brief, clip_index=0), key="ed_hook_line")
+            hook_line = st.text_input(
+                "Top hook banner text",
+                value=pick_good_hook(
+                    spoken_ed,
+                    brief=st.session_state.brief,
+                    analysis=st.session_state.brief_analysis,
+                    clip_index=len(st.session_state.clips),
+                ),
+                key="ed_hook_line",
+            )
             hook_dur_opt = st.selectbox("Top hook duration", ["8s Banner", "Full Clip Banner"], key="ed_hook_dur")
         with b:
             aspect = st.selectbox("Aspect ratio", ["9:16 Vertical", "16:9 Landscape", "1:1 Square", "4:5 Portrait", "Keep original"], key="ed_aspect")
@@ -3039,7 +3235,12 @@ elif page == "Manual Clipper (Start → End)":
                             float(end) + float(src_offset_ed),
                         )
                     )
-                    final_hook = normalize_english_subtitle_text((hook_line or "").strip()) or pick_good_hook(spoken_now, brief=st.session_state.brief, clip_index=clip_idx - 1)
+                    final_hook = normalize_english_subtitle_text((hook_line or "").strip()) or pick_good_hook(
+                        spoken_now,
+                        brief=st.session_state.brief,
+                        analysis=st.session_state.brief_analysis,
+                        clip_index=clip_idx - 1,
+                    )
                     wrap_chars = 26 if aspect in {"9:16 Vertical", "4:5 Portrait", "1:1 Square"} else 36
                     cues = []
                     if add_sub:
@@ -3106,6 +3307,7 @@ elif page == "Manual Clipper (Start → End)":
                         "name": f"{clip_name} ({aspect})", "path": str(out), "srt_path": saved_srt,
                         "start": start, "end": end, "source_offset": float(src_offset_ed), "aspect": aspect, "resolution": resolution,
                         "meta": c_meta,
+                        "caption_style": copy_pack["caption_style"],
                         "youtube": copy_pack["youtube"],
                         "instagram": copy_pack["instagram"],
                         "facebook": copy_pack["facebook"],
@@ -3342,7 +3544,7 @@ if page == "Videos Extracted":
                         st.session_state.clips[idx]["facebook"] = fb_val
 
                     render_fast_voice_reader(
-                        f"YouTube: {cl.get('youtube', '')}\nInstagram: {cl.get('instagram', '')}\nFacebook: {cl.get('facebook', '')}".strip(),
+                        f"YouTube: {cl.get('youtube', '')}\\nInstagram: {cl.get('instagram', '')}\\nFacebook: {cl.get('facebook', '')}".strip(),
                         label=f"🔊 Fast Read Clip {idx+1} Copy",
                         uid=f"short_{idx}",
                     )
@@ -3438,3 +3640,82 @@ if page == "Videos Extracted":
                 label="🔊 Preview Voiceover Readout",
                 uid="stage6_s6_vo",
             )
+'''
+
+# Verify AST syntax cleanly
+ast.parse(updated_code)
+
+# Extract and run functional unit tests on the hook & copy functions
+ns = {"re": re, "json": json}
+exec('''
+HOOK_STOPWORDS = {
+    "about", "after", "again", "also", "been", "before", "being", "between",
+    "both", "could", "did", "does", "doing", "down", "during", "each", "even",
+    "from", "have", "here", "into", "just", "like", "make", "more", "most",
+    "much", "must", "need", "only", "other", "over", "really", "right", "same",
+    "should", "some", "such", "than", "that", "their", "them", "then", "there",
+    "these", "they", "this", "those", "through", "under", "very", "want", "well",
+    "what", "when", "where", "which", "while", "with", "would", "your",
+}
+HOOK_FILLER_STARTERS = {"and", "but", "so", "or", "um", "uh", "like", "well", "okay", "yeah", "alright"}
+''', ns)
+
+for fn_name in ("_extract_key_terms", "_extract_best_spoken_hook", "_extract_brief_hook", "pick_good_hook", "build_campaign_caption_context", "_build_grounded_fallback_copy"):
+    m = re.search(rf"(def {fn_name}\(.*?\n(?:    .*\n|\n)+)", updated_code)
+    exec(m.group(1), ns)
+
+# Run tests
+test_brief = """Launch solar backpack for commuters.
+Must include 20W fast charging test.
+Caption requirement: Mention @SolarPackOfficial and link in bio.
+#SolarCommute #TechGear"""
+test_analysis = {
+    "plain_english_summary": "Demonstrate the 20W solar backpack charging a laptop outdoors.",
+    "must_include": ["Show 20W fast charging test"],
+    "caption_requirements": ["Mention @SolarPackOfficial"],
+    "hashtags": ["#SolarCommute", "#TechGear"],
+}
+
+# Test 1: Spoken transcript with filler opener
+h1 = ns["pick_good_hook"](
+    "So um basically this 20W solar panel charged my phone in 18 minutes flat.",
+    brief=test_brief,
+    analysis=test_analysis,
+    clip_index=0,
+)
+# Test 2: Empty transcript -> brief hook
+h2 = ns["pick_good_hook"]("", brief=test_brief, analysis=test_analysis, clip_index=0)
+# Test 3: Clip index 2 blends brief angle
+h3 = ns["pick_good_hook"](
+    "So um basically this 20W solar panel charged my phone in 18 minutes flat.",
+    brief=test_brief,
+    analysis=test_analysis,
+    clip_index=2,
+)
+# Test 4: Grounded copy across styles
+copy_viral = ns["_build_grounded_fallback_copy"](
+    brief=test_brief,
+    analysis=test_analysis,
+    clip_info={"title": "Peak Stitch #1", "hook": h1, "moments": [{"start": 10.0, "end": 22.0}]},
+    transcript_text="This 20W solar panel charged my phone in 18 minutes flat.",
+    clip_index=0,
+    caption_style="Hook / Viral",
+)
+copy_cta = ns["_build_grounded_fallback_copy"](
+    brief=test_brief,
+    analysis=test_analysis,
+    clip_info={"title": "Peak Stitch #1", "hook": h1, "moments": [{"start": 10.0, "end": 22.0}]},
+    transcript_text="This 20W solar panel charged my phone in 18 minutes flat.",
+    clip_index=0,
+    caption_style="Campaign / CTA",
+)
+
+assert "basically this 20W solar panel" in h1 and len(h1) <= 44
+assert h2 == "Show 20W fast charging test"
+assert h3 == "Show 20W fast charging test"
+assert "#SolarCommute" in copy_viral["instagram"] and "20W solar panel" in copy_viral["youtube"]
+assert "@SolarPackOfficial" in copy_cta["instagram"]
+
+out_path = Path("app_2.py")
+out_path.write_text(updated_code, encoding="utf-8")
+print("ALL_TESTS_PASSED", len(updated_code))
