@@ -86,7 +86,7 @@ STATE_FIELDS = [
     "project_name", "brief", "brief_analysis", "campaign_feedback",
     "go_ahead_clips", "target_platform_choice", "desired_clip_minutes",
     "auto_clip_minutes", "used_clip_windows", "hook_mode_choice",
-    "hook_banner_scope", "burn_subtitles_chk_v2", "subtitle_language",
+    "hook_banner_scope", "custom_hook_fallback", "force_custom_hook", "burn_subtitles_chk_v2", "subtitle_language",
     "onscreen_caption_size", "subtitle_accent_colour", "vertical_fit_mode",
     "mute_original_audio", "voiceover_source_mode", "voiceover_script_text",
     "voiceover_audio_path", "voiceover_audio_name", "source_video",
@@ -233,6 +233,8 @@ def _collect_state_payload(checkpoint_label: str = "autosave") -> dict:
         "used_clip_windows": st.session_state.get("used_clip_windows", []),
         "hook_mode_choice": st.session_state.get("hook_mode_choice", "Standard Clip Length (Exact Minutes)"),
         "hook_banner_scope": st.session_state.get("hook_banner_scope", "8-Second Top Banner (0–8s)"),
+        "custom_hook_fallback": st.session_state.get("custom_hook_fallback", ""),
+        "force_custom_hook": bool(st.session_state.get("force_custom_hook", False)),
         "burn_subtitles_chk_v2": bool(st.session_state.get("burn_subtitles_chk_v2", False)),
         "subtitle_language": st.session_state.get("subtitle_language", "English (Default)"),
         "onscreen_caption_size": int(st.session_state.get("onscreen_caption_size", 32)),
@@ -846,26 +848,48 @@ def _extract_brief_hook(brief: str, analysis: dict | None = None, clip_index: in
     return candidates[clip_index % len(candidates)][:44]
 
 
+def _is_weak_hook(hook_text: str) -> bool:
+    clean = re.sub(r"\s+", " ", str(hook_text or "")).strip()
+    if not clean or len(clean) < 8:
+        return True
+    if clean.lower().startswith(("highlight moment #", "key focus:")):
+        return True
+    meaningful = [
+        w for w in re.findall(r"[A-Za-z0-9]+", clean.lower())
+        if len(w) >= 3 and w not in HOOK_STOPWORDS and w not in HOOK_FILLER_STARTERS
+    ]
+    return len(meaningful) < 2
+
+
 def pick_good_hook(
     spoken_text: str,
     brief: str = "",
     analysis: dict | None = None,
     clip_index: int = 0,
+    custom_hook: str = "",
+    force_custom: bool = False,
 ) -> str:
     """
     Pick a hook grounded in the clip's spoken transcript first, then the campaign brief/analysis.
-    Never falls back to unrelated canned topics.
+    Uses user's custom hook when forced or whenever auto-detection cannot find a strong hook.
     """
+    clean_custom = normalize_english_subtitle_text(custom_hook)[:48]
+    if force_custom and clean_custom:
+        return clean_custom
+
     spoken_hook = _extract_best_spoken_hook(spoken_text)
     brief_hook = _extract_brief_hook(brief, analysis=analysis, clip_index=clip_index)
 
     if spoken_hook and brief_hook:
-        if clip_index % 3 == 2 and len(brief_hook) <= 40:
-            return brief_hook
-        return spoken_hook
-    if spoken_hook:
-        return spoken_hook
-    return brief_hook
+        chosen = brief_hook if (clip_index % 3 == 2 and len(brief_hook) <= 40) else spoken_hook
+    elif spoken_hook:
+        chosen = spoken_hook
+    else:
+        chosen = brief_hook
+
+    if clean_custom and _is_weak_hook(chosen):
+        return clean_custom
+    return chosen
 
 
 def build_stitched_peak_moments(
@@ -949,6 +973,8 @@ def build_auto_clip_candidates(
     used_windows: list[list[float]],
     allow_overlap: bool = False,
     analysis: dict | None = None,
+    custom_hook: str = "",
+    force_custom_hook: bool = False,
 ) -> list[dict]:
     count = max(1, min(6, int(clip_count)))
     results: list[dict] = []
@@ -975,6 +1001,8 @@ def build_auto_clip_candidates(
             brief=brief,
             analysis=analysis,
             clip_index=pick_num - 1,
+            custom_hook=custom_hook,
+            force_custom=force_custom_hook,
         )
 
         results.append({
@@ -2472,6 +2500,8 @@ def init_state():
         "hook_mode_choice": "Standard Clip Length (Exact Minutes)",
         "hook_banner_scope": "8-Second Top Banner (0–8s)",
         "pending_hook_banner_scope": None,
+        "custom_hook_fallback": "",
+        "force_custom_hook": False,
         "burn_subtitles_chk_v2": False,
         "subtitle_language": "English (Default)",
         "onscreen_caption_size": 32,
@@ -2743,6 +2773,18 @@ if page == "Campaign & Auto-Clipper":
             key="hook_banner_scope",
         )
 
+        hk_c1, hk_c2 = st.columns([1.6, 1.0])
+        with hk_c1:
+            st.text_input(
+                "Your custom hook (used if auto-hook is weak or forced)",
+                key="custom_hook_fallback",
+                max_chars=48,
+                placeholder="e.g. Watch what happens in the final seconds...",
+            )
+        with hk_c2:
+            st.write("")
+            st.checkbox("Always use my hook", key="force_custom_hook")
+
         active_count = int(st.session_state.get("auto_clip_count", 2))
 
         if st.button("🧠 Analyse Campaign & Video Fit", type="primary", width="stretch", key="wf_analyse_btn"):
@@ -2781,6 +2823,8 @@ if page == "Campaign & Auto-Clipper":
                                 used_windows=st.session_state.used_clip_windows,
                                 allow_overlap=bool(st.session_state.get("allow_overlap_windows", False)),
                                 analysis=analysis,
+                                custom_hook=st.session_state.get("custom_hook_fallback", ""),
+                                force_custom_hook=bool(st.session_state.get("force_custom_hook", False)),
                             )
                             st.session_state.campaign_feedback = evaluate_video_against_campaign(
                                 analysis, st.session_state.video_info, st.session_state.transcript
@@ -2850,6 +2894,8 @@ if page == "Campaign & Auto-Clipper":
                         used_windows=st.session_state.used_clip_windows,
                         allow_overlap=bool(st.session_state.get("allow_overlap_windows", False)),
                         analysis=st.session_state.brief_analysis,
+                        custom_hook=st.session_state.get("custom_hook_fallback", ""),
+                        force_custom_hook=bool(st.session_state.get("force_custom_hook", False)),
                     )
                 st.session_state.go_ahead_clips = True
                 save_workspace_state(checkpoint_label="go_ahead")
@@ -2896,6 +2942,8 @@ if page == "Campaign & Auto-Clipper":
                     used_windows=st.session_state.used_clip_windows,
                     allow_overlap=bool(st.session_state.get("allow_overlap_windows", False)),
                     analysis=st.session_state.brief_analysis,
+                    custom_hook=st.session_state.get("custom_hook_fallback", ""),
+                    force_custom_hook=bool(st.session_state.get("force_custom_hook", False)),
                 )
                 save_workspace_state(checkpoint_label="fresh_spots")
         with ctrl4:
@@ -2912,6 +2960,8 @@ if page == "Campaign & Auto-Clipper":
                     used_windows=[],
                     allow_overlap=bool(st.session_state.get("allow_overlap_windows", False)),
                     analysis=st.session_state.brief_analysis,
+                    custom_hook=st.session_state.get("custom_hook_fallback", ""),
+                    force_custom_hook=bool(st.session_state.get("force_custom_hook", False)),
                 )
                 save_workspace_state(checkpoint_label="reset_windows")
 
@@ -2967,9 +3017,16 @@ if page == "Campaign & Auto-Clipper":
                 for m in moments
             )
             st.info(
-                f"**{cand.get('title', f'Peak Stitch #{idx+1}')}** — Total: **{stitched_sec:.1f}s** (`{active_minutes:.2f} min`) · "
-                f"Fitted Hook: *{cand.get('hook', '')}*\n\nStitched spots: {chain_str}"
+                f"**{cand.get('title', f'Peak Stitch #{idx+1}')}** — Total: **{stitched_sec:.1f}s** (`{active_minutes:.2f} min`)\n\n"
+                f"Stitched spots: {chain_str}"
             )
+            edited_hook = st.text_input(
+                f"Hook banner for {cand.get('title', f'Peak Stitch #{idx+1}')} (edit anytime before stitching)",
+                value=cand.get("hook", ""),
+                max_chars=48,
+                key=f"sec3_cand_hook_{idx}",
+            )
+            cand["hook"] = edited_hook
 
         if st.button("⚡ Generate / Stitch Clips in Section 3", type="primary", width="stretch", key="wf_extract_clips_btn"):
             save_named_checkpoint("Before Section 3 Stitch")
@@ -3016,11 +3073,16 @@ if page == "Campaign & Auto-Clipper":
                     m.get("text") or transcript_slice(st.session_state.transcript, float(m["start"]), float(m["end"]))
                     for m in moments
                 ))
-                final_hook = normalize_english_subtitle_text((cand.get("hook") or "").strip()) or pick_good_hook(
+                raw_cand_hook = (st.session_state.get(f"sec3_cand_hook_{idx}") or cand.get("hook") or "").strip()
+                if st.session_state.get("force_custom_hook") and (st.session_state.get("custom_hook_fallback") or "").strip():
+                    raw_cand_hook = st.session_state.get("custom_hook_fallback", "").strip()
+                final_hook = normalize_english_subtitle_text(raw_cand_hook) or pick_good_hook(
                     all_spoken,
                     brief=st.session_state.brief,
                     analysis=st.session_state.brief_analysis,
                     clip_index=clip_num_global - 1,
+                    custom_hook=st.session_state.get("custom_hook_fallback", ""),
+                    force_custom=bool(st.session_state.get("force_custom_hook", False)),
                 )
 
                 wrap_chars = 26 if default_asp in {"9:16 Vertical", "4:5 Portrait", "1:1 Square"} else 36
@@ -3129,6 +3191,8 @@ if page == "Campaign & Auto-Clipper":
                     used_windows=st.session_state.used_clip_windows,
                     allow_overlap=bool(st.session_state.get("allow_overlap_windows", False)),
                     analysis=st.session_state.brief_analysis,
+                    custom_hook=st.session_state.get("custom_hook_fallback", ""),
+                    force_custom_hook=bool(st.session_state.get("force_custom_hook", False)),
                 )
                 save_workspace_state(checkpoint_label="section3_rendered")
                 st.success(f"Generated {len(rendered_now)} clip(s) in {time.time() - t0:.1f}s. Open **Videos Extracted** to download or generate captions.")
@@ -3192,6 +3256,8 @@ elif page == "Manual Clipper (Start → End)":
                     brief=st.session_state.brief,
                     analysis=st.session_state.brief_analysis,
                     clip_index=len(st.session_state.clips),
+                    custom_hook=st.session_state.get("custom_hook_fallback", ""),
+                    force_custom=bool(st.session_state.get("force_custom_hook", False)),
                 ),
                 key="ed_hook_line",
             )
