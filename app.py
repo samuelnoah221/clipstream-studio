@@ -1,9 +1,4 @@
-import ast
-import re
-
-# Build the complete, unified, conflict-free app_2.py and verify syntax + run unit tests on hooks & captions
-
-updated_code = '''from __future__ import annotations
+from __future__ import annotations
 
 import gc
 import hashlib
@@ -164,7 +159,7 @@ def safe_name(value: str) -> str:
 
 def escape_ffmpeg_path(p: Path) -> str:
     resolved = p.resolve().as_posix()
-    resolved = resolved.replace("\\\\", "/").replace(":", "\\\\:").replace("'", "\\\\'")
+    resolved = resolved.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
     return resolved
 
 
@@ -626,7 +621,7 @@ def get_openai_client():
 
 
 def synthesize_voiceover_file(script_text: str) -> Path | None:
-    clean_txt = re.sub(r"\\s+", " ", (script_text or "").strip())
+    clean_txt = re.sub(r"\s+", " ", (script_text or "").strip())
     if not clean_txt:
         return None
     ws_dir = workspace_dir(st.session_state.get("workspace_key", "default"))
@@ -667,11 +662,11 @@ def extract_document_text(uploaded) -> str:
     if name.endswith(".pdf"):
         import fitz
         with fitz.open(stream=raw, filetype="pdf") as doc:
-            return "\\n\\n".join(page.get_text() for page in doc).strip()
+            return "\n\n".join(page.get_text() for page in doc).strip()
     if name.endswith(".docx"):
         from docx import Document
         doc = Document(io.BytesIO(raw))
-        return "\\n".join(p.text for p in doc.paragraphs if p.text.strip())
+        return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
     if name.endswith((".txt", ".md", ".csv")):
         return raw.decode("utf-8", errors="replace")
     if name.endswith((".png", ".jpg", ".jpeg", ".webp")):
@@ -684,8 +679,8 @@ def extract_document_text(uploaded) -> str:
 
 def parse_json_response(content: str) -> dict:
     text = content.strip()
-    text = re.sub(r"^```(?:json)?\\s*", "", text)
-    text = re.sub(r"\\s*```$", "", text)
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
     start, end = text.find("{"), text.rfind("}")
     if start < 0 or end < start:
         raise ValueError("AI response did not contain valid JSON.")
@@ -698,7 +693,7 @@ def render_fast_voice_reader(text: str, label: str = "🔊 Fast Readout (Zero Da
         st.caption("Nothing to read yet.")
         return
     payload = json.dumps(clean[:3500], ensure_ascii=False)
-    payload = payload.replace("<", "\\\\u003c").replace(">", "\\\\u003e").replace("&", "\\\\u0026")
+    payload = payload.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
     safe_label = html.escape(label)
     safe_uid = re.sub(r"[^a-zA-Z0-9_]", "", uid) or "tts"
     components.html(
@@ -753,7 +748,7 @@ def transcript_slice(transcript: dict | None, start: float, end: float) -> str:
         s_a = float(sg.get("start", 0.0) or 0.0)
         s_b = float(sg.get("end", 0.0) or 0.0)
         if s_b > start and s_a < end:
-            txt = re.sub(r"\\s+", " ", str(sg.get("text", "")).strip())
+            txt = re.sub(r"\s+", " ", str(sg.get("text", "")).strip())
             if txt:
                 parts.append(txt)
     joined = " ".join(parts).strip()
@@ -775,11 +770,11 @@ def _extract_key_terms(text: str, limit: int = 6) -> list[str]:
 
 
 def _extract_best_spoken_hook(spoken_text: str) -> str:
-    clean = re.sub(r"\\s+", " ", str(spoken_text or "")).strip()
+    clean = re.sub(r"\s+", " ", str(spoken_text or "")).strip()
     if not clean:
         return ""
 
-    clauses = [c.strip(" ,;:-") for c in re.split(r"[.!?\\n]+|,\\s+", clean) if len(c.strip()) >= 8]
+    clauses = [c.strip(" ,;:-") for c in re.split(r"[.!?\n]+|,\s+", clean) if len(c.strip()) >= 8]
     best_phrase = ""
     best_score = -999.0
 
@@ -827,7 +822,7 @@ def _extract_brief_hook(brief: str, analysis: dict | None = None, clip_index: in
 
     for field in ("must_include", "required_scenes_or_moments", "deliverables", "caption_requirements"):
         for item in (an.get(field) or []):
-            s = re.sub(r"\\s+", " ", str(item or "")).strip(" -•*\\t")
+            s = re.sub(r"\s+", " ", str(item or "")).strip(" -•*\t")
             if 6 <= len(s) <= 44:
                 candidates.append(s)
 
@@ -838,7 +833,7 @@ def _extract_brief_hook(brief: str, analysis: dict | None = None, clip_index: in
             candidates.append(" ".join(w.capitalize() for w in terms)[:44])
 
     for line in str(brief or "").splitlines():
-        ln = re.sub(r"\\s+", " ", line).strip(" -•*\\t")
+        ln = re.sub(r"\s+", " ", line).strip(" -•*\t")
         if 6 <= len(ln) <= 44 and not ln.startswith("#"):
             candidates.append(ln)
 
@@ -1028,7 +1023,7 @@ def heuristic_campaign_analysis(brief: str, project_name: str) -> dict:
     )
 
     hashtags = sorted(set(re.findall(r"#[A-Za-z0-9_]+", brief)))[:10]
-    lines = [ln.strip(" -•*\\t") for ln in brief.splitlines() if ln.strip()]
+    lines = [ln.strip(" -•*\t") for ln in brief.splitlines() if ln.strip()]
     must_include = [ln for ln in lines if any(w in ln.lower() for w in ["include", "must", "mention", "call to action", "cta", "show", "hook", "caption"])][:6]
     prohibited = [ln for ln in lines if any(w in ln.lower() for w in ["avoid", "don't", "do not", "never", "prohibited", "no "])][:6]
     caption_reqs = [ln for ln in lines if any(w in ln.lower() for w in ["caption", "hashtag", "tag", "description", "link", "mention"])][:6]
@@ -1251,7 +1246,7 @@ def build_campaign_caption_context(analysis: dict | None, brief: str) -> str:
             parts.append(f"{label}: " + "; ".join(str(v) for v in vals[:8]))
     if brief.strip():
         parts.append(f"Raw Brief Notes: {brief.strip()[:1500]}")
-    return "\\n".join(parts)
+    return "\n".join(parts)
 
 
 def _build_grounded_fallback_copy(
@@ -1295,7 +1290,7 @@ def _build_grounded_fallback_copy(
         e_val = c_info.get("end")
         window_label = f" ({float(s_val):.0f}s–{float(e_val):.0f}s)" if s_val is not None and e_val is not None else ""
 
-    spoken_summary = re.sub(r"\\s+", " ", str(transcript_text or "").strip())
+    spoken_summary = re.sub(r"\s+", " ", str(transcript_text or "").strip())
     if len(spoken_summary) > 220:
         spoken_summary = spoken_summary[:217].rsplit(" ", 1)[0] + "..."
 
@@ -1327,7 +1322,7 @@ def _build_grounded_fallback_copy(
         cta = "Watch through to the end and share if this caught your attention."
 
     yt_title = f"{clip_hook} | {clean_tags.split()[0] if clean_tags else '#Shorts'}"[:95]
-    yt_body = "\\n\\n".join([p for p in [
+    yt_body = "\n\n".join([p for p in [
         f"Clip: {clip_title}{window_label}",
         lead,
         cta,
@@ -1336,7 +1331,7 @@ def _build_grounded_fallback_copy(
         clean_tags,
     ] if p]).strip()
 
-    ig_body = "\\n\\n".join([p for p in [
+    ig_body = "\n\n".join([p for p in [
         lead,
         cta,
         camp_note if caption_style != "Campaign / CTA" else "",
@@ -1344,7 +1339,7 @@ def _build_grounded_fallback_copy(
         clean_tags,
     ] if p]).strip()
 
-    fb_body = "\\n\\n".join([p for p in [
+    fb_body = "\n\n".join([p for p in [
         f"{clip_hook}{window_label}",
         context_line,
         cta,
@@ -1353,7 +1348,7 @@ def _build_grounded_fallback_copy(
         clean_tags,
     ] if p]).strip()
 
-    full_yt = f"{yt_title}\\n\\n{yt_body}".strip()
+    full_yt = f"{yt_title}\n\n{yt_body}".strip()
     return {
         "caption_style": caption_style,
         "youtube": full_yt,
@@ -1451,26 +1446,26 @@ Return ONLY valid JSON:
 def build_clips_manifest_text(clips: list[dict], project_name: str) -> str:
     lines = [f"Project: {project_name}", f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}", "=" * 50]
     for i, cl in enumerate(clips, start=1):
-        lines.append(f"\\n--- Clip {i}: {cl.get('name', 'Clip')} ---")
+        lines.append(f"\n--- Clip {i}: {cl.get('name', 'Clip')} ---")
         if cl.get("youtube"):
-            lines.append(f"[YouTube]\\n{cl['youtube']}")
+            lines.append(f"[YouTube]\n{cl['youtube']}")
         if cl.get("instagram"):
-            lines.append(f"[Instagram]\\n{cl['instagram']}")
+            lines.append(f"[Instagram]\n{cl['instagram']}")
         if cl.get("facebook"):
-            lines.append(f"[Facebook]\\n{cl['facebook']}")
-    return "\\n".join(lines)
+            lines.append(f"[Facebook]\n{cl['facebook']}")
+    return "\n".join(lines)
 
 
 # ----------------------------- SUBTITLE & FRAME PIPELINE --------------
 def normalize_english_subtitle_text(text: str, ascii_only: bool = False) -> str:
     if ascii_only:
-        cleaned = str(text or "").replace("\\u2014", " - ").replace("\\u2013", " - ")
-        cleaned = cleaned.replace("\\u2018", "'").replace("\\u2019", "'").replace("\\u201c", '"').replace("\\u201d", '"')
-        cleaned = re.sub(r"[^\\x20-\\x7E]", " ", cleaned)
+        cleaned = str(text or "").replace("\u2014", " - ").replace("\u2013", " - ")
+        cleaned = cleaned.replace("\u2018", "'").replace("\u2019", "'").replace("\u201c", '"').replace("\u201d", '"')
+        cleaned = re.sub(r"[^\x20-\x7E]", " ", cleaned)
     else:
-        cleaned = re.sub(r"[^\\x20-\\x7E\\u2014\\u2013\\u2018\\u2019\\u201c\\u201d]", " ", str(text or ""))
-        cleaned = cleaned.replace("\\u2014", " — ").replace("\\u2013", " - ")
-    return re.sub(r"\\s+", " ", cleaned).strip()
+        cleaned = re.sub(r"[^\x20-\x7E\u2014\u2013\u2018\u2019\u201c\u201d]", " ", str(text or ""))
+        cleaned = cleaned.replace("\u2014", " — ").replace("\u2013", " - ")
+    return re.sub(r"\s+", " ", cleaned).strip()
 
 
 def wrap_text_lines(text: str, max_chars: int = 26, max_lines: int = 2, ascii_only: bool = False) -> list[str]:
@@ -1496,16 +1491,16 @@ def wrap_text_lines(text: str, max_chars: int = 26, max_lines: int = 2, ascii_on
 
 
 def wrap_caption_lines(text: str, max_chars: int = 26, max_lines: int = 2) -> str:
-    return "\\n".join(wrap_text_lines(text, max_chars=max_chars, max_lines=max_lines))
+    return "\n".join(wrap_text_lines(text, max_chars=max_chars, max_lines=max_lines))
 
 
 def parse_srt_file(srt_path: str | Path) -> list[tuple[float, float, str]]:
     path = Path(srt_path)
     raw = path.read_text(encoding="utf-8-sig", errors="replace")
-    raw = raw.replace("\\r\\n", "\\n").replace("\\r", "\\n")
-    blocks = re.split(r"\\n\\s*\\n", raw.strip())
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+    blocks = re.split(r"\n\s*\n", raw.strip())
     cues: list[tuple[float, float, str]] = []
-    time_re = re.compile(r"(?P<a>\\d{1,2}:\\d{2}:\\d{2}[,.]\\d{3})\\s*-->\\s*(?P<b>\\d{1,2}:\\d{2}:\\d{2}[,.]\\d{3})")
+    time_re = re.compile(r"(?P<a>\d{1,2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(?P<b>\d{1,2}:\d{2}:\d{2}[,.]\d{3})")
 
     def to_seconds(value: str) -> float:
         hh, mm, tail = value.replace(",", ".").split(":")
@@ -1513,7 +1508,7 @@ def parse_srt_file(srt_path: str | Path) -> list[tuple[float, float, str]]:
         return int(hh) * 3600 + int(mm) * 60 + int(ss) + int(ms) / 1000
 
     for block in blocks:
-        lines = [ln.strip("\\ufeff") for ln in block.split("\\n") if ln.strip()]
+        lines = [ln.strip("\ufeff") for ln in block.split("\n") if ln.strip()]
         if not lines:
             continue
         time_idx = next((i for i, ln in enumerate(lines) if time_re.search(ln)), None)
@@ -1633,7 +1628,7 @@ def build_caption_cues(
             overlapping.append((rel_a, rel_b, txt))
 
     for rel_a, rel_b, txt in overlapping:
-        clauses = [p.strip() for p in re.split(r"(?<=[.!?])\\s+|,\\s+|\\s+-\\s+|\\s+—\\s+", txt) if p.strip()]
+        clauses = [p.strip() for p in re.split(r"(?<=[.!?])\s+|,\s+|\s+-\s+|\s+—\s+", txt) if p.strip()]
         chunks: list[str] = []
         for cl in clauses:
             words = cl.split()
@@ -1728,17 +1723,17 @@ def write_srt_file(cues: list[tuple[float, float, str]], clip_duration: float, s
         c_start, c_end, c_text = cue[:3]
         a_sec = max(0.0, min(clip_duration, float(c_start)))
         b_sec = max(a_sec + 0.15, min(clip_duration, float(c_end)))
-        clean_lines = "\\n".join(
+        clean_lines = "\n".join(
             normalize_english_subtitle_text(ln)
             for ln in (c_text or "").splitlines()
             if normalize_english_subtitle_text(ln)
         )
         if not clean_lines:
             continue
-        blocks.append(f"{idx}\\n{fmt_srt_time(a_sec)} --> {fmt_srt_time(b_sec)}\\n{clean_lines}\\n")
+        blocks.append(f"{idx}\n{fmt_srt_time(a_sec)} --> {fmt_srt_time(b_sec)}\n{clean_lines}\n")
         idx += 1
 
-    srt_path.write_text("\\n".join(blocks), encoding="utf-8")
+    srt_path.write_text("\n".join(blocks), encoding="utf-8")
     return srt_path
 
 
@@ -1813,7 +1808,7 @@ def build_frame_stage_filter(
 
 def _ass_safe_text(value: str) -> str:
     clean = normalize_english_subtitle_text(value)
-    return clean.replace("{", "(").replace("}", ")").replace("\\\\", "")
+    return clean.replace("{", "(").replace("}", ")").replace("\\", "")
 
 
 def write_creator_ass_file(
@@ -1859,7 +1854,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         if end <= start:
             continue
 
-        safe_text = _ass_safe_text(str(cue_text or "").replace("\\\\N", " "))
+        safe_text = _ass_safe_text(str(cue_text or "").replace("\\N", " "))
         max_chars = max(16, min(30, int(out_w / max(1.0, font_px * 0.58))))
         wrapped_lines = wrap_text_lines(safe_text, max_chars=max_chars, max_lines=2)
         words_by_line = [line.split() for line in wrapped_lines if line.strip()]
@@ -1889,17 +1884,17 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 remaining -= duration_cs
                 duration_values.append(duration_cs)
 
-        karaoke_parts = [f"{{\\\\kf{duration_cs}}}{word}" for word, duration_cs in zip(words, duration_values)]
+        karaoke_parts = [f"{{\\kf{duration_cs}}}{word}" for word, duration_cs in zip(words, duration_values)]
         karaoke_lines = []
         word_cursor = 0
         for line_words in words_by_line:
             line_count = len(line_words)
             karaoke_lines.append(" ".join(karaoke_parts[word_cursor:word_cursor + line_count]))
             word_cursor += line_count
-        karaoke_text = r"\\\\N".join(karaoke_lines)
-        events.append(f"Dialogue: 0,{ass_time(start)},{ass_time(end)},Creator,,0,0,0,,{{\\\\an2\\\\q2}}{karaoke_text}")
+        karaoke_text = r"\N".join(karaoke_lines)
+        events.append(f"Dialogue: 0,{ass_time(start)},{ass_time(end)},Creator,,0,0,0,,{{\\an2\\q2}}{karaoke_text}")
 
-    output_path.write_text(header + "\\n".join(events) + "\\n", encoding="utf-8")
+    output_path.write_text(header + "\n".join(events) + "\n", encoding="utf-8")
     return output_path
 
 
@@ -1934,7 +1929,7 @@ def _drawtext_subtitle_filters(
             y_pos = max(24, base_y + line_idx * line_step)
             filters.append(
                 f"drawtext=textfile='{escaped}'{font_opt}:fontcolor=white:fontsize={sub_px}:"
-                f"x=max(24\\\\,(w-text_w)/2):y={y_pos}:"
+                f"x=max(24\,(w-text_w)/2):y={y_pos}:"
                 f"borderw=4:bordercolor=black@0.98:shadowcolor=black@0.75:shadowx=2:shadowy=2:"
                 f"enable='between(t,{c_a:.2f},{c_b:.2f})'"
             )
@@ -1982,7 +1977,7 @@ def append_overlays_and_subs(
             y_hook = top_y + (h_i * hook_step)
             hook_filters.append(
                 f"drawtext=textfile='{hook_file_esc}'{font_opt}:fontcolor=white:fontsize={hook_font_px}:"
-                f"x=max(24\\\\,(w-text_w)/2):y={y_hook}:"
+                f"x=max(24\,(w-text_w)/2):y={y_hook}:"
                 f"box=1:boxcolor=black@0.75:boxborderw=8:"
                 f"enable='between(t,0,{active_end:.2f})'"
             )
@@ -2193,14 +2188,6 @@ def render_stitched_clip(
     subtitle_accent_colour: str = "Creator Yellow",
     status_cb=None,
 ) -> str | None:
-    """
-    Unstuck two-stage stitcher:
-    1) Extracts & frames each moment individually into a normalized temp segment with
-       guaranteed stereo audio (using anullsrc if the source lacks audio), avoiding
-       giant filter_complex concat stalls and A/V drift.
-    2) Joins segments via FFmpeg concat demuxer, then burns optional hook/logo/ASS
-       and applies optional voiceover/mute in a clean final pass.
-    """
     if not source or not Path(source).exists():
         raise RuntimeError("Source video file is missing.")
     if not moments:
@@ -2261,7 +2248,7 @@ def render_stitched_clip(
         if status_cb:
             status_cb("Joining stitched segments...")
         list_lines = [f"file '{sf.resolve().as_posix().replace(chr(39), chr(39)+chr(92)+chr(39)+chr(39))}'" for sf in seg_files]
-        concat_list_path.write_text("\\n".join(list_lines) + "\\n", encoding="utf-8")
+        concat_list_path.write_text("\n".join(list_lines) + "\n", encoding="utf-8")
 
         join_res = run_cmd([
             "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-fflags", "+genpts",
@@ -2699,11 +2686,11 @@ if page == "Campaign & Auto-Clipper":
             extracted = []
             for bf in brief_files:
                 try:
-                    extracted.append(f"--- {bf.name} ---\\n{extract_document_text(bf)}")
+                    extracted.append(f"--- {bf.name} ---\n{extract_document_text(bf)}")
                 except Exception as exc:
                     st.warning(f"{bf.name}: {exc}")
             if extracted:
-                st.session_state.brief = (st.session_state.brief + "\\n\\n" + "\\n\\n".join(extracted)).strip()
+                st.session_state.brief = (st.session_state.brief + "\n\n" + "\n\n".join(extracted)).strip()
                 save_workspace_state(checkpoint_label="brief_extracted")
 
         st.text_area(
@@ -2981,7 +2968,7 @@ if page == "Campaign & Auto-Clipper":
             )
             st.info(
                 f"**{cand.get('title', f'Peak Stitch #{idx+1}')}** — Total: **{stitched_sec:.1f}s** (`{active_minutes:.2f} min`) · "
-                f"Fitted Hook: *{cand.get('hook', '')}*\\n\\nStitched spots: {chain_str}"
+                f"Fitted Hook: *{cand.get('hook', '')}*\n\nStitched spots: {chain_str}"
             )
 
         if st.button("⚡ Generate / Stitch Clips in Section 3", type="primary", width="stretch", key="wf_extract_clips_btn"):
@@ -3544,7 +3531,7 @@ if page == "Videos Extracted":
                         st.session_state.clips[idx]["facebook"] = fb_val
 
                     render_fast_voice_reader(
-                        f"YouTube: {cl.get('youtube', '')}\\nInstagram: {cl.get('instagram', '')}\\nFacebook: {cl.get('facebook', '')}".strip(),
+                        f"YouTube: {cl.get('youtube', '')}\nInstagram: {cl.get('instagram', '')}\nFacebook: {cl.get('facebook', '')}".strip(),
                         label=f"🔊 Fast Read Clip {idx+1} Copy",
                         uid=f"short_{idx}",
                     )
@@ -3640,82 +3627,3 @@ if page == "Videos Extracted":
                 label="🔊 Preview Voiceover Readout",
                 uid="stage6_s6_vo",
             )
-'''
-
-# Verify AST syntax cleanly
-ast.parse(updated_code)
-
-# Extract and run functional unit tests on the hook & copy functions
-ns = {"re": re, "json": json}
-exec('''
-HOOK_STOPWORDS = {
-    "about", "after", "again", "also", "been", "before", "being", "between",
-    "both", "could", "did", "does", "doing", "down", "during", "each", "even",
-    "from", "have", "here", "into", "just", "like", "make", "more", "most",
-    "much", "must", "need", "only", "other", "over", "really", "right", "same",
-    "should", "some", "such", "than", "that", "their", "them", "then", "there",
-    "these", "they", "this", "those", "through", "under", "very", "want", "well",
-    "what", "when", "where", "which", "while", "with", "would", "your",
-}
-HOOK_FILLER_STARTERS = {"and", "but", "so", "or", "um", "uh", "like", "well", "okay", "yeah", "alright"}
-''', ns)
-
-for fn_name in ("_extract_key_terms", "_extract_best_spoken_hook", "_extract_brief_hook", "pick_good_hook", "build_campaign_caption_context", "_build_grounded_fallback_copy"):
-    m = re.search(rf"(def {fn_name}\(.*?\n(?:    .*\n|\n)+)", updated_code)
-    exec(m.group(1), ns)
-
-# Run tests
-test_brief = """Launch solar backpack for commuters.
-Must include 20W fast charging test.
-Caption requirement: Mention @SolarPackOfficial and link in bio.
-#SolarCommute #TechGear"""
-test_analysis = {
-    "plain_english_summary": "Demonstrate the 20W solar backpack charging a laptop outdoors.",
-    "must_include": ["Show 20W fast charging test"],
-    "caption_requirements": ["Mention @SolarPackOfficial"],
-    "hashtags": ["#SolarCommute", "#TechGear"],
-}
-
-# Test 1: Spoken transcript with filler opener
-h1 = ns["pick_good_hook"](
-    "So um basically this 20W solar panel charged my phone in 18 minutes flat.",
-    brief=test_brief,
-    analysis=test_analysis,
-    clip_index=0,
-)
-# Test 2: Empty transcript -> brief hook
-h2 = ns["pick_good_hook"]("", brief=test_brief, analysis=test_analysis, clip_index=0)
-# Test 3: Clip index 2 blends brief angle
-h3 = ns["pick_good_hook"](
-    "So um basically this 20W solar panel charged my phone in 18 minutes flat.",
-    brief=test_brief,
-    analysis=test_analysis,
-    clip_index=2,
-)
-# Test 4: Grounded copy across styles
-copy_viral = ns["_build_grounded_fallback_copy"](
-    brief=test_brief,
-    analysis=test_analysis,
-    clip_info={"title": "Peak Stitch #1", "hook": h1, "moments": [{"start": 10.0, "end": 22.0}]},
-    transcript_text="This 20W solar panel charged my phone in 18 minutes flat.",
-    clip_index=0,
-    caption_style="Hook / Viral",
-)
-copy_cta = ns["_build_grounded_fallback_copy"](
-    brief=test_brief,
-    analysis=test_analysis,
-    clip_info={"title": "Peak Stitch #1", "hook": h1, "moments": [{"start": 10.0, "end": 22.0}]},
-    transcript_text="This 20W solar panel charged my phone in 18 minutes flat.",
-    clip_index=0,
-    caption_style="Campaign / CTA",
-)
-
-assert "basically this 20W solar panel" in h1 and len(h1) <= 44
-assert h2 == "Show 20W fast charging test"
-assert h3 == "Show 20W fast charging test"
-assert "#SolarCommute" in copy_viral["instagram"] and "20W solar panel" in copy_viral["youtube"]
-assert "@SolarPackOfficial" in copy_cta["instagram"]
-
-out_path = Path("app_2.py")
-out_path.write_text(updated_code, encoding="utf-8")
-print("ALL_TESTS_PASSED", len(updated_code))
