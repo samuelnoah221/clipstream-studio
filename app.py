@@ -68,6 +68,12 @@ FIT_MODES = [
     "Letterbox Fit",
 ]
 
+LOGO_WATERMARK_MODES = [
+    "Standard Corner (Subtle)",
+    "Standard Corner (First 8s)",
+    "Solid Corner",
+]
+
 CAPTION_STYLES = [
     "Hook / Viral",
     "Engaging / Story",
@@ -88,13 +94,13 @@ STATE_FIELDS = [
     "auto_clip_minutes", "used_clip_windows", "hook_mode_choice",
     "hook_banner_scope", "custom_hook_fallback", "force_custom_hook",
     "burn_subtitles_chk_v2", "subtitle_language", "onscreen_caption_size",
-    "subtitle_accent_colour", "vertical_fit_mode", "mute_original_audio",
-    "voiceover_source_mode", "voiceover_script_text", "voiceover_audio_path",
-    "voiceover_audio_name", "source_videos", "active_video_idx",
-    "source_video", "video_name", "video_info", "broken_parts",
-    "transcript", "full_srt_path", "full_srt_name", "full_srt_cues",
-    "auto_candidates", "clips", "logo_path", "logo_name",
-    "brand_name", "brand_colour", "caption_instructions",
+    "subtitle_accent_colour", "vertical_fit_mode", "logo_watermark_mode",
+    "mute_original_audio", "voiceover_source_mode", "voiceover_script_text",
+    "voiceover_audio_path", "voiceover_audio_name", "source_videos",
+    "active_video_idx", "source_video", "video_name", "video_info",
+    "broken_parts", "transcript", "full_srt_path", "full_srt_name",
+    "full_srt_cues", "auto_candidates", "clips", "logo_path",
+    "logo_name", "brand_name", "brand_colour", "caption_instructions",
 ]
 
 
@@ -318,6 +324,9 @@ def _collect_state_payload(checkpoint_label: str = "autosave") -> dict:
     fit_val = st.session_state.get("vertical_fit_mode", "Fit All (Full Frame + Ambient Blur)")
     if fit_val not in FIT_MODES:
         fit_val = "Fit All (Full Frame + Ambient Blur)"
+    wm_val = st.session_state.get("logo_watermark_mode", "Standard Corner (Subtle)")
+    if wm_val not in LOGO_WATERMARK_MODES:
+        wm_val = "Standard Corner (Subtle)"
 
     return {
         "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -342,6 +351,7 @@ def _collect_state_payload(checkpoint_label: str = "autosave") -> dict:
         "onscreen_caption_size": int(st.session_state.get("onscreen_caption_size", 32)),
         "subtitle_accent_colour": st.session_state.get("subtitle_accent_colour", "Creator Yellow"),
         "vertical_fit_mode": fit_val,
+        "logo_watermark_mode": wm_val,
         "mute_original_audio": bool(st.session_state.get("mute_original_audio", False)),
         "voiceover_source_mode": st.session_state.get("voiceover_source_mode", "Uploaded Voice Track"),
         "voiceover_script_text": st.session_state.get("voiceover_script_text", ""),
@@ -419,6 +429,8 @@ def apply_state_payload(data: dict) -> bool:
 
     if st.session_state.get("vertical_fit_mode") not in FIT_MODES:
         st.session_state["vertical_fit_mode"] = "Fit All (Full Frame + Ambient Blur)"
+    if st.session_state.get("logo_watermark_mode") not in LOGO_WATERMARK_MODES:
+        st.session_state["logo_watermark_mode"] = "Standard Corner (Subtle)"
 
     cnt = max(1, min(6, int(data.get("auto_clip_count", 2))))
     st.session_state["auto_clip_count"] = cnt
@@ -1189,10 +1201,14 @@ def heuristic_campaign_analysis(brief: str, project_name: str) -> dict:
     wants_video_hook = wants_8s_hook or any(
         k in low for k in ["hook", "opening hook", "visual hook", "hook through video"]
     )
+    wants_logo_watermark = any(k in low for k in ["watermark", "logo", "brand mark"])
+    wants_standard_watermark = wants_logo_watermark and (
+        "standard" in low or ("not everywhere" in low and "everywhere watermark" not in low)
+    )
 
     hashtags = sorted(set(re.findall(r"#[A-Za-z0-9_]+", brief)))[:10]
     lines = [ln.strip(" -•*\t") for ln in brief.splitlines() if ln.strip()]
-    must_include = [ln for ln in lines if any(w in ln.lower() for w in ["include", "must", "mention", "call to action", "cta", "show", "hook", "caption"])][:6]
+    must_include = [ln for ln in lines if any(w in ln.lower() for w in ["include", "must", "mention", "call to action", "cta", "show", "hook", "caption", "logo", "watermark"])][:6]
     prohibited = [ln for ln in lines if any(w in ln.lower() for w in ["avoid", "don't", "do not", "never", "prohibited", "no "])][:6]
     caption_reqs = [ln for ln in lines if any(w in ln.lower() for w in ["caption", "hashtag", "tag", "description", "link", "mention"])][:6]
 
@@ -1207,11 +1223,13 @@ def heuristic_campaign_analysis(brief: str, project_name: str) -> dict:
         "requires_onscreen_captions": wants_onscreen_captions,
         "requires_8s_hook": wants_8s_hook,
         "requires_video_hook": wants_video_hook,
+        "requires_logo_watermark": wants_logo_watermark,
+        "prefers_standard_watermark": wants_standard_watermark,
         "clip_length_seconds": {"min": 8 if wants_8s_hook else 15, "max": 60},
         "required_scenes_or_moments": must_include[:4],
         "must_include": must_include,
         "prohibited_content": prohibited,
-        "branding_requirements": ["Include brand logo/handle if specified in campaign brief"],
+        "branding_requirements": ["Standard corner logo watermark (not tiled/everywhere)" if wants_standard_watermark else "Include brand logo/handle if specified in campaign brief"],
         "caption_requirements": caption_reqs,
         "hashtags": hashtags,
         "links_and_submission_steps": [],
@@ -1235,6 +1253,7 @@ Return ONLY valid JSON with this schema:
 {
  "campaign_name": string, "plain_english_summary": string,
  "requires_onscreen_captions": boolean, "requires_8s_hook": boolean, "requires_video_hook": boolean,
+ "requires_logo_watermark": boolean, "prefers_standard_watermark": boolean,
  "deliverables": [string], "platforms": [string],
  "clip_length_seconds": {"min": number|null, "max": number|null},
  "required_scenes_or_moments": [string], "must_include": [string],
@@ -1257,6 +1276,8 @@ Do not invent requirements. If absent, use empty arrays/false/null. Distinguish 
     parsed.setdefault("requires_onscreen_captions", base_heur["requires_onscreen_captions"])
     parsed.setdefault("requires_8s_hook", base_heur["requires_8s_hook"])
     parsed.setdefault("requires_video_hook", base_heur["requires_video_hook"])
+    parsed.setdefault("requires_logo_watermark", base_heur["requires_logo_watermark"])
+    parsed.setdefault("prefers_standard_watermark", base_heur["prefers_standard_watermark"])
     parsed.setdefault("caption_requirements", base_heur["caption_requirements"])
     parsed.setdefault("hashtags", base_heur["hashtags"])
     return parsed
@@ -1274,6 +1295,9 @@ def evaluate_video_against_campaign(analysis: dict, video_info: dict, transcript
         strengths.append(f"{total_videos}/{MAX_SOURCE_VIDEOS} source videos loaded in workspace.")
     if dur > 0:
         strengths.append(f"Active video duration is {dur:.1f}s ({fmt_time(dur)}) at {w}x{h} — clean 9:16 fit + multi-moment stitch ready.")
+    if analysis.get("requires_logo_watermark"):
+        wm_style = st.session_state.get("logo_watermark_mode", "Standard Corner (Subtle)")
+        strengths.append(f"Logo watermark requirement detected → set to '{wm_style}' (standard corner, not everywhere).")
     if not video_info.get("has_audio", True):
         gaps.append("No audio stream detected in source video—silent stereo track will be synthesized automatically.")
     if analysis.get("caption_requirements") or analysis.get("hashtags"):
@@ -2125,6 +2149,7 @@ def append_overlays_and_subs(
     ascii_only: bool = False,
     use_ass: bool = True,
     subtitle_accent_colour: str = "Creator Yellow",
+    logo_watermark_mode: str = "Standard Corner (Subtle)",
 ) -> tuple[str, str | None]:
     current = current_label
     srt_file: Path | None = None
@@ -2158,10 +2183,26 @@ def append_overlays_and_subs(
         current = "vhook"
 
     if logo and Path(logo).exists() and logo_input_idx is not None:
-        graph += [
-            f"[{logo_input_idx}:v]scale=iw*0.12:-1:flags=bilinear[logo]",
-            f"[{current}][logo]overlay=W-w-20:20:format=auto[vlogo]",
-        ]
+        wm_mode = logo_watermark_mode if logo_watermark_mode in LOGO_WATERMARK_MODES else "Standard Corner (Subtle)"
+        if wm_mode == "Solid Corner":
+            graph.append(f"[{logo_input_idx}:v]scale=iw*0.12:-1:flags=bilinear[logo]")
+            graph.append(f"[{current}][logo]overlay=W-w-20:20:format=auto[vlogo]")
+        elif wm_mode == "Standard Corner (First 8s)":
+            wm_end = min(max(1.0, float(clip_duration)), 8.0)
+            graph.append(
+                f"[{logo_input_idx}:v]scale=iw*0.12:-1:flags=bilinear,"
+                f"format=rgba,colorchannelmixer=aa=0.78[logo]"
+            )
+            graph.append(
+                f"[{current}][logo]overlay=W-w-20:20:format=auto:enable='between(t,0,{wm_end:.2f})'[vlogo]"
+            )
+        else:
+            # Standard Corner (Subtle): clean standard watermark in corner, not tiled/everywhere
+            graph.append(
+                f"[{logo_input_idx}:v]scale=iw*0.12:-1:flags=bilinear,"
+                f"format=rgba,colorchannelmixer=aa=0.78[logo]"
+            )
+            graph.append(f"[{current}][logo]overlay=W-w-20:20:format=auto[vlogo]")
         current = "vlogo"
 
     if cues:
@@ -2261,6 +2302,7 @@ def render_video(
     mute_original: bool = False,
     voiceover_path: str | None = None,
     subtitle_accent_colour: str = "Creator Yellow",
+    logo_watermark_mode: str = "Standard Corner (Subtle)",
 ) -> str | None:
     if not source or not Path(source).exists():
         raise RuntimeError("Source video file is missing.")
@@ -2306,6 +2348,7 @@ def render_video(
                 ascii_only=ascii_flag,
                 use_ass=ass_mode,
                 subtitle_accent_colour=subtitle_accent_colour,
+                logo_watermark_mode=logo_watermark_mode,
             )
 
             a_label, custom_audio = build_audio_stage(
@@ -2365,6 +2408,7 @@ def render_stitched_clip(
     mute_original: bool = False,
     voiceover_path: str | None = None,
     subtitle_accent_colour: str = "Creator Yellow",
+    logo_watermark_mode: str = "Standard Corner (Subtle)",
     status_cb=None,
 ) -> str | None:
     if not source or not Path(source).exists():
@@ -2492,6 +2536,7 @@ def render_stitched_clip(
                     ascii_only=ascii_flag,
                     use_ass=ass_mode,
                     subtitle_accent_colour=subtitle_accent_colour,
+                    logo_watermark_mode=logo_watermark_mode,
                 )
                 a_label, custom_audio = build_audio_stage(
                     graph=graph,
@@ -2662,6 +2707,7 @@ def init_state():
         "onscreen_caption_size": 32,
         "subtitle_accent_colour": "Creator Yellow",
         "vertical_fit_mode": "Fit All (Full Frame + Ambient Blur)",
+        "logo_watermark_mode": "Standard Corner (Subtle)",
         "mute_original_audio": False,
         "voiceover_source_mode": "Uploaded Voice Track",
         "voiceover_script_text": "",
@@ -2693,6 +2739,8 @@ def init_state():
 
     if st.session_state.get("vertical_fit_mode") not in FIT_MODES:
         st.session_state["vertical_fit_mode"] = "Fit All (Full Frame + Ambient Blur)"
+    if st.session_state.get("logo_watermark_mode") not in LOGO_WATERMARK_MODES:
+        st.session_state["logo_watermark_mode"] = "Standard Corner (Subtle)"
 
     if not st.session_state.get("workspace_loaded_once"):
         st.session_state["workspace_loaded_once"] = True
@@ -2703,13 +2751,13 @@ init_state()
 
 # ----------------------------- HEADER & NAV -----------------------------
 st.markdown(f"""<div class="hero">
-<div style="color:#a5b4fc;font-weight:750;font-size:.76rem;letter-spacing:.13em">UP TO {MAX_SOURCE_VIDEOS} VIDEOS · RESILIENT TWO-STAGE STITCH · ATOMIC CHECKPOINTS · MULTI-PLATFORM COPY</div>
+<div style="color:#a5b4fc;font-weight:750;font-size:.76rem;letter-spacing:.13em">UP TO {MAX_SOURCE_VIDEOS} VIDEOS · STANDARD CORNER WATERMARK · RESILIENT TWO-STAGE STITCH · MULTI-PLATFORM COPY</div>
 <h1>🎬 {APP_NAME}</h1>
-<p class="muted">Add up to {MAX_SOURCE_VIDEOS} campaign videos, switch or split any of them, stitch peak clips in Section 3, download or write multi-style captions in Section 4, and burn subtitles or add voiceover in Sections 5–6.</p>
+<p class="muted">Add up to {MAX_SOURCE_VIDEOS} campaign videos, apply a standard corner logo watermark (not tiled/everywhere), stitch peak clips in Section 3, and download or generate captions in Section 4.</p>
 <span class="pill">Up to {MAX_SOURCE_VIDEOS} Source Videos</span>
+<span class="pill">Standard Corner Watermark</span>
 <span class="pill">Unstuck 2-Pass Stitch</span>
 <span class="pill">No-Audio Stream Safe</span>
-<span class="pill">Section 4–6 Ready</span>
 </div>""", unsafe_allow_html=True)
 
 if not ffmpeg_ready():
@@ -2943,7 +2991,7 @@ if page == "Campaign & Auto-Clipper":
             "Paste campaign requirements",
             key="brief",
             height=175,
-            placeholder="Example: Post across YouTube Shorts, Instagram Reels & Facebook. Stitch peak moments, fit 9:16 cleanly, optional English burn-in subtitles, voiceover.",
+            placeholder="Example: Post across YouTube Shorts, Instagram Reels & Facebook. Use standard corner logo watermark (not everywhere), stitch peak moments, fit 9:16 cleanly.",
         )
 
         p_col, c_col, min_col = st.columns(3)
@@ -2990,6 +3038,12 @@ if page == "Campaign & Auto-Clipper":
             key="hook_banner_scope",
         )
 
+        st.selectbox(
+            "Logo watermark style (standard corner, not everywhere)",
+            LOGO_WATERMARK_MODES,
+            key="logo_watermark_mode",
+        )
+
         hk_c1, hk_c2 = st.columns([1.6, 1.0])
         with hk_c1:
             st.text_input(
@@ -3018,6 +3072,9 @@ if page == "Campaign & Auto-Clipper":
                             st.session_state["pending_hook_banner_scope"] = "8-Second Top Banner (0–8s)"
                         elif analysis.get("requires_video_hook"):
                             st.session_state["pending_hook_banner_scope"] = "Full Clip Top Banner"
+
+                        if analysis.get("prefers_standard_watermark") and st.session_state.get("logo_watermark_mode") == "Solid Corner":
+                            st.session_state["logo_watermark_mode"] = "Standard Corner (Subtle)"
 
                         if st.session_state.source_video and st.session_state.video_info and Path(st.session_state.source_video).exists():
                             tr = st.session_state.transcript
@@ -3197,7 +3254,7 @@ if page == "Campaign & Auto-Clipper":
         st.caption(
             f"Source: **{st.session_state.video_name or 'Active Video'}** · "
             f"Each clip stitches peak sub-moments summing to **{active_minutes:.2f} min ({exact_target_sec:.1f}s)** · "
-            f"Aspect: **{default_asp}**."
+            f"Aspect: **{default_asp}** · Watermark: **{st.session_state.get('logo_watermark_mode', 'Standard Corner (Subtle)')}**."
         )
 
         cands = st.session_state.auto_candidates or build_auto_clip_candidates(
@@ -3282,6 +3339,7 @@ if page == "Campaign & Auto-Clipper":
             rendered_now: list[dict] = []
             failed_msgs: list[str] = []
             banner_dur = 8.0 if st.session_state.hook_banner_scope.startswith("8-Second") else 9999.0
+            wm_mode_now = st.session_state.get("logo_watermark_mode", "Standard Corner (Subtle)")
             render_prog = st.progress(0, text=f"Generating clips in Section 3: 0/{len(cands)}")
             status_slot = st.empty()
             cap_font = int(st.session_state.get("onscreen_caption_size", 32))
@@ -3350,6 +3408,7 @@ if page == "Campaign & Auto-Clipper":
                         mute_original=bool(st.session_state.get("mute_original_audio", False)),
                         voiceover_path=active_vo_path,
                         subtitle_accent_colour=st.session_state.get("subtitle_accent_colour", "Creator Yellow"),
+                        logo_watermark_mode=wm_mode_now,
                         status_cb=_on_stage_msg,
                     )
 
@@ -3366,6 +3425,7 @@ if page == "Campaign & Auto-Clipper":
                         "end": round(float(moments[0]["start"]) + stitched_sec, 1),
                         "aspect": default_asp,
                         "fit_mode": fit_mode,
+                        "logo_watermark_mode": wm_mode_now,
                         "muted": bool(st.session_state.get("mute_original_audio", False)),
                         "subtitles_burned_en": bool(use_subs_now and saved_srt),
                         "hook": final_hook,
@@ -3508,7 +3568,8 @@ elif page == "Manual Clipper (Start → End)":
             fit_mode_ed = st.selectbox("9:16 Frame Fit", FIT_MODES, key="ed_fit_mode")
             resolution = st.selectbox("Output Resolution", ["720p HD", "1080p Full HD", "4K Ultra Sharp", "Match Source (Zero Resize Loss)"], key="ed_resolution")
             crf = st.slider("Quality CRF (18–26, 22 = fast & crisp)", 18, 26, 22, key="ed_crf")
-            add_logo = st.checkbox("Include saved brand logo", value=bool(st.session_state.logo_path), key="ed_add_logo")
+            add_logo = st.checkbox("Include standard corner logo watermark", value=bool(st.session_state.logo_path), key="ed_add_logo")
+            wm_mode_ed = st.selectbox("Logo watermark style", LOGO_WATERMARK_MODES, key="logo_watermark_mode")
             add_sub = st.checkbox("Use full-video SRT on this clip (Optional)", value=bool(st.session_state.get("full_srt_cues")), key="ed_add_sub")
             mute_ed = st.checkbox("Stage 6: Mute original video audio", value=bool(st.session_state.get("mute_original_audio", False)), key="ed_mute_orig")
 
@@ -3572,6 +3633,7 @@ elif page == "Manual Clipper (Start → End)":
                             mute_original=bool(mute_ed),
                             voiceover_path=vo_ed_path if (vo_ed_path and Path(vo_ed_path).exists()) else None,
                             subtitle_accent_colour=st.session_state.get("subtitle_accent_colour", "Creator Yellow"),
+                            logo_watermark_mode=wm_mode_ed,
                         )
                     st.session_state.used_clip_windows.append([round(start, 1), round(end, 1)])
                     c_meta = {
@@ -3584,6 +3646,7 @@ elif page == "Manual Clipper (Start → End)":
                         "source_offset": float(src_offset_ed),
                         "aspect": aspect,
                         "fit_mode": fit_mode_ed,
+                        "logo_watermark_mode": wm_mode_ed if add_logo else "None",
                         "muted": bool(mute_ed),
                         "subtitles_burned_en": bool(add_sub and saved_srt),
                         "hook": final_hook,
@@ -3652,7 +3715,8 @@ elif page == "Brand Kit & Settings":
             st.error(f"Could not import state: {exc}")
 
     st.divider()
-    st.markdown("### Brand Kit")
+    st.markdown("### Brand Kit & Standard Logo Watermark")
+    st.caption("Upload a logo once to use as a clean **standard corner watermark** (not tiled/everywhere across the frame).")
     logo = st.file_uploader("Upload brand logo (PNG/JPG/WEBP)", type=["png", "jpg", "jpeg", "webp"], key="bk_logo_up")
     if logo and st.button("Save Logo", key="bk_save_logo"):
         st.session_state.logo_path = str(save_upload(logo))
@@ -3662,6 +3726,7 @@ elif page == "Brand Kit & Settings":
     if st.session_state.logo_path and Path(st.session_state.logo_path).exists():
         st.image(st.session_state.logo_path, caption=st.session_state.logo_name or "Brand Logo", width=200)
 
+    st.selectbox("Default Logo Watermark Mode", LOGO_WATERMARK_MODES, key="logo_watermark_mode")
     st.text_input("Brand Name", key="brand_name")
     st.text_input("Brand Accent Colour", key="brand_colour")
 
@@ -3719,8 +3784,6 @@ if page == "Videos Extracted":
             if st.button("🗑️ Clear All Clips", key="clear_all_clips_btn", width="stretch"):
                 clear_rendered_clips_only()
                 st.rerun()
-
-        burn_notice_slot = st.empty()
 
         for idx, cl in enumerate(st.session_state.clips):
             with st.container(border=True):
