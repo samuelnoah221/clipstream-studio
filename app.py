@@ -3564,7 +3564,7 @@ if page == "Campaign & Auto-Clipper":
                         allow_overlap=bool(st.session_state.get("allow_overlap_windows", False)),
                         analysis=st.session_state.get("brief_analysis"),
                         custom_hook=str(st.session_state.get("custom_hook_fallback") or ""),
-                        force_custom=bool(st.session_state.get("force_custom_hook", False)),
+                        force_custom_hook=bool(st.session_state.get("force_custom_hook", False)),
                         source_label=str(st.session_state.get("video_name") or "Video"),
                     )
                     st.session_state["go_ahead_clips"] = True
