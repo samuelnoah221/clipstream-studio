@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import gc
-import hashlib
 import html
 import io
 import json
@@ -22,6 +21,7 @@ import streamlit.components.v1 as components
 
 APP_NAME = "ClipStream Studio"
 MAX_UPLOAD_MB = 2048
+MAX_SOURCE_VIDEOS = 3
 WORK_DIR = Path(tempfile.gettempdir()) / "clipstream_studio"
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 WORKSPACES_ROOT = WORK_DIR / "workspaces"
@@ -86,12 +86,13 @@ STATE_FIELDS = [
     "project_name", "brief", "brief_analysis", "campaign_feedback",
     "go_ahead_clips", "target_platform_choice", "desired_clip_minutes",
     "auto_clip_minutes", "used_clip_windows", "hook_mode_choice",
-    "hook_banner_scope", "custom_hook_fallback", "force_custom_hook", "burn_subtitles_chk_v2", "subtitle_language",
-    "onscreen_caption_size", "subtitle_accent_colour", "vertical_fit_mode",
-    "mute_original_audio", "voiceover_source_mode", "voiceover_script_text",
-    "voiceover_audio_path", "voiceover_audio_name", "source_video",
-    "video_name", "video_info", "broken_parts", "transcript",
-    "full_srt_path", "full_srt_name", "full_srt_cues",
+    "hook_banner_scope", "custom_hook_fallback", "force_custom_hook",
+    "burn_subtitles_chk_v2", "subtitle_language", "onscreen_caption_size",
+    "subtitle_accent_colour", "vertical_fit_mode", "mute_original_audio",
+    "voiceover_source_mode", "voiceover_script_text", "voiceover_audio_path",
+    "voiceover_audio_name", "source_videos", "active_video_idx",
+    "source_video", "video_name", "video_info", "broken_parts",
+    "transcript", "full_srt_path", "full_srt_name", "full_srt_cues",
     "auto_candidates", "clips", "logo_path", "logo_name",
     "brand_name", "brand_colour", "caption_instructions",
 ]
@@ -127,7 +128,7 @@ def free_disk_mb(path: Path = WORK_DIR) -> float:
 
 
 def fmt_time(seconds: float) -> str:
-    return str(timedelta(seconds=max(0, int(round(seconds)))))
+    return str(timedelta(seconds=max(0, int(round(float(seconds or 0))))))
 
 
 def fmt_srt_time(seconds: float) -> str:
@@ -196,6 +197,106 @@ def build_zip_bytes(items: list[tuple[str, str]], manifest_text: str | None = No
     return buf.getvalue()
 
 
+# ----------------------------- MULTI-VIDEO SYNC HELPERS ---------------
+def _make_video_slot(
+    name: str,
+    path: str,
+    info: dict,
+    slot_id: str | None = None,
+) -> dict:
+    return {
+        "id": slot_id or f"vid_{uuid.uuid4().hex[:8]}",
+        "name": name,
+        "path": path,
+        "info": info,
+        "broken_parts": [],
+        "transcript": None,
+        "full_srt_path": None,
+        "full_srt_name": None,
+        "full_srt_cues": [],
+        "used_clip_windows": [],
+        "auto_candidates": [],
+    }
+
+
+def sync_active_video_to_legacy_keys() -> None:
+    slots: list[dict] = list(st.session_state.get("source_videos") or [])
+    if not slots:
+        st.session_state["active_video_idx"] = 0
+        st.session_state["source_video"] = None
+        st.session_state["video_name"] = None
+        st.session_state["video_info"] = None
+        st.session_state["broken_parts"] = []
+        st.session_state["transcript"] = None
+        st.session_state["full_srt_path"] = None
+        st.session_state["full_srt_name"] = None
+        st.session_state["full_srt_cues"] = []
+        st.session_state["used_clip_windows"] = []
+        st.session_state["auto_candidates"] = []
+        return
+
+    idx = max(0, min(len(slots) - 1, int(st.session_state.get("active_video_idx", 0) or 0)))
+    st.session_state["active_video_idx"] = idx
+    cur = slots[idx]
+    st.session_state["source_video"] = cur.get("path")
+    st.session_state["video_name"] = cur.get("name")
+    st.session_state["video_info"] = cur.get("info")
+    st.session_state["broken_parts"] = list(cur.get("broken_parts") or [])
+    st.session_state["transcript"] = cur.get("transcript")
+    st.session_state["full_srt_path"] = cur.get("full_srt_path")
+    st.session_state["full_srt_name"] = cur.get("full_srt_name")
+    st.session_state["full_srt_cues"] = list(cur.get("full_srt_cues") or [])
+    st.session_state["used_clip_windows"] = list(cur.get("used_clip_windows") or [])
+    st.session_state["auto_candidates"] = list(cur.get("auto_candidates") or [])
+
+
+def sync_legacy_keys_to_active_video() -> None:
+    slots: list[dict] = list(st.session_state.get("source_videos") or [])
+    if not slots:
+        return
+    idx = max(0, min(len(slots) - 1, int(st.session_state.get("active_video_idx", 0) or 0)))
+    cur = dict(slots[idx])
+    if st.session_state.get("source_video"):
+        cur["path"] = st.session_state.get("source_video")
+    if st.session_state.get("video_name"):
+        cur["name"] = st.session_state.get("video_name")
+    if st.session_state.get("video_info") is not None:
+        cur["info"] = st.session_state.get("video_info")
+    cur["broken_parts"] = list(st.session_state.get("broken_parts") or [])
+    cur["transcript"] = st.session_state.get("transcript")
+    cur["full_srt_path"] = st.session_state.get("full_srt_path")
+    cur["full_srt_name"] = st.session_state.get("full_srt_name")
+    cur["full_srt_cues"] = list(st.session_state.get("full_srt_cues") or [])
+    cur["used_clip_windows"] = list(st.session_state.get("used_clip_windows") or [])
+    cur["auto_candidates"] = list(st.session_state.get("auto_candidates") or [])
+    slots[idx] = cur
+    st.session_state["source_videos"] = slots
+
+
+def set_active_video_index(new_idx: int) -> None:
+    sync_legacy_keys_to_active_video()
+    slots: list[dict] = list(st.session_state.get("source_videos") or [])
+    if not slots:
+        return
+    st.session_state["active_video_idx"] = max(0, min(len(slots) - 1, int(new_idx)))
+    sync_active_video_to_legacy_keys()
+
+
+def remove_video_slot(rem_idx: int) -> None:
+    slots: list[dict] = list(st.session_state.get("source_videos") or [])
+    if 0 <= rem_idx < len(slots):
+        removed = slots.pop(rem_idx)
+        p = removed.get("path")
+        if p and Path(p).exists():
+            Path(p).unlink(missing_ok=True)
+        for bp in removed.get("broken_parts") or []:
+            if bp.get("path") and Path(bp["path"]).exists():
+                Path(bp["path"]).unlink(missing_ok=True)
+    st.session_state["source_videos"] = slots
+    st.session_state["active_video_idx"] = max(0, min(len(slots) - 1, int(st.session_state.get("active_video_idx", 0) or 0)))
+    sync_active_video_to_legacy_keys()
+
+
 # ----------------------------- WORKSPACE & SNAPSHOT SAVE/LOAD ---------
 def workspace_dir(ws_key: str) -> Path:
     d = WORKSPACES_ROOT / safe_name(ws_key)
@@ -212,6 +313,7 @@ def _atomic_write_json(target: Path, payload: dict) -> Path:
 
 
 def _collect_state_payload(checkpoint_label: str = "autosave") -> dict:
+    sync_legacy_keys_to_active_video()
     key = st.session_state.get("workspace_key") or "default_session"
     fit_val = st.session_state.get("vertical_fit_mode", "Fit All (Full Frame + Ambient Blur)")
     if fit_val not in FIT_MODES:
@@ -245,6 +347,8 @@ def _collect_state_payload(checkpoint_label: str = "autosave") -> dict:
         "voiceover_script_text": st.session_state.get("voiceover_script_text", ""),
         "voiceover_audio_path": st.session_state.get("voiceover_audio_path"),
         "voiceover_audio_name": st.session_state.get("voiceover_audio_name"),
+        "source_videos": list(st.session_state.get("source_videos") or []),
+        "active_video_idx": int(st.session_state.get("active_video_idx", 0) or 0),
         "source_video": st.session_state.get("source_video"),
         "video_name": st.session_state.get("video_name"),
         "video_info": st.session_state.get("video_info"),
@@ -318,11 +422,42 @@ def apply_state_payload(data: dict) -> bool:
 
     cnt = max(1, min(6, int(data.get("auto_clip_count", 2))))
     st.session_state["auto_clip_count"] = cnt
-    st.session_state["auto_clip_count_top"] = cnt
-    st.session_state["auto_clip_count_step3"] = cnt
 
-    for path_key in ("source_video", "voiceover_audio_path", "logo_path", "full_srt_path"):
-        pv = data.get(path_key)
+    valid_slots: list[dict] = []
+    for sl in data.get("source_videos") or []:
+        if isinstance(sl, dict) and sl.get("path") and Path(sl["path"]).exists():
+            valid_parts = [
+                bp for bp in (sl.get("broken_parts") or [])
+                if isinstance(bp, dict) and bp.get("path") and Path(bp["path"]).exists()
+            ]
+            sl_copy = dict(sl)
+            sl_copy["broken_parts"] = valid_parts
+            valid_slots.append(sl_copy)
+
+    if not valid_slots and data.get("source_video") and Path(data["source_video"]).exists():
+        valid_slots.append({
+            "id": f"vid_{uuid.uuid4().hex[:8]}",
+            "name": data.get("video_name") or Path(data["source_video"]).name,
+            "path": data["source_video"],
+            "info": data.get("video_info") or {},
+            "broken_parts": [
+                bp for bp in (data.get("broken_parts") or [])
+                if isinstance(bp, dict) and bp.get("path") and Path(bp["path"]).exists()
+            ],
+            "transcript": data.get("transcript"),
+            "full_srt_path": data.get("full_srt_path") if data.get("full_srt_path") and Path(data["full_srt_path"]).exists() else None,
+            "full_srt_name": data.get("full_srt_name"),
+            "full_srt_cues": data.get("full_srt_cues") or [],
+            "used_clip_windows": data.get("used_clip_windows") or [],
+            "auto_candidates": data.get("auto_candidates") or [],
+        })
+
+    st.session_state["source_videos"] = valid_slots[:MAX_SOURCE_VIDEOS]
+    st.session_state["active_video_idx"] = max(0, min(max(0, len(st.session_state["source_videos"]) - 1), int(data.get("active_video_idx", 0) or 0)))
+    sync_active_video_to_legacy_keys()
+
+    for path_key in ("voiceover_audio_path", "logo_path", "full_srt_path"):
+        pv = st.session_state.get(path_key)
         st.session_state[path_key] = pv if (pv and Path(pv).exists()) else None
 
     valid_clips = []
@@ -347,7 +482,7 @@ def load_state_from_file(json_file: Path) -> bool:
 
 def clear_rendered_clips_only() -> None:
     for cl in st.session_state.get("clips") or []:
-        for k_f in ("path", "srt_path", "ass_path"):
+        for k_f in ("path", "srt_path", "ass_path", "external_srt_path"):
             fp = cl.get(k_f)
             if fp:
                 Path(fp).unlink(missing_ok=True)
@@ -365,6 +500,8 @@ def clear_workspace_data(ws_key: str, reset_session: bool = True) -> None:
         st.session_state["brief_analysis"] = None
         st.session_state["campaign_feedback"] = None
         st.session_state["go_ahead_clips"] = False
+        st.session_state["source_videos"] = []
+        st.session_state["active_video_idx"] = 0
         st.session_state["used_clip_windows"] = []
         st.session_state["source_video"] = None
         st.session_state["video_name"] = None
@@ -391,13 +528,13 @@ def attach_uploader_percentage_bar(max_mb: int = 2048):
         f"""
         <div id="cs_pct_box" style="font-family:system-ui,-apple-system,sans-serif;background:#151b29;border:1px solid #2b354b;border-radius:12px;padding:11px 13px;color:#f4f5fa;">
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;font-size:13px;">
-            <span id="cs_pct_lbl">Waiting for file selection in uploader below...</span>
+            <span id="cs_pct_lbl">Waiting for video file selection (up to {MAX_SOURCE_VIDEOS} videos)...</span>
             <strong id="cs_pct_val" style="color:#a5b4fc;">0%</strong>
           </div>
           <div style="width:100%;height:9px;background:#090c13;border-radius:999px;overflow:hidden;border:1px solid #293449;">
             <div id="cs_pct_fill" style="width:0%;height:100%;background:linear-gradient(90deg,#6366f1,#22c55e);transition:width 0.1s ease;"></div>
           </div>
-          <div id="cs_pct_meta" style="margin-top:5px;font-size:12px;color:#94a3b8;">Max size: {max_mb} MB</div>
+          <div id="cs_pct_meta" style="margin-top:5px;font-size:12px;color:#94a3b8;">Max size per file: {max_mb} MB · Up to {MAX_SOURCE_VIDEOS} videos</div>
         </div>
         <script>
           (function() {{
@@ -427,7 +564,7 @@ def attach_uploader_percentage_bar(max_mb: int = 2048):
                 if (offset >= scanLimit) {{
                   fill.style.width = "100%";
                   val.textContent = "100%";
-                  meta.textContent = totalMb + " MB ready — click Load Video";
+                  meta.textContent = totalMb + " MB ready — click Load Video(s)";
                   lbl.textContent = "Selected: " + file.name;
                   return;
                 }}
@@ -480,14 +617,15 @@ def save_upload(uploaded, suffix: str | None = None, show_progress: bool = False
     ws_dir = workspace_dir(st.session_state.get("workspace_key", "default"))
     ext = suffix or Path(uploaded.name).suffix.lower() or ".bin"
     path = ws_dir / f"{next(tempfile._get_candidate_names())}_{int(time.time())}{ext}"
-    total_bytes = max(1, int(getattr(uploaded, "size", 0) or 0))
+    raw_size = int(getattr(uploaded, "size", 0) or 0)
     avail_mb = free_disk_mb(ws_dir)
-    if avail_mb >= 0 and (total_bytes / (1024 * 1024)) > (avail_mb - 150):
-        raise RuntimeError(f"Not enough disk space ({avail_mb} MB free) to safely save {total_bytes / (1024*1024):.1f} MB.")
+    if raw_size > 0 and avail_mb >= 0 and (raw_size / (1024 * 1024)) > (avail_mb - 150):
+        raise RuntimeError(f"Not enough disk space ({avail_mb} MB free) to safely save {raw_size / (1024*1024):.1f} MB.")
 
     written = 0
     chunk_size = 16 * 1024 * 1024
     last_pct = -5
+    denom = max(1, raw_size)
 
     bar = st.progress(0, text="Loading file to disk: 0%") if show_progress else None
     uploaded.seek(0)
@@ -498,12 +636,12 @@ def save_upload(uploaded, suffix: str | None = None, show_progress: bool = False
                 break
             handle.write(chunk)
             written += len(chunk)
-            pct = min(100, int((written / total_bytes) * 100))
+            pct = min(100, int((written / denom) * 100)) if raw_size > 0 else 50
             if bar is not None and (pct >= last_pct + 5 or pct == 100):
                 last_pct = pct
                 bar.progress(
                     pct,
-                    text=f"Loading file to disk: {pct}% ({written / (1024*1024):.1f} / {total_bytes / (1024*1024):.1f} MB)",
+                    text=f"Loading file to disk: {pct}% ({written / (1024*1024):.1f} MB)",
                 )
     if bar is not None:
         bar.progress(100, text="File loaded to disk: 100%")
@@ -737,7 +875,10 @@ def render_fast_voice_reader(text: str, label: str = "🔊 Fast Readout (Zero Da
 
 # ----------------------------- AUTO-CLIPPING & GROUNDED HOOK HELPERS --
 def overlaps_used(start: float, end: float, used_windows: list[list[float]], min_gap: float = 2.0) -> bool:
-    for u_start, u_end in used_windows:
+    for win in used_windows or []:
+        if not isinstance(win, (list, tuple)) or len(win) < 2:
+            continue
+        u_start, u_end = float(win[0]), float(win[1])
         if start < (u_end + min_gap) and end > (u_start - min_gap):
             return True
     return False
@@ -869,10 +1010,6 @@ def pick_good_hook(
     custom_hook: str = "",
     force_custom: bool = False,
 ) -> str:
-    """
-    Pick a hook grounded in the clip's spoken transcript first, then the campaign brief/analysis.
-    Uses user's custom hook when forced or whenever auto-detection cannot find a strong hook.
-    """
     clean_custom = normalize_english_subtitle_text(custom_hook)[:48]
     if force_custom and clean_custom:
         return clean_custom
@@ -918,7 +1055,7 @@ def build_stitched_peak_moments(
     rng.shuffle(base_fracs)
 
     moments: list[dict] = []
-    combined_used = list(used_windows)
+    combined_used = list(used_windows or [])
 
     for idx, p_dur in enumerate(part_durs):
         max_s = max_start_for_each[idx]
@@ -975,13 +1112,14 @@ def build_auto_clip_candidates(
     analysis: dict | None = None,
     custom_hook: str = "",
     force_custom_hook: bool = False,
+    source_label: str = "",
 ) -> list[dict]:
     count = max(1, min(6, int(clip_count)))
     results: list[dict] = []
-    combined_used = list(used_windows)
+    combined_used = list(used_windows or [])
 
     for idx in range(count):
-        pick_num = len(used_windows) + idx + 1
+        pick_num = len(used_windows or []) + idx + 1
         moments = build_stitched_peak_moments(
             duration=duration,
             desired_minutes=desired_minutes,
@@ -1004,9 +1142,11 @@ def build_auto_clip_candidates(
             custom_hook=custom_hook,
             force_custom=force_custom_hook,
         )
+        prefix = f"[{source_label}] " if source_label else ""
 
         results.append({
-            "title": f"Peak Stitch #{pick_num} ({len(moments)} moments)",
+            "title": f"{prefix}Peak Stitch #{pick_num} ({len(moments)} moments)",
+            "source_video_name": source_label,
             "moments": moments,
             "start": moments[0]["start"] if moments else 0.0,
             "end": moments[-1]["end"] if moments else stitched_dur,
@@ -1122,7 +1262,7 @@ Do not invent requirements. If absent, use empty arrays/false/null. Distinguish 
     return parsed
 
 
-def evaluate_video_against_campaign(analysis: dict, video_info: dict, transcript: dict | None) -> dict:
+def evaluate_video_against_campaign(analysis: dict, video_info: dict, transcript: dict | None, total_videos: int = 1) -> dict:
     strengths = []
     gaps = []
     warnings = list(analysis.get("prohibited_content", []) or [])
@@ -1130,8 +1270,10 @@ def evaluate_video_against_campaign(analysis: dict, video_info: dict, transcript
     dur = float(video_info.get("duration", 0) or 0)
     w = int(video_info.get("width", 0) or 0)
     h = int(video_info.get("height", 0) or 0)
+    if total_videos > 1:
+        strengths.append(f"{total_videos}/{MAX_SOURCE_VIDEOS} source videos loaded in workspace.")
     if dur > 0:
-        strengths.append(f"Video duration is {dur:.1f}s ({fmt_time(dur)}) at {w}x{h} — clean 9:16 fit + multi-moment stitch ready.")
+        strengths.append(f"Active video duration is {dur:.1f}s ({fmt_time(dur)}) at {w}x{h} — clean 9:16 fit + multi-moment stitch ready.")
     if not video_info.get("has_audio", True):
         gaps.append("No audio stream detected in source video—silent stereo track will be synthesized automatically.")
     if analysis.get("caption_requirements") or analysis.get("hashtags"):
@@ -1174,8 +1316,8 @@ def extract_audio(video_path: str) -> Path:
     p = run_cmd([
         "ffmpeg", "-y", "-i", video_path, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "48k", str(audio_path),
     ], timeout=600)
-    if p.returncode:
-        raise RuntimeError(p.stderr[-1800:] or "Audio extraction failed.")
+    if p.returncode or not audio_path.exists() or audio_path.stat().st_size == 0:
+        raise RuntimeError(p.stderr[-1800:] or "Audio extraction failed or source has no audio.")
     if audio_path.stat().st_size > 24 * 1024 * 1024:
         raise RuntimeError("Extracted audio exceeds the transcription API file limit.")
     return audio_path
@@ -1556,9 +1698,10 @@ def parse_srt_file(srt_path: str | Path) -> list[tuple[float, float, str]]:
     return cues
 
 
-def srt_cues_for_clip(full_cues: list[tuple[float, float, str]], start: float, end: float, max_chars: int = 28) -> list[tuple[float, float, str]]:
+def srt_cues_for_clip(full_cues: list, start: float, end: float, max_chars: int = 28) -> list[tuple[float, float, str]]:
     out = []
-    for a, b, text in full_cues:
+    for cue in full_cues or []:
+        a, b, text = float(cue[0]), float(cue[1]), str(cue[2])
         if b <= start or a >= end:
             continue
         rel_a = max(0.0, a - start)
@@ -1568,7 +1711,7 @@ def srt_cues_for_clip(full_cues: list[tuple[float, float, str]], start: float, e
     return out
 
 
-def srt_cues_for_stitched_clip(full_cues: list[tuple[float, float, str]], moments: list[dict], max_chars: int = 28) -> list[tuple[float, float, str]]:
+def srt_cues_for_stitched_clip(full_cues: list, moments: list[dict], max_chars: int = 28) -> list[tuple[float, float, str]]:
     out: list[tuple[float, float, str]] = []
     timeline_offset = 0.0
     for moment in moments:
@@ -1576,7 +1719,8 @@ def srt_cues_for_stitched_clip(full_cues: list[tuple[float, float, str]], moment
         source_b = float(moment.get("end", source_a))
         if source_b <= source_a:
             continue
-        for a, b, text in full_cues:
+        for cue in full_cues or []:
+            a, b, text = float(cue[0]), float(cue[1]), str(cue[2])
             if b <= source_a or a >= source_b:
                 continue
             rel_a = timeline_offset + max(0.0, a - source_a)
@@ -1701,8 +1845,8 @@ def build_stitched_caption_cues(
     max_chars: int = 26,
     fallback_text: str = "",
     clip_duration: float = 15.0,
-) -> list[tuple[float, float, str]]:
-    stitched_cues: list[tuple[float, float, str]] = []
+) -> list[tuple]:
+    stitched_cues: list[tuple] = []
     timeline_offset = 0.0
     for m in moments:
         m_start = float(m.get("start", 0.0) or 0.0)
@@ -1744,7 +1888,7 @@ def build_stitched_caption_cues(
     return stitched_cues[:40]
 
 
-def write_srt_file(cues: list[tuple[float, float, str]], clip_duration: float, srt_path: Path) -> Path:
+def write_srt_file(cues: list[tuple], clip_duration: float, srt_path: Path) -> Path:
     blocks: list[str] = []
     idx = 1
     for cue in cues:
@@ -1840,7 +1984,7 @@ def _ass_safe_text(value: str) -> str:
 
 
 def write_creator_ass_file(
-    cues: list[tuple[float, float, str]],
+    cues: list[tuple],
     clip_duration: float,
     out_w: int,
     out_h: int,
@@ -1927,7 +2071,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 
 def _drawtext_subtitle_filters(
-    cues: list[tuple[float, float, str]],
+    cues: list[tuple],
     clip_duration: float,
     out_h: int,
     caption_font_size: int,
@@ -1957,7 +2101,7 @@ def _drawtext_subtitle_filters(
             y_pos = max(24, base_y + line_idx * line_step)
             filters.append(
                 f"drawtext=textfile='{escaped}'{font_opt}:fontcolor=white:fontsize={sub_px}:"
-                f"x=max(24\,(w-text_w)/2):y={y_pos}:"
+                f"x=max(24\\,(w-text_w)/2):y={y_pos}:"
                 f"borderw=4:bordercolor=black@0.98:shadowcolor=black@0.75:shadowx=2:shadowy=2:"
                 f"enable='between(t,{c_a:.2f},{c_b:.2f})'"
             )
@@ -1972,7 +2116,7 @@ def append_overlays_and_subs(
     out_h: int,
     logo: str | None,
     logo_input_idx: int | None,
-    cues: list[tuple[float, float, str]] | None,
+    cues: list[tuple] | None,
     hook_banner_text: str,
     hook_banner_duration: float,
     caption_font_size: int,
@@ -2005,7 +2149,7 @@ def append_overlays_and_subs(
             y_hook = top_y + (h_i * hook_step)
             hook_filters.append(
                 f"drawtext=textfile='{hook_file_esc}'{font_opt}:fontcolor=white:fontsize={hook_font_px}:"
-                f"x=max(24\,(w-text_w)/2):y={y_hook}:"
+                f"x=max(24\\,(w-text_w)/2):y={y_hook}:"
                 f"box=1:boxcolor=black@0.75:boxborderw=8:"
                 f"enable='between(t,0,{active_end:.2f})'"
             )
@@ -2058,26 +2202,27 @@ def build_audio_stage(
     mute_original: bool = False,
     voiceover_path: str | None = None,
     normalize_audio: bool = False,
+    vo_input_idx: int | None = None,
 ) -> tuple[str, bool]:
     has_vo = bool(voiceover_path and Path(voiceover_path).exists())
-    vo_idx = len(inputs) // 2
-    if has_vo:
+    if has_vo and vo_input_idx is None:
+        vo_input_idx = sum(1 for i in range(0, len(inputs) - 1, 2) if inputs[i] == "-i")
         inputs += ["-i", str(voiceover_path)]
 
     if mute_original:
-        if has_vo:
+        if has_vo and vo_input_idx is not None:
             graph.append(
-                f"[{vo_idx}:a]atrim=0:{clip_duration:.2f},asetpts=PTS-STARTPTS,"
+                f"[{vo_input_idx}:a]atrim=0:{clip_duration:.2f},asetpts=PTS-STARTPTS,"
                 f"aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,volume=1.15[aout]"
             )
             return "[aout]", True
         graph.append(f"anullsrc=r=44100:cl=stereo:d={clip_duration:.2f}[aout]")
         return "[aout]", True
 
-    if has_vo:
+    if has_vo and vo_input_idx is not None:
         graph.append(
             f"[{input_spec}]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,volume=0.25[orig_a];"
-            f"[{vo_idx}:a]atrim=0:{clip_duration:.2f},asetpts=PTS-STARTPTS,"
+            f"[{vo_input_idx}:a]atrim=0:{clip_duration:.2f},asetpts=PTS-STARTPTS,"
             f"aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,volume=1.15[vo_a];"
             f"[orig_a][vo_a]amix=inputs=2:duration=first:dropout_transition=2[aout]"
         )
@@ -2102,7 +2247,7 @@ def render_video(
     resolution: str,
     crf: int,
     logo: str | None = None,
-    cues: list[tuple[float, float, str]] | None = None,
+    cues: list[tuple] | None = None,
     hook_banner_text: str = "",
     hook_banner_duration: float = 8.0,
     src_w: int = 1280,
@@ -2127,11 +2272,20 @@ def render_video(
         ascii_flag = not ass_mode
         graph: list[str] = [build_frame_stage_filter("0:v", out_w, out_h, aspect, "vstage", fit_mode=fit_mode)]
         inputs: list[str] = ["-ss", str(round(float(start), 2)), "-i", source]
+        next_idx = 1
         has_logo = bool(logo and Path(logo).exists())
         logo_idx: int | None = None
         if has_logo:
-            logo_idx = 1
+            logo_idx = next_idx
+            next_idx += 1
             inputs += ["-i", str(logo)]
+
+        has_vo = bool(voiceover_path and Path(voiceover_path).exists())
+        vo_idx: int | None = None
+        if has_vo:
+            vo_idx = next_idx
+            next_idx += 1
+            inputs += ["-i", str(voiceover_path)]
 
         temp_text_files: list[Path] = []
         try:
@@ -2162,14 +2316,11 @@ def render_video(
                 mute_original=mute_original,
                 voiceover_path=voiceover_path,
                 normalize_audio=normalize_audio,
+                vo_input_idx=vo_idx,
             )
 
-            args = ["ffmpeg", "-y", *inputs]
-            if custom_audio:
-                args += ["-filter_complex", ";".join(graph), "-map", f"[{current}]", "-map", a_label]
-            else:
-                args += ["-filter_complex", ";".join(graph), "-map", f"[{current}]", "-map", "0:a?"]
-
+            args = ["ffmpeg", "-y", *inputs, "-filter_complex", ";".join(graph), "-map", f"[{current}]"]
+            args += ["-map", a_label] if custom_audio else ["-map", "0:a?"]
             args += [
                 "-t", str(clip_duration),
                 "-c:v", "libx264",
@@ -2202,7 +2353,7 @@ def render_stitched_clip(
     resolution: str,
     crf: int,
     logo: str | None = None,
-    cues: list[tuple[float, float, str]] | None = None,
+    cues: list[tuple] | None = None,
     hook_banner_text: str = "",
     hook_banner_duration: float = 8.0,
     src_w: int = 1280,
@@ -2310,10 +2461,17 @@ def render_stitched_clip(
             ascii_flag = not ass_mode
             graph: list[str] = ["[0:v]setsar=1[vbase]"]
             inputs: list[str] = ["-i", str(joined_raw_path)]
+            next_idx = 1
             logo_idx: int | None = None
             if has_logo:
-                logo_idx = 1
+                logo_idx = next_idx
+                next_idx += 1
                 inputs += ["-i", str(logo)]
+            vo_idx: int | None = None
+            if has_vo:
+                vo_idx = next_idx
+                next_idx += 1
+                inputs += ["-i", str(voiceover_path)]
 
             temp_text_files: list[Path] = []
             try:
@@ -2338,11 +2496,12 @@ def render_stitched_clip(
                 a_label, custom_audio = build_audio_stage(
                     graph=graph,
                     inputs=inputs,
-                    input_spec="0:a",
+                    input_spec="0:a?",
                     clip_duration=max(0.5, total_dur),
                     mute_original=mute_original,
                     voiceover_path=voiceover_path,
                     normalize_audio=False,
+                    vo_input_idx=vo_idx,
                 )
                 cmd = ["ffmpeg", "-y", *inputs, "-filter_complex", ";".join(graph), "-map", f"[{current}]"]
                 cmd += ["-map", a_label] if custom_audio else ["-map", "0:a?"]
@@ -2373,7 +2532,7 @@ def burn_subtitles_into_clip(
     transcript: dict | None,
     caption_font_size: int = 28,
     subtitle_accent_colour: str = "Creator Yellow",
-    supplied_cues: list[tuple[float, float, str]] | None = None,
+    supplied_cues: list | None = None,
 ) -> tuple[dict, str]:
     src_p = clip_rec.get("path") or ""
     if not src_p or not Path(src_p).exists():
@@ -2406,7 +2565,7 @@ def burn_subtitles_into_clip(
     fallback_txt = next((normalize_english_subtitle_text(b) for b in fallback_bits if normalize_english_subtitle_text(b)), "English highlight clip")
 
     if supplied_cues is not None:
-        cues = [(max(0.0, float(a)), min(clip_dur, float(b)), str(txt)) for a, b, txt in supplied_cues if float(b) > float(a) and float(a) < clip_dur and float(b) > 0]
+        cues = [(max(0.0, float(c[0])), min(clip_dur, float(c[1])), str(c[2])) for c in supplied_cues if float(c[1]) > float(c[0]) and float(c[0]) < clip_dur and float(c[1]) > 0]
     elif moments:
         cues = build_stitched_caption_cues(
             transcript=transcript, moments=moments, max_chars=wrap_chars,
@@ -2447,7 +2606,7 @@ def burn_subtitles_into_clip(
             cmd = [
                 "ffmpeg", "-y", "-i", src_p, "-vf", vf,
                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
-                "-pix_fmt", "yuv420p", "-c:a", "copy",
+                "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
                 "-movflags", "+faststart", str(out_mp4),
             ]
             res = run_cmd(cmd, timeout=600)
@@ -2475,8 +2634,6 @@ def burn_subtitles_into_clip(
 def sync_auto_clip_count(source_key: str):
     val = max(1, min(6, int(st.session_state.get(source_key, 2))))
     st.session_state["auto_clip_count"] = val
-    st.session_state["auto_clip_count_top"] = val
-    st.session_state["auto_clip_count_step3"] = val
 
 
 def init_state():
@@ -2492,8 +2649,6 @@ def init_state():
         "go_ahead_clips": False,
         "target_platform_choice": "YouTube + IG + Facebook",
         "auto_clip_count": 2,
-        "auto_clip_count_top": 2,
-        "auto_clip_count_step3": 2,
         "desired_clip_minutes": 0.50,
         "auto_clip_minutes": 0.50,
         "used_clip_windows": [],
@@ -2512,6 +2667,8 @@ def init_state():
         "voiceover_script_text": "",
         "voiceover_audio_path": None,
         "voiceover_audio_name": None,
+        "source_videos": [],
+        "active_video_idx": 0,
         "source_video": None,
         "video_name": None,
         "video_info": None,
@@ -2539,17 +2696,18 @@ def init_state():
 
     if not st.session_state.get("workspace_loaded_once"):
         st.session_state["workspace_loaded_once"] = True
+        sync_active_video_to_legacy_keys()
 
 
 init_state()
 
 # ----------------------------- HEADER & NAV -----------------------------
 st.markdown(f"""<div class="hero">
-<div style="color:#a5b4fc;font-weight:750;font-size:.76rem;letter-spacing:.13em">RESILIENT TWO-STAGE STITCH · ATOMIC CHECKPOINTS · JSON STATE EXPORT/IMPORT · MULTI-PLATFORM COPY</div>
+<div style="color:#a5b4fc;font-weight:750;font-size:.76rem;letter-spacing:.13em">UP TO {MAX_SOURCE_VIDEOS} VIDEOS · RESILIENT TWO-STAGE STITCH · ATOMIC CHECKPOINTS · MULTI-PLATFORM COPY</div>
 <h1>🎬 {APP_NAME}</h1>
-<p class="muted">Generate stitched clips in Section 3 with per-segment isolation & crash checkpoints, download or generate multi-style captions in Section 4, and burn English subtitles or add voiceover in Sections 5–6.</p>
+<p class="muted">Add up to {MAX_SOURCE_VIDEOS} campaign videos, switch or split any of them, stitch peak clips in Section 3, download or write multi-style captions in Section 4, and burn subtitles or add voiceover in Sections 5–6.</p>
+<span class="pill">Up to {MAX_SOURCE_VIDEOS} Source Videos</span>
 <span class="pill">Unstuck 2-Pass Stitch</span>
-<span class="pill">Atomic Checkpoints & JSON Save/Load</span>
 <span class="pill">No-Audio Stream Safe</span>
 <span class="pill">Section 4–6 Ready</span>
 </div>""", unsafe_allow_html=True)
@@ -2560,6 +2718,8 @@ if not ffmpeg_ready():
 avail_mb_now = free_disk_mb()
 if 0 <= avail_mb_now < 300:
     st.warning(f"Low temp disk space: **{avail_mb_now:.0f} MB free**. Clear old clips or checkpoints before rendering large videos.")
+
+slots_now: list[dict] = list(st.session_state.get("source_videos") or [])
 
 with st.sidebar:
     st.title("STUDIO")
@@ -2594,13 +2754,14 @@ with st.sidebar:
         clear_rendered_clips_only()
         st.rerun()
 
-    wipe_confirm = st.checkbox("Confirm full session wipe (deletes uploaded video & clips)", key="confirm_wipe_ws")
+    wipe_confirm = st.checkbox("Confirm full session wipe (deletes uploaded videos & clips)", key="confirm_wipe_ws")
     if st.button("🗑️ Wipe Entire Session", width="stretch", disabled=not wipe_confirm, key="clear_cur_ws_btn"):
         clear_workspace_data(st.session_state["workspace_key"], reset_session=True)
         st.session_state["confirm_wipe_ws"] = False
         st.rerun()
 
     st.divider()
+    st.metric("Loaded Videos", f"{len(slots_now)}/{MAX_SOURCE_VIDEOS}")
     st.metric("Go-Ahead Status", "Approved" if st.session_state.go_ahead_clips else "Pending Review")
     st.metric("Broken Parts Ready", len(st.session_state.broken_parts))
     st.metric("Generated Clips", len(st.session_state.clips))
@@ -2608,37 +2769,90 @@ with st.sidebar:
 
 # ----------------------------- PAGE 1: CAMPAIGN & AUTO-CLIPPER --------
 if page == "Campaign & Auto-Clipper":
-    st.subheader("Step 1 · Video (Single Uploader + Live % + 3/5-Part Breaker) + Campaign Requirements")
+    st.subheader(f"Step 1 · Up to {MAX_SOURCE_VIDEOS} Videos + Live % + 3/5-Part Breaker + Campaign Requirements")
     left_col, right_col = st.columns([1.15, 1], gap="large")
 
     with left_col:
         st.text_input("Project / Campaign Name", key="project_name")
         attach_uploader_percentage_bar(MAX_UPLOAD_MB)
-        video_up = st.file_uploader("Upload campaign video", type=["mp4", "mov", "mkv", "webm", "m4v"], key="wf_video_up")
-        if video_up and video_up.size > MAX_UPLOAD_MB * 1024 * 1024:
-            st.error(f"File exceeds {MAX_UPLOAD_MB} MB limit.")
-        elif video_up and st.button("Load Video", type="primary", key="wf_load_video"):
+        video_ups = st.file_uploader(
+            f"Upload up to {MAX_SOURCE_VIDEOS} campaign videos",
+            type=["mp4", "mov", "mkv", "webm", "m4v"],
+            accept_multiple_files=True,
+            key="wf_video_up",
+        )
+        if video_ups:
+            oversized = [f.name for f in video_ups if getattr(f, "size", 0) > MAX_UPLOAD_MB * 1024 * 1024]
+            if oversized:
+                st.error(f"Exceeds {MAX_UPLOAD_MB} MB limit: {', '.join(oversized)}")
+            if len(video_ups) > MAX_SOURCE_VIDEOS:
+                st.warning(f"Only the first {MAX_SOURCE_VIDEOS} selected files will be loaded ({len(video_ups)} selected).")
+
+        remaining_slots = MAX_SOURCE_VIDEOS - len(slots_now)
+        if video_ups and st.button(
+            f"Load Video(s) ({min(len(video_ups), max(1, remaining_slots))} slot(s) available)",
+            type="primary",
+            disabled=remaining_slots <= 0,
+            key="wf_load_video",
+        ):
             try:
-                vpath = save_upload(video_up, show_progress=True)
-                with st.spinner("Inspecting video metadata..."):
-                    vinfo = probe_video(str(vpath))
-                    st.session_state.source_video = str(vpath)
-                    st.session_state.video_name = video_up.name
-                    st.session_state.video_info = vinfo
-                    st.session_state.broken_parts = []
-                    st.session_state.transcript = None
-                    st.session_state.auto_candidates = []
-                    st.session_state.used_clip_windows = []
-                    st.session_state.campaign_feedback = None
-                    st.session_state.go_ahead_clips = False
-                    save_workspace_state(checkpoint_label="video_loaded")
-                st.success(f"Loaded {video_up.name} ({fmt_time(vinfo['duration'])})")
+                loaded_count = 0
+                for f_item in list(video_ups)[:remaining_slots]:
+                    if getattr(f_item, "size", 0) > MAX_UPLOAD_MB * 1024 * 1024:
+                        continue
+                    vpath = save_upload(f_item, show_progress=(len(video_ups) == 1))
+                    with st.spinner(f"Inspecting {f_item.name}..."):
+                        vinfo = probe_video(str(vpath))
+                        new_slot = _make_video_slot(name=f_item.name, path=str(vpath), info=vinfo)
+                        slots_now.append(new_slot)
+                        loaded_count += 1
+                if loaded_count > 0:
+                    st.session_state["source_videos"] = slots_now[:MAX_SOURCE_VIDEOS]
+                    st.session_state["active_video_idx"] = len(st.session_state["source_videos"]) - 1
+                    sync_active_video_to_legacy_keys()
+                    st.session_state["campaign_feedback"] = None
+                    save_workspace_state(checkpoint_label="videos_loaded")
+                    st.success(f"Loaded {loaded_count} video(s). Total in workspace: {len(st.session_state['source_videos'])}/{MAX_SOURCE_VIDEOS}.")
+                    st.rerun()
             except Exception as exc:
                 st.error(f"Video error: {exc}")
+
+        if slots_now:
+            st.markdown("#### Loaded Videos (Up to 3)")
+            slot_tabs = st.tabs([f"Video {i+1}: {s['name'][:22]}" for i, s in enumerate(slots_now)])
+            for s_idx, s_tab in enumerate(slot_tabs):
+                with s_tab:
+                    sl_obj = slots_now[s_idx]
+                    sl_info = sl_obj.get("info") or {}
+                    sl_mb = round((sl_info.get("size") or (Path(sl_obj["path"]).stat().st_size if Path(sl_obj["path"]).exists() else 0)) / (1024 * 1024), 1)
+                    st.caption(
+                        f"Duration: **{fmt_time(sl_info.get('duration', 0))}** · "
+                        f"Resolution: **{sl_info.get('width', 0)}x{sl_info.get('height', 0)}** · "
+                        f"Size: **{sl_mb} MB** · "
+                        f"Broken parts: **{len(sl_obj.get('broken_parts') or [])}**"
+                    )
+                    act_c1, act_c2 = st.columns([1.4, 1.0])
+                    with act_c1:
+                        is_active = (int(st.session_state.get("active_video_idx", 0)) == s_idx)
+                        if st.button(
+                            "✅ Active Video" if is_active else f"🎯 Set Video {s_idx+1} Active",
+                            disabled=is_active,
+                            width="stretch",
+                            key=f"set_active_vid_{s_idx}",
+                        ):
+                            set_active_video_index(s_idx)
+                            save_workspace_state(checkpoint_label="switched_video")
+                            st.rerun()
+                    with act_c2:
+                        if st.button(f"✖ Remove #{s_idx+1}", width="stretch", key=f"remove_vid_{s_idx}"):
+                            remove_video_slot(s_idx)
+                            save_workspace_state(checkpoint_label="removed_video")
+                            st.rerun()
 
         if st.session_state.video_info and st.session_state.source_video and Path(st.session_state.source_video).exists():
             vi = st.session_state.video_info
             size_mb = round((vi.get("size") or Path(st.session_state.source_video).stat().st_size) / (1024 * 1024), 1)
+            st.markdown(f"#### Active Video Preview — `{st.session_state.video_name or 'Video'}`")
             if size_mb < 200:
                 st.video(st.session_state.source_video)
             else:
@@ -2648,10 +2862,10 @@ if page == "Campaign & Auto-Clipper":
             m2.metric("Resolution", f"{vi['width']}x{vi['height']}")
             m3.metric("File Size", f"{size_mb} MB")
 
-            st.markdown("#### Full-video subtitles (recommended)")
-            st.caption("Upload the complete video's .SRT file here before extracting clips. ClipStream will cut and retime the matching subtitle lines for every extracted clip.")
+            st.markdown("#### Full-video subtitles (recommended for active video)")
+            st.caption("Upload the active video's .SRT file here before extracting clips. ClipStream will cut and retime matching subtitle lines for every extracted clip.")
             full_srt_up = st.file_uploader("Upload full-length SRT", type=["srt"], key="full_video_srt_upload")
-            if full_srt_up and st.button("Use This SRT for the Full Video", key="apply_full_video_srt", type="primary"):
+            if full_srt_up and st.button("Use This SRT for Active Video", key="apply_full_video_srt", type="primary"):
                 try:
                     srt_saved = save_upload(full_srt_up, suffix=".srt")
                     parsed = parse_srt_file(srt_saved)
@@ -2662,6 +2876,7 @@ if page == "Campaign & Auto-Clipper":
                     st.session_state.full_srt_path = str(srt_saved)
                     st.session_state.full_srt_name = full_srt_up.name
                     st.session_state.full_srt_cues = valid
+                    sync_legacy_keys_to_active_video()
                     save_workspace_state(checkpoint_label="srt_loaded")
                     st.success(f"Loaded {len(valid)} subtitle cues from {full_srt_up.name}.")
                 except Exception as exc:
@@ -2670,14 +2885,15 @@ if page == "Campaign & Auto-Clipper":
                 st.success(f"Full-video SRT ready: {st.session_state.get('full_srt_name') or 'Uploaded SRT'} · {len(st.session_state.full_srt_cues)} cues")
 
             if ffmpeg_ready() and float(vi["duration"]) >= 1.5:
-                st.radio("Break video into how many parts?", [3, 5], horizontal=True, key="breaker_part_count")
-                if st.button(f"✂️ Break Video into {st.session_state.breaker_part_count} Parts", width="stretch", key="break_3_5_parts_btn"):
+                st.radio("Break active video into how many parts?", [3, 5], horizontal=True, key="breaker_part_count")
+                if st.button(f"✂️ Break Active Video into {st.session_state.breaker_part_count} Parts", width="stretch", key="break_3_5_parts_btn"):
                     try:
                         st.session_state.broken_parts = break_video_into_parts(
                             st.session_state.source_video,
                             float(vi["duration"]),
                             int(st.session_state.breaker_part_count),
                         )
+                        sync_legacy_keys_to_active_video()
                         save_workspace_state(checkpoint_label="parts_broken")
                         st.success(f"Created {len(st.session_state.broken_parts)} parts! Clip any part in Manual Clipper anytime.")
                     except Exception as exc:
@@ -2742,6 +2958,7 @@ if page == "Campaign & Auto-Clipper":
                 "Auto-clip count",
                 min_value=1,
                 max_value=6,
+                value=int(st.session_state.get("auto_clip_count", 2)),
                 step=1,
                 key="auto_clip_count_top",
                 on_change=sync_auto_clip_count,
@@ -2803,8 +3020,8 @@ if page == "Campaign & Auto-Clipper":
                             st.session_state["pending_hook_banner_scope"] = "Full Clip Top Banner"
 
                         if st.session_state.source_video and st.session_state.video_info and Path(st.session_state.source_video).exists():
-                            tr = None
-                            if get_openai_client():
+                            tr = st.session_state.transcript
+                            if get_openai_client() and not tr and st.session_state.video_info.get("has_audio", True):
                                 try:
                                     with st.spinner("Transcribing spoken words..."):
                                         tr = transcribe_video(st.session_state.source_video)
@@ -2824,19 +3041,21 @@ if page == "Campaign & Auto-Clipper":
                                 allow_overlap=bool(st.session_state.get("allow_overlap_windows", False)),
                                 analysis=analysis,
                                 custom_hook=st.session_state.get("custom_hook_fallback", ""),
-                                force_custom_hook=bool(st.session_state.get("force_custom_hook", False)),
+                                force_custom=bool(st.session_state.get("force_custom_hook", False)),
+                                source_label=st.session_state.video_name or "Video",
                             )
                             st.session_state.campaign_feedback = evaluate_video_against_campaign(
-                                analysis, st.session_state.video_info, st.session_state.transcript
+                                analysis, st.session_state.video_info, st.session_state.transcript, total_videos=len(slots_now)
                             )
                         else:
                             st.session_state.campaign_feedback = {
                                 "ready": False,
-                                "verdict": "Campaign Analysed — Upload Video to Check Fit & Auto-Clip",
+                                "verdict": "Campaign Analysed — Upload Up to 3 Videos to Check Fit & Auto-Clip",
                                 "strengths": [],
                                 "gaps": ["Upload a campaign video on the left to pick peak moments and stitch clips."],
                                 "warnings": analysis.get("prohibited_content", []) or [],
                             }
+                    sync_legacy_keys_to_active_video()
                     save_workspace_state(checkpoint_label="analysed")
                     st.success("Campaign feedback ready and saved.")
                 except Exception as exc:
@@ -2895,15 +3114,17 @@ if page == "Campaign & Auto-Clipper":
                         allow_overlap=bool(st.session_state.get("allow_overlap_windows", False)),
                         analysis=st.session_state.brief_analysis,
                         custom_hook=st.session_state.get("custom_hook_fallback", ""),
-                        force_custom_hook=bool(st.session_state.get("force_custom_hook", False)),
+                        force_custom=bool(st.session_state.get("force_custom_hook", False)),
+                        source_label=st.session_state.video_name or "Video",
                     )
                 st.session_state.go_ahead_clips = True
+                sync_legacy_keys_to_active_video()
                 save_workspace_state(checkpoint_label="go_ahead")
 
         with go_col2:
             if st.session_state.go_ahead_clips:
                 exact_s = minutes_to_seconds(float(st.session_state.auto_clip_minutes))
-                st.success(f"Go-ahead granted! Section 3 will stitch clips totaling ~{float(st.session_state.auto_clip_minutes):.2f} min ({exact_s:.1f}s) with enhanced 9:16 fit.")
+                st.success(f"Go-ahead granted! Section 3 will stitch clips from `{st.session_state.video_name or 'Active Video'}` totaling ~{float(st.session_state.auto_clip_minutes):.2f} min ({exact_s:.1f}s).")
 
     # Section 3: Auto-Clipper (Generate / Stitch Clips)
     if st.session_state.go_ahead_clips and st.session_state.video_info and ffmpeg_ready():
@@ -2920,6 +3141,7 @@ if page == "Campaign & Auto-Clipper":
                 "How many stitched clips",
                 min_value=1,
                 max_value=6,
+                value=int(st.session_state.get("auto_clip_count", 2)),
                 step=1,
                 key="auto_clip_count_step3",
                 on_change=sync_auto_clip_count,
@@ -2943,8 +3165,10 @@ if page == "Campaign & Auto-Clipper":
                     allow_overlap=bool(st.session_state.get("allow_overlap_windows", False)),
                     analysis=st.session_state.brief_analysis,
                     custom_hook=st.session_state.get("custom_hook_fallback", ""),
-                    force_custom_hook=bool(st.session_state.get("force_custom_hook", False)),
+                    force_custom=bool(st.session_state.get("force_custom_hook", False)),
+                    source_label=st.session_state.video_name or "Video",
                 )
+                sync_legacy_keys_to_active_video()
                 save_workspace_state(checkpoint_label="fresh_spots")
         with ctrl4:
             if st.button("🧹 Reset Used Spots", width="stretch", key="reset_used_ranges_btn"):
@@ -2961,16 +3185,19 @@ if page == "Campaign & Auto-Clipper":
                     allow_overlap=bool(st.session_state.get("allow_overlap_windows", False)),
                     analysis=st.session_state.brief_analysis,
                     custom_hook=st.session_state.get("custom_hook_fallback", ""),
-                    force_custom_hook=bool(st.session_state.get("force_custom_hook", False)),
+                    force_custom=bool(st.session_state.get("force_custom_hook", False)),
+                    source_label=st.session_state.video_name or "Video",
                 )
+                sync_legacy_keys_to_active_video()
                 save_workspace_state(checkpoint_label="reset_windows")
 
         st.checkbox("Allow overlapping moments if source video is short", key="allow_overlap_windows")
 
         default_asp = default_aspect_for_platform(st.session_state.target_platform_choice)
         st.caption(
+            f"Source: **{st.session_state.video_name or 'Active Video'}** · "
             f"Each clip stitches peak sub-moments summing to **{active_minutes:.2f} min ({exact_target_sec:.1f}s)** · "
-            f"Aspect: **{default_asp}**. Extracted clips appear in **Videos Extracted** for instant download & captions."
+            f"Aspect: **{default_asp}**."
         )
 
         cands = st.session_state.auto_candidates or build_auto_clip_candidates(
@@ -2984,6 +3211,7 @@ if page == "Campaign & Auto-Clipper":
             used_windows=st.session_state.used_clip_windows,
             allow_overlap=bool(st.session_state.get("allow_overlap_windows", False)),
             analysis=st.session_state.brief_analysis,
+            source_label=st.session_state.video_name or "Video",
         )
         cands = cands[:active_count]
 
@@ -3031,7 +3259,7 @@ if page == "Campaign & Auto-Clipper":
         if st.button("⚡ Generate / Stitch Clips in Section 3", type="primary", width="stretch", key="wf_extract_clips_btn"):
             save_named_checkpoint("Before Section 3 Stitch")
             use_subs_now = bool(st.session_state.get("burn_subtitles_chk_v2", False) or st.session_state.get("full_srt_cues"))
-            if use_subs_now and not st.session_state.transcript and get_openai_client():
+            if use_subs_now and not st.session_state.transcript and get_openai_client() and vi.get("has_audio", True):
                 try:
                     with st.spinner("Transcribing spoken audio for English subtitles..."):
                         st.session_state.transcript = transcribe_video(st.session_state.source_video)
@@ -3131,6 +3359,7 @@ if page == "Campaign & Auto-Clipper":
                     clip_meta = {
                         **cand,
                         "mode": "Auto Peak Stitch",
+                        "source_video_name": st.session_state.video_name or "Video",
                         "title": cand.get("title", f"Peak Stitch #{clip_num_global}"),
                         "moments": moments,
                         "start": float(moments[0]["start"]),
@@ -3192,8 +3421,10 @@ if page == "Campaign & Auto-Clipper":
                     allow_overlap=bool(st.session_state.get("allow_overlap_windows", False)),
                     analysis=st.session_state.brief_analysis,
                     custom_hook=st.session_state.get("custom_hook_fallback", ""),
-                    force_custom_hook=bool(st.session_state.get("force_custom_hook", False)),
+                    force_custom=bool(st.session_state.get("force_custom_hook", False)),
+                    source_label=st.session_state.video_name or "Video",
                 )
+                sync_legacy_keys_to_active_video()
                 save_workspace_state(checkpoint_label="section3_rendered")
                 st.success(f"Generated {len(rendered_now)} clip(s) in {time.time() - t0:.1f}s. Open **Videos Extracted** to download or generate captions.")
 
@@ -3203,49 +3434,59 @@ if page == "Campaign & Auto-Clipper":
 
 # ----------------------------- PAGE 2: MANUAL CLIPPER (START -> END) --
 elif page == "Manual Clipper (Start → End)":
-    st.subheader("Manual Clipper — Clip From One Timestamp/Length to Another")
-    if not st.session_state.video_info and not st.session_state.broken_parts:
-        st.info("Upload and load a video in 'Campaign & Auto-Clipper' first.")
-    else:
-        part_sources: list[tuple[str, str, float, int, int, float]] = []
-        for bp in st.session_state.broken_parts:
-            if Path(bp["path"]).exists():
+    st.subheader("Manual Clipper — Clip From Any Loaded Video or Broken Part")
+    sync_legacy_keys_to_active_video()
+
+    part_sources: list[tuple[str, str, float, int, int, float, dict | None, str]] = []
+    for v_i, sl in enumerate(slots_now):
+        v_path = sl.get("path") or ""
+        v_name = sl.get("name") or f"Video {v_i+1}"
+        v_inf = sl.get("info") or {}
+        if v_path and Path(v_path).exists():
+            part_sources.append((
+                f"[Video {v_i+1}] Full: {v_name} ({fmt_time(v_inf.get('duration', 0))})",
+                v_path,
+                max(1.0, float(v_inf.get("duration") or 1.0)),
+                int(v_inf.get("width") or 1280),
+                int(v_inf.get("height") or 720),
+                0.0,
+                sl.get("transcript"),
+                v_name,
+            ))
+        for bp in sl.get("broken_parts") or []:
+            bp_path = bp.get("path") or ""
+            if bp_path and Path(bp_path).exists():
                 bp_info = bp.get("info") or {}
                 part_sources.append((
-                    f"{bp['label']} ({fmt_time(bp_info.get('duration', 0))} · {round((bp_info.get('size') or 0)/(1024*1024), 1)} MB)",
-                    bp["path"],
+                    f"[Video {v_i+1}] {bp.get('label', 'Part')} of {v_name} ({fmt_time(bp_info.get('duration', 0))})",
+                    bp_path,
                     max(1.0, float(bp_info.get("duration") or 1.0)),
                     int(bp_info.get("width") or 1280),
                     int(bp_info.get("height") or 720),
                     float(bp.get("start_in_source", 0.0) or 0.0),
+                    sl.get("transcript"),
+                    v_name,
                 ))
-        if st.session_state.source_video and Path(st.session_state.source_video).exists() and st.session_state.video_info:
-            vi_ed = st.session_state.video_info
-            part_sources.append((
-                f"Full Video: {st.session_state.video_name or 'Source'} ({fmt_time(vi_ed.get('duration', 0))})",
-                st.session_state.source_video,
-                max(1.0, float(vi_ed.get("duration") or 1.0)),
-                int(vi_ed.get("width") or 1280),
-                int(vi_ed.get("height") or 720),
-                0.0,
-            ))
 
+    if not part_sources:
+        st.info("Upload and load up to 3 videos in 'Campaign & Auto-Clipper' first.")
+    else:
         sel_src_idx = st.selectbox(
-            "Choose broken part or full video to manually clip",
+            "Choose any loaded video or broken part to manually clip",
             options=list(range(len(part_sources))),
             format_func=lambda i: part_sources[i][0],
             key="ed_source_choice",
         )
-        src_label, active_src_path, dur_ed, src_w_ed, src_h_ed, src_offset_ed = part_sources[int(sel_src_idx)]
+        src_label, active_src_path, dur_ed, src_w_ed, src_h_ed, src_offset_ed, src_transcript, src_vid_name = part_sources[int(sel_src_idx)]
 
         a, b = st.columns(2)
         with a:
             start = st.number_input("Start timestamp (seconds)", min_value=0.0, max_value=max(0.5, dur_ed - 0.5), value=0.0, step=0.5, key="ed_start_sec")
             end = st.number_input("End timestamp (seconds)", min_value=0.5, max_value=dur_ed, value=min(30.0, dur_ed), step=0.5, key="ed_end_sec")
             st.caption(f"Manual span: **{fmt_time(start)} → {fmt_time(end)}** (**{max(0.0, round(float(end) - float(start), 1)):.1f}s**)")
-            clip_name = st.text_input("Clip name", value=safe_name(Path(st.session_state.video_name or "clip").stem + "_manual"), key="ed_clip_name")
+            clip_name = st.text_input("Clip name", value=safe_name(Path(src_vid_name).stem + "_manual"), key="ed_clip_name")
             spoken_ed = transcript_slice(
-                st.session_state.transcript,
+                src_transcript,
                 float(start) + float(src_offset_ed),
                 float(end) + float(src_offset_ed),
             )
@@ -3283,7 +3524,7 @@ elif page == "Manual Clipper (Start → End)":
                     srt_out = ws_dir / f"{base_stem}.srt"
                     spoken_now = normalize_english_subtitle_text(
                         transcript_slice(
-                            st.session_state.transcript,
+                            src_transcript,
                             float(start) + float(src_offset_ed),
                             float(end) + float(src_offset_ed),
                         )
@@ -3306,7 +3547,7 @@ elif page == "Manual Clipper (Start → End)":
                             )
                         else:
                             cues = build_caption_cues(
-                                transcript=st.session_state.transcript,
+                                transcript=src_transcript,
                                 start=float(start) + float(src_offset_ed),
                                 end=float(end) + float(src_offset_ed),
                                 fallback_text=spoken_now or final_hook,
@@ -3335,6 +3576,7 @@ elif page == "Manual Clipper (Start → End)":
                     st.session_state.used_clip_windows.append([round(start, 1), round(end, 1)])
                     c_meta = {
                         "mode": "Manual Clip",
+                        "source_video_name": src_vid_name,
                         "title": clip_name,
                         "source": src_label,
                         "start": start,
@@ -3478,6 +3720,8 @@ if page == "Videos Extracted":
                 clear_rendered_clips_only()
                 st.rerun()
 
+        burn_notice_slot = st.empty()
+
         for idx, cl in enumerate(st.session_state.clips):
             with st.container(border=True):
                 c_vid, c_cap = st.columns([1.2, 1.4], gap="large")
@@ -3485,15 +3729,16 @@ if page == "Videos Extracted":
                 c_meta = cl.get("meta") or {}
                 clip_mode = c_meta.get("mode") or "Clip"
                 moments_list = c_meta.get("moments") or []
+                src_vid_tag = f" · Source: `{c_meta['source_video_name']}`" if c_meta.get("source_video_name") else ""
                 with c_vid:
                     st.markdown(f"**Clip {idx + 1} [{clip_mode}]: {cl['name']}**")
                     mute_tag = " · Muted Audio" if c_meta.get("muted") else ""
                     sub_tag = " · EN Subtitles Burned" if c_meta.get("subtitles_burned_en") else ""
                     if moments_list:
                         m_txt = " + ".join(f"{float(m['start']):.0f}s–{float(m['end']):.0f}s" for m in moments_list)
-                        st.caption(f"Stitched: {m_txt} ({actual_sec:.1f}s total) · {cl['aspect']} · {cl['resolution']}{mute_tag}{sub_tag}")
+                        st.caption(f"Stitched: {m_txt} ({actual_sec:.1f}s total) · {cl['aspect']} · {cl['resolution']}{src_vid_tag}{mute_tag}{sub_tag}")
                     else:
-                        st.caption(f"{fmt_time(cl['start'])} → {fmt_time(cl['end'])} ({actual_sec:.1f}s) · {cl['aspect']} · {cl['resolution']}{mute_tag}{sub_tag}")
+                        st.caption(f"{fmt_time(cl['start'])} → {fmt_time(cl['end'])} ({actual_sec:.1f}s) · {cl['aspect']} · {cl['resolution']}{src_vid_tag}{mute_tag}{sub_tag}")
                     if Path(cl["path"]).exists():
                         st.video(cl["path"])
                         with st.expander(f"Add a separate SRT for Clip {idx+1}"):
@@ -3649,9 +3894,7 @@ if page == "Videos Extracted":
                         st.session_state.clips[i_clip] = updated_rec
                         status_msgs.append(f"Clip {i_clip+1}: {msg}")
             save_workspace_state(checkpoint_label="subtitles_burned")
-            for m_line in status_msgs:
-                st.success(m_line)
-            st.rerun()
+            st.success(" · ".join(status_msgs))
     else:
         st.caption("Generate or manually render a clip first, then burn English subtitles into your clip(s) here.")
 
