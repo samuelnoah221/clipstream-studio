@@ -120,7 +120,7 @@ SUBTITLE_ACCENT_PALETTE = {
 STATE_FIELDS = [
     "project_name", "brief", "brief_analysis", "campaign_feedback",
     "go_ahead_clips", "target_platform_choice", "desired_clip_minutes",
-    "auto_clip_minutes", "used_clip_windows", "offered_clip_windows", "hook_mode_choice",
+    "auto_clip_minutes", "used_clip_windows", "offered_clip_windows", "moments_per_clip", "moment_order", "hook_mode_choice",
     "hook_banner_scope", "custom_hook_fallback", "force_custom_hook",
     "burn_subtitles_chk_v2", "subtitle_language", "onscreen_caption_size",
     "subtitle_accent_colour", "vertical_fit_mode", "logo_watermark_mode",
@@ -383,6 +383,8 @@ def _collect_state_payload(checkpoint_label: str = "autosave") -> dict:
         "auto_clip_minutes": float(st.session_state.get("auto_clip_minutes") or 0.50),
         "used_clip_windows": st.session_state.get("used_clip_windows", []),
         "offered_clip_windows": st.session_state.get("offered_clip_windows", []),
+        "moments_per_clip": int(st.session_state.get("moments_per_clip") or 0),
+        "moment_order": st.session_state.get("moment_order", "Chronological (story order)"),
         "hook_mode_choice": st.session_state.get("hook_mode_choice", "Standard Clip Length (Exact Minutes)"),
         "hook_banner_scope": st.session_state.get("hook_banner_scope", "8-Second Top Banner (0–8s)"),
         "custom_hook_fallback": st.session_state.get("custom_hook_fallback", ""),
@@ -1475,10 +1477,23 @@ def _snap_to_segment_start(start: float, seg_starts: list[float], max_s: float, 
     return start
 
 
-def _choose_part_count(total_target: float, safe_dur: float) -> int:
-    wanted = 3 if total_target <= 30.0 else 4
-    for n in range(wanted, 1, -1):
-        if total_target + 2.0 * (n - 1) + 0.5 <= safe_dur:
+def _gap_for(n_parts: int) -> float:
+    return 2.0 if n_parts <= 4 else 0.75
+
+
+def _choose_part_count(total_target: float, safe_dur: float, requested: int = 0) -> int:
+    """How many moments one clip can really hold. requested=0 means Auto (3-4)."""
+    try:
+        req = int(requested or 0)
+    except (TypeError, ValueError):
+        req = 0
+    wanted = req if req > 0 else (3 if total_target <= 30.0 else 4)
+    wanted = max(1, min(12, wanted))
+    min_seg = 1.5 if req > 0 else 1.0
+    for n in range(wanted, 0, -1):
+        if n > 1 and total_target / n < min_seg:
+            continue
+        if total_target + _gap_for(n) * (n - 1) + 0.5 <= safe_dur:
             return n
     return 1
 
@@ -1492,6 +1507,8 @@ def _build_peak_moments(
     energy_profile: list[float] | None = None,
     key_terms: list[str] | None = None,
     rng: random.Random | None = None,
+    moments_per_clip: int = 0,
+    strongest_first: bool = False,
 ) -> tuple[list[dict], int]:
     """Returns (moments, relax_level). relax_level 0 = totally fresh footage."""
     rng = rng or random.Random(uuid.uuid4().int)
@@ -1503,11 +1520,15 @@ def _build_peak_moments(
         end_s = round(max(0.5, safe_dur), 1)
         return [{"start": 0.0, "end": end_s, "text": transcript_slice(transcript, 0.0, end_s), "score": 0.0}], 3
 
-    num_parts = _choose_part_count(total_target, safe_dur)
-    raw_weights = [1.3, 0.85, 0.95, 1.1][:num_parts] if num_parts > 1 else [1.0]
+    num_parts = _choose_part_count(total_target, safe_dur, moments_per_clip)
+    base_w = [1.3, 0.85, 0.95, 1.1]
+    raw_weights = [base_w[i % 4] for i in range(num_parts)] if num_parts > 1 else [1.0]
     w_sum = sum(raw_weights)
-    part_durs = [max(1.0, round((w / w_sum) * total_target, 1)) for w in raw_weights]
-    part_durs[-1] = round(max(0.8, part_durs[-1] + (total_target - sum(part_durs))), 1)
+    part_durs = [round((w / w_sum) * total_target, 1) for w in raw_weights]
+    part_durs[-1] = round(total_target - sum(part_durs[:-1]), 1)
+    if part_durs[-1] < 0.8:
+        part_durs = [round(total_target / num_parts, 1)] * num_parts
+        part_durs[-1] = round(total_target - sum(part_durs[:-1]), 1)
 
     n_secs = int(math.ceil(safe_dur)) + 1
     terms = list(key_terms or [])
@@ -1580,7 +1601,7 @@ def _build_peak_moments(
     for idx in order:
         pool = pools[idx]
         pick = None
-        for gap in (2.0, 0.5):
+        for gap in (_gap_for(num_parts), 0.25):
             for li, lvl in enumerate(levels):
                 cands = [
                     p for p in pool
@@ -1604,7 +1625,12 @@ def _build_peak_moments(
             "score": round(float(pick[2]), 3),
         })
 
-    chosen.sort(key=lambda m: m["start"])
+    if strongest_first and len(chosen) > 1:
+        best = max(chosen, key=lambda m: m.get("score", 0.0))
+        rest = sorted((m for m in chosen if m is not best), key=lambda m: m["start"])
+        chosen = [best] + rest
+    else:
+        chosen.sort(key=lambda m: m["start"])
     return chosen, worst_level
 
 
@@ -1646,6 +1672,8 @@ def build_auto_clip_candidates(
     source_label: str = "Video",
     energy_profile: list[float] | None = None,
     title_offset: int = 0,
+    moments_per_clip: int = 0,
+    strongest_first: bool = False,
 ) -> list[dict]:
     count = max(1, min(6, int(clip_count or 2)))
     safe_dur = max(0.5, float(duration or 15.0))
@@ -1671,6 +1699,8 @@ def build_auto_clip_candidates(
             energy_profile=energy_profile,
             key_terms=key_terms,
             rng=rng,
+            moments_per_clip=moments_per_clip,
+            strongest_first=strongest_first,
         )
         for m in moments:
             combined_used.append([m["start"], m["end"]])
@@ -1706,6 +1736,8 @@ def build_auto_clip_candidates(
             "risk": "",
             "confidence": "high" if avg_score >= 0.5 else "medium",
             "relaxed": relax_level > 0,
+            "requested_moments": int(moments_per_clip or 0),
+            "moments_capped": bool(moments_per_clip and len(moments) < int(moments_per_clip)),
             "peak_score": round(avg_score, 3),
         })
 
@@ -3350,6 +3382,7 @@ def refresh_auto_candidates(mode: str = "pick_new") -> list[dict]:
     offered = _dedupe_windows(ss.get("offered_clip_windows"))
     minutes = max(0.10, float(ss.get("auto_clip_minutes") or ss.get("desired_clip_minutes") or 0.50))
     count = max(1, min(6, int(ss.get("auto_clip_count") or 2)))
+    mpc = max(0, min(12, int(ss.get("moments_per_clip") or 0)))
 
     energy = None
     src = ss.get("source_video")
@@ -3376,11 +3409,15 @@ def refresh_auto_candidates(mode: str = "pick_new") -> list[dict]:
         source_label=str(ss.get("video_name") or "Video"),
         energy_profile=energy,
         title_offset=len(ss.get("clips") or []),
+        moments_per_clip=mpc,
+        strongest_first=str(ss.get("moment_order") or "").startswith("Strongest"),
     )
     new_offered = list(offered)
     for c in cands:
         c["plan_minutes"] = round(minutes, 4)
         c["plan_count"] = count
+        c["plan_moments"] = mpc
+        c["plan_order"] = str(ss.get("moment_order") or "")
         for m in c.get("moments") or []:
             new_offered.append([round(float(m["start"]), 1), round(float(m["end"]), 1)])
     ss["offered_clip_windows"] = _dedupe_windows(new_offered)
@@ -3407,6 +3444,8 @@ def init_state():
         "auto_clip_minutes": 0.50,
         "used_clip_windows": [],
         "offered_clip_windows": [],
+        "moments_per_clip": 0,
+        "moment_order": "Chronological (story order)",
         "hook_mode_choice": "Standard Clip Length (Exact Minutes)",
         "hook_banner_scope": "8-Second Top Banner (0–8s)",
         "pending_hook_banner_scope": None,
@@ -4043,6 +4082,19 @@ if page == "Campaign & Auto-Clipper":
         vi = st.session_state.video_info
         dur = max(1.0, float(vi.get("duration") or 10.0))
 
+        mp_c1, mp_c2 = st.columns([1.1, 1.0])
+        with mp_c1:
+            st.number_input(
+                "Moments per clip (0 = Auto)",
+                min_value=0, max_value=12, step=1, key="moments_per_clip",
+                help="How many different peak spots are stitched into each clip, e.g. 2, 6 or 10. Spots never repeat across clips or retries.",
+            )
+        with mp_c2:
+            st.selectbox(
+                "Moment order",
+                ["Chronological (story order)", "Strongest first (hook)"],
+                key="moment_order",
+            )
         ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([1.1, 1.0, 1.2, 1.0])
         with ctrl1:
             st.number_input("Desired clip minutes", min_value=0.10, max_value=15.0, step=0.25, key="auto_clip_minutes")
@@ -4060,6 +4112,15 @@ if page == "Campaign & Auto-Clipper":
         active_minutes = max(0.10, float(st.session_state.get("auto_clip_minutes", 0.50) or 0.50))
         active_count = max(1, min(6, int(st.session_state.get("auto_clip_count", 2) or 2)))
         exact_target_sec = round(min(dur, minutes_to_seconds(active_minutes)), 1)
+        mpc_req = int(st.session_state.get("moments_per_clip") or 0)
+        mpc_eff = _choose_part_count(exact_target_sec, dur, mpc_req)
+        if mpc_req and mpc_eff < mpc_req:
+            st.warning(
+                f"A {exact_target_sec:.0f}s clip from a {fmt_time(dur)} video fits only **{mpc_eff}** moment(s) of 1.5s+ "
+                f"(you asked for {mpc_req}). Raise the clip length or lower the moments."
+            )
+        else:
+            st.caption(f"Each clip = **{mpc_eff} moments** · about **{exact_target_sec / max(1, mpc_eff):.1f}s** per moment.")
 
         with ctrl3:
             if st.button("🔄 Pick Different Peak Spots", width="stretch", key="pick_fresh_spots_btn"):
@@ -4085,6 +4146,8 @@ if page == "Campaign & Auto-Clipper":
             and len(cands) == active_count
             and all(abs(float(c.get("plan_minutes", -1)) - round(active_minutes, 4)) < 1e-6 for c in cands)
             and all(c.get("cid") for c in cands)
+            and all(int(c.get("plan_moments", -1)) == mpc_req for c in cands)
+            and all(c.get("plan_order", "") == str(st.session_state.get("moment_order") or "") for c in cands)
         )
         if not plan_ok:
             cands = refresh_auto_candidates("replan")
@@ -4098,6 +4161,17 @@ if page == "Campaign & Auto-Clipper":
             f"🎯 Fresh footage left: **{fresh_pct:.0f}%** · every click on *Pick Different Peak Spots* avoids all spots "
             "already shown or rendered. Moments are ranked by audio energy, speech density and your brief keywords."
         )
+
+        used_hist = _dedupe_windows(st.session_state.get("used_clip_windows"))
+        shown_hist = _dedupe_windows(st.session_state.get("offered_clip_windows"))
+        with st.expander(f"🗂️ Spot history ({len(used_hist)} rendered · {len(shown_hist)} shown)"):
+            st.caption("These time ranges are skipped on every new pick while fresh footage remains.")
+            if used_hist:
+                st.markdown("**Rendered:** " + " · ".join(f"`{fmt_time(a)}–{fmt_time(b)}`" for a, b in sorted(used_hist)[:60]))
+            if shown_hist:
+                st.markdown("**Shown, not rendered:** " + " · ".join(f"`{fmt_time(a)}–{fmt_time(b)}`" for a, b in sorted(shown_hist)[:60]))
+            if not used_hist and not shown_hist:
+                st.caption("No spots used yet.")
 
         q_col1, q_col2, q_col3, q_col4 = st.columns(4)
         with q_col1:
@@ -4132,6 +4206,9 @@ if page == "Campaign & Auto-Clipper":
                 f"**{cand.get('title', f'Peak Stitch #{idx+1}')}** — Total: **{stitched_sec:.1f}s** (`{active_minutes:.2f} min`)\n\n"
                 f"Stitched spots: {chain_str}"
             )
+            st.caption(f"Peak strength: **{float(cand.get('peak_score', 0.0)):.2f}** · confidence: **{cand.get('confidence', 'medium')}**")
+            if cand.get("moments_capped"):
+                st.caption(f"⚠️ Only {len(moments)} moment(s) fit this clip length (you asked for {cand.get('requested_moments')}).")
             if cand.get("relaxed"):
                 st.caption("♻️ Most fresh footage is already used, so this pick overlaps the least-used spots.")
             edited_hook = st.text_input(
