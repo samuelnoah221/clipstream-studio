@@ -1216,22 +1216,28 @@ def build_stitched_peak_moments(
 def build_auto_clip_candidates(
     brief: str,
     transcript: dict | None,
-    contact_sheet: Path | None,
+    contact_sheet,
     duration: float,
     target_platform: str,
     clip_count: int,
-    desired_minutes: float | None,
-    used_windows: list[list[float]] | None,
+    desired_minutes: float,
+    used_windows: list,
     allow_overlap: bool = False,
     analysis: dict | None = None,
     custom_hook: str = "",
     force_custom_hook: bool = False,
-    source_label: str = "",
+    source_label: str = "Video",
 ) -> list[dict]:
     count = max(1, min(6, int(clip_count or 2)))
     safe_dur = max(0.5, float(duration or 15.0))
+    mins_val = max(0.10, float(desired_minutes or 0.50))
+    target_sec = round(min(safe_dur, minutes_to_seconds(mins_val)), 1)
     results: list[dict] = []
-    combined_used = list(used_windows or [])
+    combined_used: list[list[float]] = [
+        [float(w[0]), float(w[1])]
+        for w in (used_windows or [])
+        if isinstance(w, (list, tuple)) and len(w) >= 2
+    ]
 
     for idx in range(count):
         pick_num = len(used_windows or []) + idx + 1
@@ -3470,20 +3476,20 @@ if page == "Campaign & Auto-Clipper":
                             except Exception:
                                 sheet = None
                             st.session_state.auto_candidates = build_auto_clip_candidates(
-                                brief=str(st.session_state.brief or ""),
-                                transcript=tr,
-                                contact_sheet=sheet,
-                                duration=float(st.session_state.video_info.get("duration") or 10.0),
-                                target_platform=str(st.session_state.target_platform_choice or "YouTube + IG + Facebook"),
-                                clip_count=active_count,
-                                desired_minutes=float(st.session_state.desired_clip_minutes or 0.50),
-                                used_windows=list(st.session_state.used_clip_windows or []),
-                                allow_overlap=bool(st.session_state.get("allow_overlap_windows", False)),
-                                analysis=analysis,
-                                custom_hook=str(st.session_state.get("custom_hook_fallback") or ""),
-                                force_custom=bool(st.session_state.get("force_custom_hook", False)),
-                                source_label=str(st.session_state.video_name or "Video"),
-                            )
+    brief=str(st.session_state.brief or ""),
+    transcript=tr,
+    contact_sheet=sheet,
+    duration=float(st.session_state.video_info.get("duration") or 10.0),
+    target_platform=str(st.session_state.target_platform_choice or "YouTube + IG + Facebook"),
+    clip_count=active_count,
+    desired_minutes=float(st.session_state.desired_clip_minutes or 0.50),
+    used_windows=list(st.session_state.used_clip_windows or []),
+    allow_overlap=bool(st.session_state.get("allow_overlap_windows", False)),
+    analysis=analysis,
+    custom_hook=str(st.session_state.get("custom_hook_fallback") or ""),
+    force_custom_hook=bool(st.session_state.get("force_custom_hook", False)),
+    source_label=str(st.session_state.video_name or "Video"),
+)
                             st.session_state.campaign_feedback = evaluate_video_against_campaign(
                                 analysis, st.session_state.video_info, st.session_state.transcript, total_videos=len(slots_now)
                             )
