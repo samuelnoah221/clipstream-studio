@@ -92,10 +92,12 @@ HOOK_FILLER_STARTERS = {
     "and", "but", "so", "or", "um", "uh", "like", "well", "okay", "yeah", "alright",
 }
 
+SMART_FIT = "Smart Fill (9:16 follows the action)"
 FIT_MODES = [
-    "Fill & Crop (9:16 Zoom)",
+    SMART_FIT,
     "Fit All (Full Frame + Ambient Blur)",
     "Fit All (Pure Full Frame)",
+    "Fill & Crop (9:16 Zoom)",
     "Letterbox Fit",
 ]
 
@@ -103,6 +105,17 @@ LOGO_WATERMARK_MODES = [
     "Standard Corner (Subtle)",
     "Standard Corner (First 8s)",
     "Solid Corner",
+]
+
+LOGO_POSITIONS = [
+    "Bottom-Right (small, like the CNPL shorts)",
+    "Bottom-Left (large, faint watermark)",
+    "Top-Right (small)",
+]
+
+CAPTION_LOOKS = [
+    "Black Box · White Text (top, short-form style)",
+    "Creator Karaoke (bottom, highlight colour)",
 ]
 
 CAPTION_STYLES = [
@@ -140,7 +153,7 @@ STATE_FIELDS = [
     "active_video_idx", "source_video", "video_name", "video_info",
     "broken_parts", "transcript", "full_srt_path", "full_srt_name",
     "full_srt_cues", "auto_candidates", "clips", "logo_path",
-    "logo_name", "brand_name", "brand_colour", "caption_instructions",
+    "logo_name", "logo_position", "caption_look", "brand_name", "brand_colour", "caption_instructions",
 ]
 
 
@@ -382,9 +395,9 @@ def _atomic_write_json(target: Path, payload: dict) -> Path:
 def _collect_state_payload(checkpoint_label: str = "autosave") -> dict:
     sync_legacy_keys_to_active_video()
     key = st.session_state.get("workspace_key") or "default_session"
-    fit_val = st.session_state.get("vertical_fit_mode", "Fill & Crop (9:16 Zoom)")
+    fit_val = st.session_state.get("vertical_fit_mode", "Fit All (Full Frame + Ambient Blur)")
     if fit_val not in FIT_MODES:
-        fit_val = "Fill & Crop (9:16 Zoom)"
+        fit_val = "Fit All (Full Frame + Ambient Blur)"
     wm_val = st.session_state.get("logo_watermark_mode", "Standard Corner (Subtle)")
     if wm_val not in LOGO_WATERMARK_MODES:
         wm_val = "Standard Corner (Subtle)"
@@ -420,6 +433,8 @@ def _collect_state_payload(checkpoint_label: str = "autosave") -> dict:
         "subtitle_accent_colour": st.session_state.get("subtitle_accent_colour", "Creator Yellow"),
         "vertical_fit_mode": fit_val,
         "logo_watermark_mode": wm_val,
+        "logo_position": st.session_state.get("logo_position", LOGO_POSITIONS[0]),
+        "caption_look": st.session_state.get("caption_look", CAPTION_LOOKS[0]),
         "mute_original_audio": bool(st.session_state.get("mute_original_audio", False)),
         "orig_audio_volume": float(st.session_state.get("orig_audio_volume", 1.0)),
         "vo_audio_volume": float(st.session_state.get("vo_audio_volume", 1.15)),
@@ -505,9 +520,13 @@ def apply_state_payload(data: dict) -> bool:
             st.session_state[field] = data[field]
 
     if st.session_state.get("vertical_fit_mode") not in FIT_MODES:
-        st.session_state["vertical_fit_mode"] = "Fill & Crop (9:16 Zoom)"
+        st.session_state["vertical_fit_mode"] = SMART_FIT
     if st.session_state.get("logo_watermark_mode") not in LOGO_WATERMARK_MODES:
         st.session_state["logo_watermark_mode"] = "Standard Corner (Subtle)"
+    if st.session_state.get("logo_position") not in LOGO_POSITIONS:
+        st.session_state["logo_position"] = LOGO_POSITIONS[0]
+    if st.session_state.get("caption_look") not in CAPTION_LOOKS:
+        st.session_state["caption_look"] = CAPTION_LOOKS[0]
     if st.session_state.get("moment_order") not in MOMENT_ORDERS:
         st.session_state["moment_order"] = MOMENT_ORDERS[0]
 
@@ -1744,7 +1763,7 @@ def _build_mixed_moments(
     src_order = list(range(n_src))
     rng.shuffle(src_order)
     assign = [src_order[i % n_src] for i in range(n)]
-    levels = [0.05, 0.15, 0.35, 0.70, 1.0] if allow_overlap else [0.0, 0.05, 0.12, 0.25, 0.45, 1.0]
+    levels = [0.10, 0.25, 0.50, 1.0] if allow_overlap else [0.0, 0.10, 0.25, 0.50, 1.0]
 
     pool_cache: dict[tuple[int, float], list] = {}
 
@@ -1873,32 +1892,39 @@ def build_mixed_candidates(
     results: list[dict] = []
     has_signal = any(s.get("energy") or s.get("motion") or s.get("transcript") for s in sources)
 
+    batch_windows: dict[str, list[list[float]]] = {}
+
+    def _overlap_score(moms: list[dict]) -> tuple[float, float]:
+        tot = max(0.1, sum(m["end"] - m["start"] for m in moms))
+        b = sum((m["end"] - m["start"]) * window_overlap_fraction(m["start"], m["end"], batch_windows.get(m["source"], [])) for m in moms) / tot
+        h = sum((m["end"] - m["start"]) * window_overlap_fraction(m["start"], m["end"], (avoid or {}).get(m["source"], [])) for m in moms) / tot
+        return b, h
+
     for idx in range(count):
         picked = None
-        # Stronger diversity: more attempts + progressive strictness so all N clips differ
-        for _attempt in range(18):
+        best_score = 1e9
+        base_n = _choose_part_count(max(1.0, min(float(target_seconds), sum(float(x["duration"]) for x in sources))), moments_per_clip, len(sources))
+        for _attempt in range(40):
+            mpc_try = moments_per_clip
+            if _attempt >= 14:
+                mpc_try = max(1, min(12, base_n + (_attempt - 13) % 4))
             moments, worst = _build_mixed_moments(
-                sources, scorers, target_seconds, avoid_live, moments_per_clip, order_mode, allow_overlap, rng
+                sources, scorers, target_seconds, avoid_live, mpc_try, order_mode, allow_overlap, rng
             )
             sig = _moments_signature(moments)
-            if picked is None:
-                picked = (moments, worst, sig)
-            if sig not in seen:
-                # Extra check: require at least one moment that does not heavily overlap prior used windows
-                heavy_overlap = False
-                for m in moments:
-                    used_k = avoid_live.get(m["source"], [])
-                    if window_overlap_fraction(m["start"], m["end"], used_k) > 0.55:
-                        heavy_overlap = True
-                        break
-                if not heavy_overlap or _attempt >= 12:
-                    picked = (moments, worst, sig)
-                    break
-        moments, worst, sig = picked
-        seen.add(sig)
-        # Immediately reserve the chosen windows so the next clip cannot reuse them
+            b_ov, h_ov = _overlap_score(moments)
+            score = 4.0 * b_ov + h_ov + (2.0 if sig in seen else 0.0)
+            if score < best_score:
+                best_score = score
+                picked = (moments, worst, sig, b_ov)
+            if score < 0.03:
+                break
+        moments, worst, sig, b_ov = picked
         for m in moments:
-            avoid_live.setdefault(m["source"], []).append([round(float(m["start"]), 1), round(float(m["end"]), 1)])
+            batch_windows.setdefault(m["source"], []).append([m["start"], m["end"]])
+        seen.add(sig)
+        for m in moments:
+            avoid_live.setdefault(m["source"], []).append([m["start"], m["end"]])
 
         pick_num = int(title_offset) + idx + 1
         stitched_dur = round(sum(max(0.1, m["end"] - m["start"]) for m in moments), 1)
@@ -1947,6 +1973,7 @@ def build_mixed_candidates(
             "moments_capped": bool(moments_per_clip and len(moments) < int(moments_per_clip)),
             "peak_score": round(avg_score, 3),
             "signature": sig,
+            "overlap_with_others": round(float(b_ov), 2),
         })
 
     return results, list(seen)
@@ -2790,18 +2817,49 @@ def resolve_target_dimensions(aspect: str, resolution: str, src_w: int, src_h: i
     return max(2, int(tw) - (int(tw) % 2)), max(2, int(th) - (int(th) % 2))
 
 
+def motion_focus_x(video_path: str, start: float, end: float) -> float:
+    """0..1 horizontal position of the on-screen action in [start,end]. 0.5 = centre (fallback)."""
+    try:
+        import numpy as np
+        fps, w, h = 5, 64, 36
+        fb = w * h
+        dur = max(0.5, float(end) - float(start))
+        cmd = ["ffmpeg", "-v", "error", "-ss", f"{max(0.0, float(start)):.2f}", "-t", f"{dur:.2f}",
+               "-i", str(video_path), "-an", "-vf", f"fps={fps},scale={w}:{h},format=gray",
+               "-f", "rawvideo", "-"]
+        p = subprocess.run(cmd, capture_output=True, timeout=60)
+        raw = p.stdout or b""
+        n = len(raw) // fb
+        if n < 3:
+            return 0.5
+        fr = np.frombuffer(raw[: n * fb], dtype=np.uint8).reshape(n, h, w).astype(np.float32)
+        d = np.abs(np.diff(fr, axis=0)).sum(axis=(0, 1))
+        d = d - d.min()
+        if d.sum() < 1e-3:
+            return 0.5
+        d = np.convolve(d, np.ones(5) / 5.0, mode="same")
+        xs = np.arange(w, dtype=np.float32)
+        cen = float((d * xs).sum() / d.sum()) / (w - 1)
+        # blend with centre so the crop never jumps to an extreme edge
+        return float(max(0.08, min(0.92, 0.25 * 0.5 + 0.75 * cen)))
+    except Exception:
+        return 0.5
+
+
 def build_frame_stage_filter(
     in_label: str,
     out_w: int,
     out_h: int,
     aspect: str,
     out_label: str,
-    fit_mode: str = "Fill & Crop (9:16 Zoom)",
+    fit_mode: str = "Fit All (Full Frame + Ambient Blur)",
+    crop_x_frac: float | None = None,
 ) -> str:
-    if fit_mode == "Fill & Crop (9:16 Zoom)":
+    if fit_mode in ("Fill & Crop (9:16 Zoom)", SMART_FIT):
+        fx = 0.5 if crop_x_frac is None else max(0.0, min(1.0, float(crop_x_frac)))
         return (
             f"[{in_label}]scale={out_w}:{out_h}:force_original_aspect_ratio=increase:flags=lanczos,"
-            f"crop={out_w}:{out_h}:(iw-{out_w})/2:(ih-{out_h})/2,setsar=1[{out_label}]"
+            f"crop={out_w}:{out_h}:(iw-{out_w})*{fx:.3f}:(ih-{out_h})/2,setsar=1[{out_label}]"
         )
     if fit_mode == "Letterbox Fit":
         return (
@@ -2809,28 +2867,42 @@ def build_frame_stage_filter(
             f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:color=#090c13,setsar=1[{out_label}]"
         )
     if fit_mode == "Fit All (Pure Full Frame)":
-        # Stretch-free: scale to cover then slight center crop (still no blur)
-        return (
-            f"[{in_label}]scale={out_w}:{out_h}:force_original_aspect_ratio=increase:flags=lanczos,"
-            f"crop={out_w}:{out_h}:(iw-{out_w})/2:(ih-{out_h})/2,setsar=1[{out_label}]"
-        )
+        return f"[{in_label}]scale={out_w}:{out_h}:flags=lanczos,setsar=1[{out_label}]"
 
     bg_lbl = f"{out_label}_bg"
     fg_lbl = f"{out_label}_fg"
     composed_lbl = f"{out_label}_comp"
     is_vertical = out_h > out_w
     vignette_step = ",vignette=PI/4.5" if is_vertical else ""
-    # Cleaner ambient blur: milder blur + brighter so sides do not look muddy (matches pro short style)
     return (
         f"[{in_label}]split[{bg_lbl}_raw][{fg_lbl}_raw];"
         f"[{bg_lbl}_raw]scale={out_w}:{out_h}:force_original_aspect_ratio=increase:flags=lanczos,"
-        f"crop={out_w}:{out_h}:(iw-{out_w})/2:(ih-{out_h})/2,gblur=sigma=14:steps=1,"
-        f"eq=brightness=-0.04:saturation=1.05:contrast=1.02{vignette_step},setsar=1[{bg_lbl}];"
+        f"crop={out_w}:{out_h}:(iw-{out_w})/2:(ih-{out_h})/2,gblur=sigma=24:steps=2,"
+        f"eq=brightness=-0.12:saturation=1.08:contrast=1.05{vignette_step},setsar=1[{bg_lbl}];"
         f"[{fg_lbl}_raw]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease:flags=lanczos,"
-        f"eq=contrast=1.04:saturation=1.05,setsar=1[{fg_lbl}];"
+        f"eq=contrast=1.03:saturation=1.04,setsar=1[{fg_lbl}];"
         f"[{bg_lbl}][{fg_lbl}]overlay=(W-w)/2:(H-h)/2:shortest=1[{composed_lbl}];"
-        f"[{composed_lbl}]drawbox=x=0:y=0:w={out_w}:h=3:color=white@0.10:t=fill[{out_label}]"
+        f"[{composed_lbl}]drawbox=x=0:y=0:w={out_w}:h=4:color=white@0.12:t=fill[{out_label}]"
     )
+
+
+def logo_geometry(out_w: int, mode: str, position: str, clip_dur: float) -> tuple[int, str, float, str]:
+    """(logo pixel width, overlay x:y, alpha, enable expression)."""
+    pos = position if position in LOGO_POSITIONS else LOGO_POSITIONS[0]
+    m = mode if mode in LOGO_WATERMARK_MODES else "Standard Corner (Subtle)"
+    if pos.startswith("Bottom-Left"):
+        w_px, xy, alpha = int(out_w * 0.30), "W*0.06:H-h-H*0.10", 0.55
+    elif pos.startswith("Top-Right"):
+        w_px, xy, alpha = int(out_w * 0.12), "W-w-W*0.04:H*0.04", 0.92
+    else:
+        w_px, xy, alpha = int(out_w * 0.115), "W-w-W*0.035:H-h-H*0.035", 0.95
+    if m == "Standard Corner (Subtle)":
+        alpha = min(alpha, 0.88)
+    if m == "Solid Corner":
+        alpha = 1.0
+    w_px = max(24, w_px - (w_px % 2))
+    enable = f":enable='between(t,0,{min(max(1.0, clip_dur), 8.0):.2f})'" if m == "Standard Corner (First 8s)" else ""
+    return w_px, xy, alpha, enable
 
 
 def _ass_safe_text(value: str) -> str:
@@ -2848,9 +2920,17 @@ def write_creator_ass_file(
     accent_colour: str = "Creator Yellow",
 ) -> Path:
     accent = SUBTITLE_ACCENT_PALETTE.get(accent_colour, SUBTITLE_ACCENT_PALETTE["Creator Yellow"])
+    box_look = str(st.session_state.get("caption_look", CAPTION_LOOKS[0])).startswith("Black Box")
     scale = max(0.75, min(2.0, float(out_h) / 1280.0))
     font_px = max(24, min(76, int(round(int(font_size) * scale))))
     margin_v = max(58, int(round(out_h * (0.115 if out_h >= out_w else 0.075))))
+    if box_look:
+        margin_v = int(round(out_h * (0.15 if out_h >= out_w else 0.08)))
+    style_line = (
+        f"Style: Creator,Arial,{font_px},&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,3,{max(8, int(font_px * 0.28))},0,8,60,60,{margin_v},1"
+        if box_look else
+        f"Style: Creator,Arial,{font_px},{accent},&H00FFFFFF,&H00101010,&H64000000,-1,0,0,0,100,100,0,0,1,3.2,1.4,2,48,48,{margin_v},1"
+    )
     header = f"""[Script Info]
 Title: ClipStream Studio Creator Captions
 ScriptType: v4.00+
@@ -2861,7 +2941,7 @@ PlayResY: {max(2, int(out_h))}
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Creator,Arial,{font_px},{accent},&H00FFFFFF,&H00101010,&H64000000,-1,0,0,0,100,100,0,0,1,3.2,1.4,2,48,48,{margin_v},1
+{style_line}
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -2911,7 +2991,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 remaining -= duration_cs
                 duration_values.append(duration_cs)
 
-        karaoke_parts = [f"{{\\kf{duration_cs}}}{word}" for word, duration_cs in zip(words, duration_values)]
+        if box_look:
+            karaoke_parts = list(words)
+        else:
+            karaoke_parts = [f"{{\\kf{duration_cs}}}{word}" for word, duration_cs in zip(words, duration_values)]
         karaoke_lines = []
         word_cursor = 0
         for line_words in words_by_line:
@@ -2919,7 +3002,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             karaoke_lines.append(" ".join(karaoke_parts[word_cursor:word_cursor + line_count]))
             word_cursor += line_count
         karaoke_text = r"\N".join(karaoke_lines)
-        events.append(f"Dialogue: 0,{ass_time(start)},{ass_time(end)},Creator,,0,0,0,,{{\\an2\\q2}}{karaoke_text}")
+        events.append(f"Dialogue: 0,{ass_time(start)},{ass_time(end)},Creator,,0,0,0,,{{\\an{8 if box_look else 2}\\q2}}{karaoke_text}")
 
     output_path.write_text(header + "\n".join(events) + "\n", encoding="utf-8")
     return output_path
@@ -3014,25 +3097,11 @@ def append_overlays_and_subs(
         current = "vhook"
 
     if logo and Path(logo).exists() and logo_input_idx is not None:
-        wm_mode = logo_watermark_mode if logo_watermark_mode in LOGO_WATERMARK_MODES else "Standard Corner (Subtle)"
-        if wm_mode == "Solid Corner":
-            graph.append(f"[{logo_input_idx}:v]scale=iw*0.15:-1:flags=bilinear[logo]")
-            graph.append(f"[{current}][logo]overlay=22:H-h-28:format=auto[vlogo]")
-        elif wm_mode == "Standard Corner (First 8s)":
-            wm_end = min(max(1.0, float(clip_duration)), 8.0)
-            graph.append(
-                f"[{logo_input_idx}:v]scale=iw*0.15:-1:flags=bilinear,"
-                f"format=rgba,colorchannelmixer=aa=0.78[logo]"
-            )
-            graph.append(
-                f"[{current}][logo]overlay=22:H-h-28:format=auto:enable='between(t,0,{wm_end:.2f})'[vlogo]"
-            )
-        else:
-            graph.append(
-                f"[{logo_input_idx}:v]scale=iw*0.15:-1:flags=bilinear,"
-                f"format=rgba,colorchannelmixer=aa=0.78[logo]"
-            )
-            graph.append(f"[{current}][logo]overlay=22:H-h-28:format=auto[vlogo]")
+        lw, lxy, lalpha, lena = logo_geometry(out_w, logo_watermark_mode, st.session_state.get("logo_position", LOGO_POSITIONS[0]), clip_duration)
+        graph.append(
+            f"[{logo_input_idx}:v]scale={lw}:-1:flags=lanczos,format=rgba,colorchannelmixer=aa={lalpha:.2f}[logo]"
+        )
+        graph.append(f"[{current}][logo]overlay={lxy}:format=auto{lena}[vlogo]")
         current = "vlogo"
 
     if cues:
@@ -3146,7 +3215,7 @@ def render_video(
     normalize_audio: bool = False,
     clip_index: int = 0,
     srt_output_path: str | None = None,
-    fit_mode: str = "Fill & Crop (9:16 Zoom)",
+    fit_mode: str = "Fit All (Full Frame + Ambient Blur)",
     mute_original: bool = False,
     voiceover_path: str | None = None,
     subtitle_accent_colour: str = "Creator Yellow",
@@ -3166,7 +3235,8 @@ def render_video(
 
     for ass_mode in (True, False):
         ascii_flag = not ass_mode
-        graph: list[str] = [build_frame_stage_filter("0:v", out_w, out_h, aspect, "vstage", fit_mode=fit_mode)]
+        focus = motion_focus_x(source, start, end) if fit_mode == SMART_FIT else None
+        graph: list[str] = [build_frame_stage_filter("0:v", out_w, out_h, aspect, "vstage", fit_mode=fit_mode, crop_x_frac=focus)]
         inputs: list[str] = ["-ss", str(round(float(start), 2)), "-i", source]
         next_idx = 1
         has_logo = bool(logo and Path(logo).exists())
@@ -3261,7 +3331,7 @@ def render_stitched_clip(
     caption_font_size: int = 28,
     encode_preset: str = "ultrafast",
     srt_output_path: str | None = None,
-    fit_mode: str = "Fill & Crop (9:16 Zoom)",
+    fit_mode: str = "Fit All (Full Frame + Ambient Blur)",
     mute_original: bool = False,
     voiceover_path: str | None = None,
     subtitle_accent_colour: str = "Creator Yellow",
@@ -3308,7 +3378,8 @@ def render_stitched_clip(
                 status_cb(f"Segment {idx + 1}/{len(moments)} · {Path(m_src).name[:18]} ({s_v:.1f}s–{e_v:.1f}s)...")
 
             seg_out = ws_dir / f"seg_{idx}_{next(tempfile._get_candidate_names())}.mp4"
-            vf_seg = build_frame_stage_filter("0:v", out_w, out_h, aspect, "vseg", fit_mode=fit_mode)
+            focus = motion_focus_x(m_src, s_v, e_v) if fit_mode == SMART_FIT else None
+            vf_seg = build_frame_stage_filter("0:v", out_w, out_h, aspect, "vseg", fit_mode=fit_mode, crop_x_frac=focus)
             af_seg = (
                 f"anullsrc=r=44100:cl=stereo:d={seg_d:.2f},aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[aseg]"
                 if (mute_original or not src_has_audio)
@@ -3486,21 +3557,21 @@ def apply_logo_to_clip(
     if wm_mode == "Solid Corner":
         vf_complex = (
             "[0:v]setsar=1[vbase];"
-            "[1:v]scale=iw*0.15:-1:flags=bilinear[logo];"
-            "[vbase][logo]overlay=22:H-h-28:format=auto[vout]"
+            "[1:v]scale=iw*0.12:-1:flags=bilinear[logo];"
+            "[vbase][logo]overlay=W-w-20:20:format=auto[vout]"
         )
     elif wm_mode == "Standard Corner (First 8s)":
         wm_end = min(max(1.0, clip_dur), 8.0)
         vf_complex = (
             "[0:v]setsar=1[vbase];"
-            "[1:v]scale=iw*0.15:-1:flags=bilinear,format=rgba,colorchannelmixer=aa=0.78[logo];"
-            f"[vbase][logo]overlay=22:H-h-28:format=auto:enable='between(t,0,{wm_end:.2f})'[vout]"
+            "[1:v]scale=iw*0.12:-1:flags=bilinear,format=rgba,colorchannelmixer=aa=0.78[logo];"
+            f"[vbase][logo]overlay=W-w-20:20:format=auto:enable='between(t,0,{wm_end:.2f})'[vout]"
         )
     else:
         vf_complex = (
             "[0:v]setsar=1[vbase];"
-            "[1:v]scale=iw*0.15:-1:flags=bilinear,format=rgba,colorchannelmixer=aa=0.78[logo];"
-            "[vbase][logo]overlay=22:H-h-28:format=auto[vout]"
+            "[1:v]scale=iw*0.12:-1:flags=bilinear,format=rgba,colorchannelmixer=aa=0.78[logo];"
+            "[vbase][logo]overlay=W-w-20:20:format=auto[vout]"
         )
 
     res = run_cmd([
@@ -3803,8 +3874,10 @@ def init_state():
         "subtitle_language": "English (Default)",
         "onscreen_caption_size": 32,
         "subtitle_accent_colour": "Creator Yellow",
-        "vertical_fit_mode": "Fill & Crop (9:16 Zoom)",
+        "vertical_fit_mode": SMART_FIT,
         "logo_watermark_mode": "Standard Corner (Subtle)",
+        "logo_position": LOGO_POSITIONS[0],
+        "caption_look": CAPTION_LOOKS[0],
         "mute_original_audio": False,
         "voiceover_source_mode": "Uploaded Voice Track",
         "voiceover_script_text": "",
@@ -3835,7 +3908,7 @@ def init_state():
             st.session_state[k] = v
 
     if st.session_state.get("vertical_fit_mode") not in FIT_MODES:
-        st.session_state["vertical_fit_mode"] = "Fill & Crop (9:16 Zoom)"
+        st.session_state["vertical_fit_mode"] = SMART_FIT
     if st.session_state.get("logo_watermark_mode") not in LOGO_WATERMARK_MODES:
         st.session_state["logo_watermark_mode"] = "Standard Corner (Subtle)"
     if st.session_state.get("moment_order") not in MOMENT_ORDERS:
@@ -3882,17 +3955,17 @@ def stamp_logo_onto_existing_clip(
 
     wm_mode = watermark_mode if watermark_mode in LOGO_WATERMARK_MODES else "Standard Corner (Subtle)"
     if wm_mode == "Solid Corner":
-        vf = "[1:v]scale=iw*0.15:-1:flags=bilinear[logo];[0:v][logo]overlay=22:H-h-28:format=auto[vout]"
+        vf = "[1:v]scale=iw*0.12:-1:flags=bilinear[logo];[0:v][logo]overlay=W-w-20:20:format=auto[vout]"
     elif wm_mode == "Standard Corner (First 8s)":
         wm_end = min(max(1.0, clip_dur), 8.0)
         vf = (
-            "[1:v]scale=iw*0.15:-1:flags=bilinear,format=rgba,colorchannelmixer=aa=0.78[logo];"
-            f"[0:v][logo]overlay=22:H-h-28:format=auto:enable='between(t,0,{wm_end:.2f})'[vout]"
+            "[1:v]scale=iw*0.12:-1:flags=bilinear,format=rgba,colorchannelmixer=aa=0.78[logo];"
+            f"[0:v][logo]overlay=W-w-20:20:format=auto:enable='between(t,0,{wm_end:.2f})'[vout]"
         )
     else:
         vf = (
-            "[1:v]scale=iw*0.15:-1:flags=bilinear,format=rgba,colorchannelmixer=aa=0.78[logo];"
-            "[0:v][logo]overlay=22:H-h-28:format=auto[vout]"
+            "[1:v]scale=iw*0.12:-1:flags=bilinear,format=rgba,colorchannelmixer=aa=0.78[logo];"
+            "[0:v][logo]overlay=W-w-20:20:format=auto[vout]"
         )
 
     cmd = [
@@ -3942,6 +4015,50 @@ def stamp_logo_onto_existing_clip(
     updated["meta"] = updated_meta
     gc.collect()
     return updated, f"Stamped logo ({wm_mode}) onto clip."
+
+
+def stamp_logo_onto_existing_clip(
+    clip_rec: dict,
+    logo_file_path: str,
+    watermark_mode: str = "Standard Corner (Subtle)",
+) -> tuple[dict, str]:
+    src_p = clip_rec.get("path") or ""
+    if not src_p or not Path(src_p).exists():
+        return clip_rec, "Skipped (clip video file not found)."
+    if not logo_file_path or not Path(logo_file_path).exists():
+        return clip_rec, "Skipped (logo file not found)."
+    if not ffmpeg_ready():
+        return clip_rec, "Skipped (FFmpeg not available)."
+    try:
+        info = probe_video(src_p)
+        clip_dur = max(0.5, float(info.get("duration") or 10.0))
+        w_px = int(info.get("width") or 720)
+    except Exception:
+        clip_dur, w_px = 10.0, 720
+    pos = st.session_state.get("logo_position", LOGO_POSITIONS[0])
+    lw, lxy, lalpha, lena = logo_geometry(w_px, watermark_mode, pos, clip_dur)
+    vf = (
+        f"[1:v]scale={lw}:-1:flags=lanczos,format=rgba,colorchannelmixer=aa={lalpha:.2f}[logo];"
+        f"[0:v][logo]overlay={lxy}:format=auto{lena}[vout]"
+    )
+    ws_dir = workspace_dir(st.session_state.get("workspace_key", "default"))
+    out_mp4 = ws_dir / f"{safe_name(Path(src_p).stem)}_logo_{next(tempfile._get_candidate_names())}.mp4"
+    res = run_cmd([
+        "ffmpeg", "-y", "-i", src_p, "-i", str(logo_file_path), "-filter_complex", vf,
+        "-map", "[vout]", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(out_mp4),
+    ], timeout=450)
+    if res.returncode != 0 or not out_mp4.exists() or out_mp4.stat().st_size == 0:
+        out_mp4.unlink(missing_ok=True)
+        return clip_rec, (res.stderr[-1500:] or "Logo stamp failed.")
+    updated = dict(clip_rec)
+    meta = dict(clip_rec.get("meta") or {})
+    updated["path"] = str(out_mp4)
+    meta["logo_applied_post_render"] = True
+    meta["logo_watermark_mode"] = watermark_mode
+    updated["meta"] = meta
+    gc.collect()
+    return updated, f"Stamped logo ({pos}) onto clip."
 
 
 def render_srt_and_logo_beside(key_prefix: str = "beside", title: str = "SRT & Logo (Side-by-Side)"):
@@ -4309,6 +4426,7 @@ if page == "Campaign & Auto-Clipper":
             LOGO_WATERMARK_MODES,
             key="logo_watermark_mode",
         )
+        st.selectbox("Logo position & size", LOGO_POSITIONS, key="logo_position")
 
         hk_c1, hk_c2 = st.columns([1.6, 1.0])
         with hk_c1:
@@ -4551,12 +4669,7 @@ if page == "Campaign & Auto-Clipper":
                 key="wf_sharp_res",
             )
         with q_col2:
-            fit_mode = st.selectbox(
-                "9:16 Frame Fit",
-                FIT_MODES,
-                key="vertical_fit_mode",
-                help="Fill & Crop = sharp full-frame short (no blurry sides). Ambient Blur = soft background. Use Fill & Crop for clean pro-style verticals like the CNPL examples.",
-            )
+            fit_mode = st.selectbox("9:16 Frame Fit", FIT_MODES, key="vertical_fit_mode")
         with q_col3:
             sharp_crf = st.slider("Quality CRF (18–26)", 18, 26, 22, key="wf_sharp_crf")
         with q_col4:
@@ -4577,6 +4690,8 @@ if page == "Campaign & Auto-Clipper":
                 f"Stitched spots: {chain_str}"
             )
             st.caption(f"Peak strength: **{float(cand.get('peak_score', 0.0)):.2f}** · confidence: **{cand.get('confidence', 'medium')}**")
+            if float(cand.get("overlap_with_others", 0.0)) > 0.35:
+                st.caption("⚠️ Your loaded footage is too short to make every clip fully different — add more video or lower clip length / clip count.")
             if cand.get("moments_capped"):
                 st.caption(f"⚠️ Only {len(moments)} moment(s) fit this clip length (you asked for {cand.get('requested_moments')}).")
             if cand.get("relaxed"):
@@ -5013,6 +5128,8 @@ elif page == "Brand Kit & Settings":
     st.divider()
     render_srt_and_logo_beside(key_prefix="brandkit_beside", title="Brand Kit: SRT & Logo Side-by-Side")
     st.selectbox("Default Logo Watermark Mode", LOGO_WATERMARK_MODES, key="logo_watermark_mode")
+    st.selectbox("Logo position & size", LOGO_POSITIONS, key="logo_position")
+    st.selectbox("Caption look", CAPTION_LOOKS, key="caption_look")
     st.text_input("Brand Name", key="brand_name")
     st.text_input("Brand Accent Colour", key="brand_colour")
 
@@ -5317,7 +5434,8 @@ if page == "Videos Extracted":
             key="onscreen_caption_size",
         )
     with s5_c4:
-        st.selectbox("Highlight colour", list(SUBTITLE_ACCENT_PALETTE.keys()), key="subtitle_accent_colour")
+        st.selectbox("Highlight colour (karaoke look)", list(SUBTITLE_ACCENT_PALETTE.keys()), key="subtitle_accent_colour")
+        st.selectbox("Caption look", CAPTION_LOOKS, key="caption_look")
 
     if st.session_state.clips:
         s5_target_options = ["All Extracted Clips"] + [f"Clip {i+1}: {c['name']}" for i, c in enumerate(st.session_state.clips)]
