@@ -4,6 +4,7 @@ import gc
 import html
 import io
 import json
+import math
 import os
 import random
 import re
@@ -22,10 +23,37 @@ import streamlit.components.v1 as components
 APP_NAME = "ClipStream Studio"
 MAX_UPLOAD_MB = 2048
 MAX_SOURCE_VIDEOS = 3
-WORK_DIR = Path(tempfile.gettempdir()) / "clipstream_studio"
+LEGACY_WORK_DIR = Path(tempfile.gettempdir()) / "clipstream_studio"
+
+
+def _resolve_data_root() -> Path:
+    """Prefer a folder that survives restarts. Override with env CLIPSTREAM_DATA_DIR."""
+    candidates: list[Path] = []
+    env_dir = os.getenv("CLIPSTREAM_DATA_DIR", "").strip()
+    if env_dir:
+        candidates.append(Path(env_dir).expanduser())
+    try:
+        candidates.append(Path.home() / ".clipstream_studio")
+    except Exception:
+        pass
+    candidates.append(LEGACY_WORK_DIR)
+    for cand in candidates:
+        try:
+            cand.mkdir(parents=True, exist_ok=True)
+            probe = cand / ".write_test"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+            return cand
+        except Exception:
+            continue
+    return Path(tempfile.gettempdir())
+
+
+WORK_DIR = _resolve_data_root()
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 WORKSPACES_ROOT = WORK_DIR / "workspaces"
 WORKSPACES_ROOT.mkdir(parents=True, exist_ok=True)
+VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".m4v"}
 
 st.set_page_config(page_title=APP_NAME, page_icon="🎬", layout="wide")
 
@@ -92,7 +120,7 @@ SUBTITLE_ACCENT_PALETTE = {
 STATE_FIELDS = [
     "project_name", "brief", "brief_analysis", "campaign_feedback",
     "go_ahead_clips", "target_platform_choice", "desired_clip_minutes",
-    "auto_clip_minutes", "used_clip_windows", "hook_mode_choice",
+    "auto_clip_minutes", "used_clip_windows", "offered_clip_windows", "hook_mode_choice",
     "hook_banner_scope", "custom_hook_fallback", "force_custom_hook",
     "burn_subtitles_chk_v2", "subtitle_language", "onscreen_caption_size",
     "subtitle_accent_colour", "vertical_fit_mode", "logo_watermark_mode",
@@ -229,6 +257,7 @@ def _make_video_slot(
         "full_srt_name": None,
         "full_srt_cues": [],
         "used_clip_windows": [],
+        "offered_clip_windows": [],
         "auto_candidates": [],
     }
 
@@ -246,6 +275,7 @@ def sync_active_video_to_legacy_keys() -> None:
         st.session_state["full_srt_name"] = None
         st.session_state["full_srt_cues"] = []
         st.session_state["used_clip_windows"] = []
+        st.session_state["offered_clip_windows"] = []
         st.session_state["auto_candidates"] = []
         return
 
@@ -261,6 +291,7 @@ def sync_active_video_to_legacy_keys() -> None:
     st.session_state["full_srt_name"] = cur.get("full_srt_name")
     st.session_state["full_srt_cues"] = list(cur.get("full_srt_cues") or [])
     st.session_state["used_clip_windows"] = list(cur.get("used_clip_windows") or [])
+    st.session_state["offered_clip_windows"] = list(cur.get("offered_clip_windows") or [])
     st.session_state["auto_candidates"] = list(cur.get("auto_candidates") or [])
 
 
@@ -282,6 +313,7 @@ def sync_legacy_keys_to_active_video() -> None:
     cur["full_srt_name"] = st.session_state.get("full_srt_name")
     cur["full_srt_cues"] = list(st.session_state.get("full_srt_cues") or [])
     cur["used_clip_windows"] = list(st.session_state.get("used_clip_windows") or [])
+    cur["offered_clip_windows"] = list(st.session_state.get("offered_clip_windows") or [])
     cur["auto_candidates"] = list(st.session_state.get("auto_candidates") or [])
     slots[idx] = cur
     st.session_state["source_videos"] = slots
@@ -350,6 +382,7 @@ def _collect_state_payload(checkpoint_label: str = "autosave") -> dict:
         "desired_clip_minutes": float(st.session_state.get("desired_clip_minutes") or 0.50),
         "auto_clip_minutes": float(st.session_state.get("auto_clip_minutes") or 0.50),
         "used_clip_windows": st.session_state.get("used_clip_windows", []),
+        "offered_clip_windows": st.session_state.get("offered_clip_windows", []),
         "hook_mode_choice": st.session_state.get("hook_mode_choice", "Standard Clip Length (Exact Minutes)"),
         "hook_banner_scope": st.session_state.get("hook_banner_scope", "8-Second Top Banner (0–8s)"),
         "custom_hook_fallback": st.session_state.get("custom_hook_fallback", ""),
@@ -396,6 +429,11 @@ def save_workspace_state(ws_key: str | None = None, checkpoint_label: str = "aut
     payload["workspace_key"] = key
     _atomic_write_json(state_file, payload)
     st.session_state["last_saved_at"] = f"{payload['saved_at']} ({checkpoint_label})"
+    try:
+        if st.query_params.get("ws") != key:
+            st.query_params["ws"] = key
+    except Exception:
+        pass
     return state_file
 
 
@@ -475,6 +513,7 @@ def apply_state_payload(data: dict) -> bool:
             "full_srt_name": data.get("full_srt_name"),
             "full_srt_cues": data.get("full_srt_cues") or [],
             "used_clip_windows": data.get("used_clip_windows") or [],
+            "offered_clip_windows": data.get("offered_clip_windows") or [],
             "auto_candidates": data.get("auto_candidates") or [],
         })
 
@@ -509,70 +548,164 @@ def load_state_from_file(json_file: Path) -> bool:
     return apply_state_payload(data)
 
 
+def _workspace_roots() -> list[Path]:
+    roots = [WORKSPACES_ROOT]
+    legacy = LEGACY_WORK_DIR / "workspaces"
+    try:
+        if legacy.exists() and legacy.resolve() != WORKSPACES_ROOT.resolve():
+            roots.append(legacy)
+    except Exception:
+        pass
+    return roots
+
+
+_WS_SUMMARY_CACHE: dict[str, tuple[float, dict]] = {}
+
+
+def list_saved_workspaces() -> list[dict]:
+    """Every workspace stored on this machine/server, newest first."""
+    items: list[dict] = []
+    seen: set[str] = set()
+    current_key = st.session_state.get("workspace_key")
+    for root in _workspace_roots():
+        try:
+            dirs = [d for d in root.iterdir() if d.is_dir()]
+        except Exception:
+            continue
+        for d in dirs:
+            if d.name in seen:
+                continue
+            state_file = d / "workspace_state.json"
+            summary: dict = {}
+            mtime = 0.0
+            try:
+                mtime = (state_file if state_file.exists() else d).stat().st_mtime
+            except Exception:
+                pass
+            cache_hit = _WS_SUMMARY_CACHE.get(str(state_file))
+            if state_file.exists():
+                if cache_hit and cache_hit[0] == mtime:
+                    summary = cache_hit[1]
+                else:
+                    try:
+                        data = json.loads(state_file.read_text(encoding="utf-8"))
+                        summary = {
+                            "project_name": data.get("project_name") or "Untitled",
+                            "saved_at": data.get("saved_at") or "",
+                            "label": data.get("checkpoint_label") or "",
+                            "brief": (data.get("brief") or "")[:160],
+                            "video_paths": [
+                                sl.get("path") for sl in (data.get("source_videos") or [])
+                                if isinstance(sl, dict) and sl.get("path")
+                            ],
+                            "clips": [
+                                {"name": c.get("name") or "Clip", "path": c.get("path"), "aspect": c.get("aspect", ""), "srt_path": c.get("srt_path")}
+                                for c in (data.get("clips") or []) if isinstance(c, dict) and c.get("path")
+                            ],
+                        }
+                        _WS_SUMMARY_CACHE[str(state_file)] = (mtime, summary)
+                    except Exception:
+                        summary = {}
+            clips = [c for c in summary.get("clips", []) if c.get("path") and Path(c["path"]).exists()]
+            videos = [p for p in summary.get("video_paths", []) if p and Path(p).exists()]
+            if not summary:
+                try:
+                    media = [f for f in d.iterdir() if f.is_file() and f.suffix.lower() in VIDEO_EXTS]
+                except Exception:
+                    media = []
+                if not media:
+                    continue
+                summary = {"project_name": "Recoverable files", "saved_at": "", "label": "no state file", "brief": ""}
+                videos = [str(f) for f in media]
+            if not clips and not videos and not summary.get("brief") and d.name != current_key:
+                continue
+            seen.add(d.name)
+            items.append({
+                "key": d.name,
+                "dir": d,
+                "project_name": summary.get("project_name", "Untitled"),
+                "saved_at": summary.get("saved_at", ""),
+                "label": summary.get("label", ""),
+                "brief": summary.get("brief", ""),
+                "n_videos": len(videos),
+                "clips": clips,
+                "n_clips": len(clips),
+                "mtime": mtime,
+                "current": d.name == current_key,
+            })
+    items.sort(key=lambda x: -x["mtime"])
+    return items
+
+
 def load_workspace_by_code(code_input: str) -> tuple[bool, str]:
     clean_code = normalize_workspace_code(code_input)
     if not clean_code:
         return False, "Enter a valid workspace code first."
 
-    wdir = WORKSPACES_ROOT / clean_code
-    state_file = wdir / "workspace_state.json"
+    found_dir: Path | None = None
+    names_to_try = [clean_code] + ([] if clean_code.startswith("session_") else [f"session_{clean_code}"])
+    for name in names_to_try:
+        for root in _workspace_roots():
+            if (root / name).is_dir():
+                found_dir = root / name
+                break
+        if found_dir:
+            break
+    if found_dir is None:
+        partial: list[Path] = []
+        for root in _workspace_roots():
+            try:
+                partial += [p for p in root.iterdir() if p.is_dir() and clean_code.lower() in p.name.lower()]
+            except Exception:
+                pass
+        if partial:
+            found_dir = sorted(partial, key=lambda p: p.stat().st_mtime, reverse=True)[0]
+    if found_dir is None:
+        return False, (
+            f"No saved workspace found for `{clean_code}`. Open the **Saved Work** page to see everything stored here, "
+            "or import your exported project `.JSON` under Brand Kit & Settings."
+        )
 
-    # Also search subdirs if user typed a partial suffix
-    if not state_file.exists():
-        matches = [
-            p / "workspace_state.json"
-            for p in WORKSPACES_ROOT.iterdir()
-            if p.is_dir() and clean_code.lower() in p.name.lower() and (p / "workspace_state.json").exists()
-        ]
-        if matches:
-            state_file = sorted(matches, key=lambda f: f.stat().st_mtime, reverse=True)[0]
-            clean_code = state_file.parent.name
-
-    st.session_state["workspace_key"] = clean_code
+    clean_code = found_dir.name
+    state_file = found_dir / "workspace_state.json"
     if state_file.exists() and load_state_from_file(state_file):
+        st.session_state["workspace_key"] = clean_code
         return True, f"Loaded workspace `{clean_code}`."
 
-    # If folder exists without workspace_state.json, scan any media/json inside
-    wdir.mkdir(parents=True, exist_ok=True)
-    ckpt_list = list_checkpoints(clean_code)
-    if ckpt_list and load_state_from_file(ckpt_list[0]["path"]):
-        return True, f"Loaded latest checkpoint in workspace `{clean_code}`."
+    ckpt_dir = found_dir / "checkpoints"
+    if ckpt_dir.exists():
+        for ck in sorted(ckpt_dir.glob("*.json"), key=lambda f: f.stat().st_mtime, reverse=True):
+            if load_state_from_file(ck):
+                st.session_state["workspace_key"] = clean_code
+                return True, f"Loaded latest checkpoint in workspace `{clean_code}`."
 
-    # Discover any orphan videos/logos/clips inside that folder
+    st.session_state["workspace_key"] = clean_code
     discovered_videos: list[dict] = []
     discovered_clips: list[dict] = []
-    for f in sorted(wdir.rglob("*")):
+    for f in sorted(found_dir.rglob("*")):
         if not f.is_file() or f.name == "workspace_state.json":
             continue
         ext = f.suffix.lower()
         if ext in {".png", ".jpg", ".jpeg", ".webp"} and "logo" in f.name.lower() and not st.session_state.get("logo_path"):
             st.session_state["logo_path"] = str(f)
             st.session_state["logo_name"] = f.name
-        elif ext in {".mp4", ".mov", ".mkv", ".webm", ".m4v"}:
-            if ffmpeg_ready():
-                try:
-                    inf = probe_video(str(f))
-                    if "stitch" in f.name.lower() or "manual" in f.name.lower() or "clip" in f.name.lower():
-                        discovered_clips.append({
-                            "name": f.stem,
-                            "path": str(f),
-                            "srt_path": None,
-                            "start": 0.0,
-                            "end": float(inf.get("duration") or 10.0),
-                            "aspect": "9:16 Vertical" if inf.get("height", 0) > inf.get("width", 0) else "16:9 Landscape",
-                            "resolution": f"{inf.get('width', 0)}x{inf.get('height', 0)}",
-                            "meta": {"title": f.stem, "mode": "Recovered Clip"},
-                            "caption_style": "Hook / Viral",
-                            "youtube": "",
-                            "instagram": "",
-                            "facebook": "",
-                            "caption": "",
-                            "description": "",
-                        })
-                    elif len(discovered_videos) < MAX_SOURCE_VIDEOS:
-                        discovered_videos.append(_make_video_slot(name=f.name, path=str(f), info=inf))
-                except Exception:
-                    pass
+        elif ext in VIDEO_EXTS and ffmpeg_ready():
+            try:
+                inf = probe_video(str(f))
+                if any(tag in f.name.lower() for tag in ("stitch", "manual", "clip")):
+                    discovered_clips.append({
+                        "name": f.stem, "path": str(f), "srt_path": None, "start": 0.0,
+                        "end": float(inf.get("duration") or 10.0),
+                        "aspect": "9:16 Vertical" if inf.get("height", 0) > inf.get("width", 0) else "16:9 Landscape",
+                        "resolution": f"{inf.get('width', 0)}x{inf.get('height', 0)}",
+                        "meta": {"title": f.stem, "mode": "Recovered Clip"},
+                        "caption_style": "Hook / Viral",
+                        "youtube": "", "instagram": "", "facebook": "", "caption": "", "description": "",
+                    })
+                elif len(discovered_videos) < MAX_SOURCE_VIDEOS:
+                    discovered_videos.append(_make_video_slot(name=f.name, path=str(f), info=inf))
+            except Exception:
+                pass
 
     if discovered_videos or discovered_clips or st.session_state.get("logo_path"):
         st.session_state["source_videos"] = discovered_videos
@@ -580,10 +713,26 @@ def load_workspace_by_code(code_input: str) -> tuple[bool, str]:
         sync_active_video_to_legacy_keys()
         st.session_state["clips"] = discovered_clips
         save_workspace_state(clean_code, checkpoint_label="recovered_from_code")
-        return True, f"Switched to workspace `{clean_code}` and recovered {len(discovered_videos)} video(s), {len(discovered_clips)} clip(s)."
+        return True, f"Opened `{clean_code}` and recovered {len(discovered_videos)} video(s), {len(discovered_clips)} clip(s)."
 
-    st.session_state["last_saved_at"] = f"Switched to {clean_code}"
-    return True, f"Switched to workspace `{clean_code}` (new/empty workspace ready)."
+    st.session_state["last_saved_at"] = f"Opened {clean_code}"
+    return True, f"Opened workspace `{clean_code}` (it has no saved state yet)."
+
+
+def open_saved_workspace(key: str) -> tuple[bool, str]:
+    """Save whatever is open right now, then switch to another saved workspace."""
+    try:
+        if st.session_state.get("source_videos") or st.session_state.get("clips"):
+            save_workspace_state(checkpoint_label="before_switch")
+    except Exception:
+        pass
+    ok, msg = load_workspace_by_code(key)
+    if ok:
+        try:
+            st.query_params["ws"] = st.session_state.get("workspace_key", key)
+        except Exception:
+            pass
+    return ok, msg
 
 
 def clear_rendered_clips_only() -> None:
@@ -609,6 +758,7 @@ def clear_workspace_data(ws_key: str, reset_session: bool = True) -> None:
         st.session_state["source_videos"] = []
         st.session_state["active_video_idx"] = 0
         st.session_state["used_clip_windows"] = []
+        st.session_state["offered_clip_windows"] = []
         st.session_state["source_video"] = None
         st.session_state["video_name"] = None
         st.session_state["video_info"] = None
@@ -1142,6 +1292,322 @@ def pick_good_hook(
     return chosen
 
 
+# ----------------------------- PEAK-MOMENT ENGINE ----------------------
+# Finds genuinely different peak moments every time. Windows that were already
+# offered or rendered are tracked, and fresh footage is always preferred.
+def _norm_windows(windows) -> list[list[float]]:
+    out: list[list[float]] = []
+    for w in windows or []:
+        if isinstance(w, (list, tuple)) and len(w) >= 2:
+            try:
+                a, b = float(w[0]), float(w[1])
+            except (TypeError, ValueError):
+                continue
+            if b > a:
+                out.append([a, b])
+    return out
+
+
+def _dedupe_windows(windows) -> list[list[float]]:
+    seen: set[tuple[float, float]] = set()
+    out: list[list[float]] = []
+    for a, b in _norm_windows(windows):
+        key = (round(a, 1), round(b, 1))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append([key[0], key[1]])
+    return out
+
+
+def _union_length(intervals: list[tuple[float, float]]) -> float:
+    total = 0.0
+    cur_s: float | None = None
+    cur_e: float | None = None
+    for a, b in sorted(intervals):
+        if b <= a:
+            continue
+        if cur_e is None or a > cur_e:
+            if cur_e is not None and cur_s is not None:
+                total += cur_e - cur_s
+            cur_s, cur_e = a, b
+        else:
+            cur_e = max(cur_e, b)
+    if cur_e is not None and cur_s is not None:
+        total += cur_e - cur_s
+    return total
+
+
+def window_overlap_fraction(start: float, end: float, windows: list[list[float]]) -> float:
+    span = max(0.001, float(end) - float(start))
+    clipped = [(max(a, start), min(b, end)) for a, b in windows if b > start and a < end]
+    return min(1.0, _union_length(clipped) / span)
+
+
+def used_coverage_fraction(duration: float, windows) -> float:
+    dur = max(1.0, float(duration or 1.0))
+    ivs = [(max(0.0, a), min(dur, b)) for a, b in _norm_windows(windows)]
+    return min(1.0, _union_length(ivs) / dur)
+
+
+def compute_energy_profile(video_path: str, duration: float = 0.0, has_audio: bool = True) -> list[float] | None:
+    """Per-second loudness (0..1) of the source audio. Cached beside the video file."""
+    if not has_audio or not video_path:
+        return None
+    vp = Path(video_path)
+    if not vp.exists():
+        return None
+    cache = vp.with_name(vp.name + ".energy.json")
+    try:
+        if cache.exists() and cache.stat().st_mtime >= vp.stat().st_mtime:
+            cached = json.loads(cache.read_text(encoding="utf-8"))
+            if isinstance(cached, list) and cached:
+                return [float(x) for x in cached]
+    except Exception:
+        pass
+    try:
+        import numpy as np
+    except Exception:
+        return None
+
+    sr = 8000
+    sec_bytes = sr * 2
+    cmd = ["ffmpeg", "-v", "error", "-i", str(vp), "-vn", "-ac", "1", "-ar", str(sr), "-f", "s16le", "-"]
+    levels: list[float] = []
+    leftover = b""
+    t0 = time.time()
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except Exception:
+        return None
+    try:
+        while True:
+            chunk = proc.stdout.read(sec_bytes * 30) if proc.stdout else b""
+            if not chunk:
+                break
+            data = leftover + chunk
+            n_full = len(data) // sec_bytes
+            if n_full:
+                arr = np.frombuffer(data[: n_full * sec_bytes], dtype=np.int16).astype(np.float32).reshape(n_full, sr)
+                rms = np.sqrt(np.mean(arr * arr, axis=1)) / 32768.0
+                levels.extend((20.0 * np.log10(rms + 1e-5)).tolist())
+            leftover = data[n_full * sec_bytes:]
+            if time.time() - t0 > 900:
+                proc.kill()
+                return None
+        if len(leftover) >= sec_bytes // 4:
+            arr = np.frombuffer(leftover[: (len(leftover) // 2) * 2], dtype=np.int16).astype(np.float32)
+            if arr.size:
+                rms = float(np.sqrt(np.mean(arr * arr))) / 32768.0
+                levels.append(float(20.0 * np.log10(rms + 1e-5)))
+    except Exception:
+        return None
+    finally:
+        try:
+            if proc.stdout:
+                proc.stdout.close()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+
+    if len(levels) < 3:
+        return None
+    lv = np.array(levels, dtype=np.float32)
+    lo, hi = float(np.percentile(lv, 10)), float(np.percentile(lv, 95))
+    if hi - lo < 3.0:
+        profile = [0.5] * len(levels)
+    else:
+        profile = np.clip((lv - lo) / (hi - lo), 0.0, 1.0).round(3).tolist()
+    try:
+        cache.write_text(json.dumps(profile), encoding="utf-8")
+    except Exception:
+        pass
+    return [float(x) for x in profile]
+
+
+def _transcript_density(transcript: dict | None, n_secs: int, key_terms: list[str]):
+    words = [0.0] * n_secs
+    hits = [0.0] * n_secs
+    starts: list[float] = []
+    key_set = {k.lower() for k in key_terms}
+    segs = (transcript or {}).get("segments") if isinstance(transcript, dict) else None
+    for sg in segs or []:
+        if not isinstance(sg, dict):
+            continue
+        try:
+            s = float(sg.get("start", 0.0) or 0.0)
+            e = float(sg.get("end", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        toks = re.findall(r"[a-z0-9']+", str(sg.get("text", "")).lower())
+        wc = len(toks)
+        if wc == 0:
+            continue
+        kh = sum(1 for t in toks if t in key_set)
+        if e <= s:
+            e = s + max(1.0, wc / 2.5)
+        starts.append(s)
+        span = max(0.001, e - s)
+        for i in range(max(0, int(s)), min(n_secs - 1, int(e)) + 1):
+            ov = max(0.0, min(e, i + 1) - max(s, i))
+            if ov > 0:
+                words[i] += wc * (ov / span)
+                hits[i] += kh * (ov / span)
+    return words, hits, starts
+
+
+def _prefix_sums(arr: list[float]) -> list[float]:
+    out = [0.0]
+    for v in arr:
+        out.append(out[-1] + v)
+    return out
+
+
+def _snap_to_segment_start(start: float, seg_starts: list[float], max_s: float, tol: float = 1.5) -> float:
+    if not seg_starts:
+        return start
+    nearest = min(seg_starts, key=lambda x: abs(x - start))
+    if abs(nearest - start) <= tol:
+        return max(0.0, min(max_s, nearest))
+    return start
+
+
+def _choose_part_count(total_target: float, safe_dur: float) -> int:
+    wanted = 3 if total_target <= 30.0 else 4
+    for n in range(wanted, 1, -1):
+        if total_target + 2.0 * (n - 1) + 0.5 <= safe_dur:
+            return n
+    return 1
+
+
+def _build_peak_moments(
+    duration: float,
+    desired_minutes: float | None,
+    used_windows: list[list[float]] | None,
+    transcript: dict | None = None,
+    allow_overlap: bool = False,
+    energy_profile: list[float] | None = None,
+    key_terms: list[str] | None = None,
+    rng: random.Random | None = None,
+) -> tuple[list[dict], int]:
+    """Returns (moments, relax_level). relax_level 0 = totally fresh footage."""
+    rng = rng or random.Random(uuid.uuid4().int)
+    safe_dur = max(0.5, float(duration or 15.0))
+    total_target = round(max(1.0, min(safe_dur, minutes_to_seconds(desired_minutes))), 1)
+    used = _norm_windows(used_windows)
+
+    if safe_dur <= 1.0 or total_target >= safe_dur - 0.5:
+        end_s = round(max(0.5, safe_dur), 1)
+        return [{"start": 0.0, "end": end_s, "text": transcript_slice(transcript, 0.0, end_s), "score": 0.0}], 3
+
+    num_parts = _choose_part_count(total_target, safe_dur)
+    raw_weights = [1.3, 0.85, 0.95, 1.1][:num_parts] if num_parts > 1 else [1.0]
+    w_sum = sum(raw_weights)
+    part_durs = [max(1.0, round((w / w_sum) * total_target, 1)) for w in raw_weights]
+    part_durs[-1] = round(max(0.8, part_durs[-1] + (total_target - sum(part_durs))), 1)
+
+    n_secs = int(math.ceil(safe_dur)) + 1
+    terms = list(key_terms or [])
+    words, hits, seg_starts = _transcript_density(transcript, n_secs, terms)
+    has_speech = sum(words) > 0
+    has_energy = bool(energy_profile) and len(energy_profile or []) >= 3
+    energy = list(energy_profile or [])
+    if has_energy and len(energy) < n_secs:
+        energy += [energy[-1]] * (n_secs - len(energy))
+    e_pre = _prefix_sums(energy) if has_energy else []
+    w_pre = _prefix_sums(words)
+    h_pre = _prefix_sums(hits)
+
+    def window_score(s: float, e: float) -> float:
+        i0 = max(0, int(s))
+        i1 = max(i0 + 1, min(n_secs, int(math.ceil(e))))
+        span = max(1, i1 - i0)
+        sc = 0.0
+        if has_energy:
+            mean_e = (e_pre[i1] - e_pre[i0]) / span
+            max_e = max(energy[i0:i1]) if i1 > i0 else mean_e
+            sc += 0.55 * mean_e + 0.20 * max_e
+        if has_speech:
+            sc += 0.30 * min(1.0, ((w_pre[i1] - w_pre[i0]) / span) / 3.0)
+            sc += 0.45 * min(1.0, ((h_pre[i1] - h_pre[i0]) / span) / 0.6)
+        return sc
+
+    def make_pool(d: float) -> list[tuple[float, float, float]]:
+        max_s = max(0.0, safe_dur - d)
+        if max_s <= 0.0:
+            return [(0.0, round(min(safe_dur, d), 1), 0.0)]
+        step = max(1.0, d / 2.0, safe_dur / 700.0)
+        offset = rng.uniform(0.0, step)
+        starts = []
+        t = offset if offset <= max_s else 0.0
+        while t <= max_s + 1e-6:
+            starts.append(round(min(max_s, t), 1))
+            t += step
+        starts.extend([0.0, round(max_s, 1)])
+        starts = [_snap_to_segment_start(s, seg_starts, max_s) for s in starts]
+        pool = []
+        seen: set[float] = set()
+        for s in sorted(set(round(x, 1) for x in starts)):
+            if s in seen:
+                continue
+            seen.add(s)
+            e = round(min(safe_dur, s + d), 1)
+            if e - s < min(d, 0.8):
+                continue
+            pool.append((s, e, window_score(s, e) + rng.uniform(0.0, 0.30)))
+        return pool
+
+    pools = [make_pool(d) for d in part_durs]
+    levels = [0.10, 0.25, 0.50] if allow_overlap else [0.0, 0.10, 0.25, 0.50]
+
+    def clash(s: float, e: float, chosen: list[dict], gap: float) -> bool:
+        return any(s < c["end"] + gap and e > c["start"] - gap for c in chosen)
+
+    def weighted_pick(cands: list[tuple[float, float, float]]) -> tuple[float, float, float]:
+        cands = sorted(cands, key=lambda x: -x[2])
+        top = cands[: max(4, int(len(cands) * 0.15))]
+        lo = min(c[2] for c in top)
+        weights = [((c[2] - lo) + 0.08) ** 2 for c in top]
+        return rng.choices(top, weights=weights, k=1)[0]
+
+    # Place the slots with the fewest options first so tight videos still work.
+    order = sorted(range(len(part_durs)), key=lambda i: len(pools[i]))
+    chosen: list[dict] = []
+    worst_level = 0
+    for idx in order:
+        pool = pools[idx]
+        pick = None
+        for gap in (2.0, 0.5):
+            for li, lvl in enumerate(levels):
+                cands = [
+                    p for p in pool
+                    if not clash(p[0], p[1], chosen, gap)
+                    and window_overlap_fraction(p[0], p[1], used) <= lvl + 1e-9
+                ]
+                if cands:
+                    pick = weighted_pick(cands)
+                    worst_level = max(worst_level, li)
+                    break
+            if pick:
+                break
+        if pick is None:
+            free = [p for p in pool if not clash(p[0], p[1], chosen, 0.0)] or pool
+            pick = min(free, key=lambda p: (window_overlap_fraction(p[0], p[1], used), -p[2]))
+            worst_level = len(levels)
+        chosen.append({
+            "start": float(pick[0]),
+            "end": float(pick[1]),
+            "text": transcript_slice(transcript, pick[0], pick[1]),
+            "score": round(float(pick[2]), 3),
+        })
+
+    chosen.sort(key=lambda m: m["start"])
+    return chosen, worst_level
+
+
 def build_stitched_peak_moments(
     duration: float,
     desired_minutes: float | None,
@@ -1149,67 +1615,18 @@ def build_stitched_peak_moments(
     transcript: dict | None = None,
     seed_offset: int = 0,
     allow_overlap: bool = False,
+    energy_profile: list[float] | None = None,
+    key_terms: list[str] | None = None,
 ) -> list[dict]:
-    safe_dur = max(0.5, float(duration or 15.0))
-    total_target = round(max(1.0, min(safe_dur, minutes_to_seconds(desired_minutes))), 1)
-    if safe_dur <= 1.0 or total_target <= 0:
-        end_s = round(max(0.5, safe_dur), 1)
-        return [{"start": 0.0, "end": end_s, "text": transcript_slice(transcript, 0.0, end_s)}]
-
-    num_parts = 3 if total_target <= 30.0 else 4
-    raw_weights = [1.3, 0.85, 0.95, 1.1][:num_parts]
-    w_sum = sum(raw_weights)
-    part_durs = [max(1.0, round((w / w_sum) * total_target, 1)) for w in raw_weights]
-    diff = round(total_target - sum(part_durs), 1)
-    part_durs[-1] = round(max(0.8, part_durs[-1] + diff), 1)
-
-    max_start_for_each = [max(0.0, safe_dur - d) for d in part_durs]
-    rng = random.Random(int(time.time() * 100) + int(seed_offset) * 37)
-    base_fracs = [0.12, 0.36, 0.62, 0.84][:num_parts]
-    rng.shuffle(base_fracs)
-
-    moments: list[dict] = []
-    combined_used = list(used_windows or [])
-
-    for idx, p_dur in enumerate(part_durs):
-        max_s = max_start_for_each[idx]
-        if max_s <= 0.0:
-            s_val = 0.0
-            e_val = round(min(safe_dur, p_dur), 1)
-            moments.append({"start": s_val, "end": e_val, "text": transcript_slice(transcript, s_val, e_val)})
-            continue
-
-        candidate_starts = [
-            round(max(0.0, min(max_s, base_fracs[idx] * max_s)), 1),
-            round(max(0.0, min(max_s, ((idx + 0.35 + (seed_offset * 0.19)) % 0.96) * max_s)), 1),
-        ]
-        for _ in range(6):
-            candidate_starts.append(round(rng.uniform(0.0, max_s), 1))
-
-        chosen_s = None
-        for cs in candidate_starts:
-            ce = round(min(safe_dur, cs + p_dur), 1)
-            if ce <= cs:
-                continue
-            already_in_clip = any(cs < (m["end"] + 2.0) and ce > (m["start"] - 2.0) for m in moments)
-            if allow_overlap or (not already_in_clip and not overlaps_used(cs, ce, combined_used, min_gap=1.5)):
-                chosen_s = cs
-                break
-
-        if chosen_s is None:
-            chosen_s = round(max(0.0, min(max_s, (idx / max(1, num_parts)) * max_s)), 1)
-
-        chosen_e = round(min(safe_dur, chosen_s + p_dur), 1)
-        if chosen_e <= chosen_s:
-            chosen_e = round(min(safe_dur, chosen_s + 0.8), 1)
-
-        moments.append({
-            "start": chosen_s,
-            "end": chosen_e,
-            "text": transcript_slice(transcript, chosen_s, chosen_e),
-        })
-        combined_used.append([chosen_s, chosen_e])
-
+    moments, _ = _build_peak_moments(
+        duration=duration,
+        desired_minutes=desired_minutes,
+        used_windows=used_windows,
+        transcript=transcript,
+        allow_overlap=allow_overlap,
+        energy_profile=energy_profile,
+        key_terms=key_terms,
+    )
     return moments
 
 
@@ -1227,31 +1644,38 @@ def build_auto_clip_candidates(
     custom_hook: str = "",
     force_custom_hook: bool = False,
     source_label: str = "Video",
+    energy_profile: list[float] | None = None,
+    title_offset: int = 0,
 ) -> list[dict]:
     count = max(1, min(6, int(clip_count or 2)))
     safe_dur = max(0.5, float(duration or 15.0))
     mins_val = max(0.10, float(desired_minutes or 0.50))
-    target_sec = round(min(safe_dur, minutes_to_seconds(mins_val)), 1)
     results: list[dict] = []
-    combined_used: list[list[float]] = [
-        [float(w[0]), float(w[1])]
-        for w in (used_windows or [])
-        if isinstance(w, (list, tuple)) and len(w) >= 2
-    ]
+    combined_used = _norm_windows(used_windows)
+
+    an = analysis if isinstance(analysis, dict) else {}
+    term_src = " ".join(
+        [str(brief or "")]
+        + [str(x) for f in ("must_include", "required_scenes_or_moments", "deliverables") for x in (an.get(f) or [])]
+    )
+    key_terms = _extract_key_terms(term_src, limit=14)
+    rng = random.Random(uuid.uuid4().int)
 
     for idx in range(count):
-        pick_num = len(used_windows or []) + idx + 1
-        moments = build_stitched_peak_moments(
+        moments, relax_level = _build_peak_moments(
             duration=safe_dur,
-            desired_minutes=desired_minutes,
+            desired_minutes=mins_val,
             used_windows=combined_used,
             transcript=transcript,
-            seed_offset=pick_num,
             allow_overlap=allow_overlap,
+            energy_profile=energy_profile,
+            key_terms=key_terms,
+            rng=rng,
         )
         for m in moments:
             combined_used.append([m["start"], m["end"]])
 
+        pick_num = int(title_offset) + idx + 1
         stitched_dur = round(sum(max(0.1, m["end"] - m["start"]) for m in moments), 1)
         all_spoken = " ".join(m["text"] for m in moments if m.get("text")).strip()
         span_summary = ", ".join(f"{m['start']:.0f}s–{m['end']:.0f}s" for m in moments)
@@ -1264,9 +1688,11 @@ def build_auto_clip_candidates(
             force_custom=force_custom_hook,
         )
         prefix = f"[{source_label}] " if source_label else ""
+        avg_score = sum(m.get("score", 0.0) for m in moments) / max(1, len(moments))
 
         results.append({
-            "title": f"{prefix}Peak Stitch #{pick_num} ({len(moments)} moments)",
+            "cid": uuid.uuid4().hex[:8],
+            "title": f"{prefix}Peak Stitch #{pick_num} ({len(moments)} moment{'s' if len(moments) != 1 else ''})",
             "source_video_name": source_label,
             "moments": moments,
             "start": moments[0]["start"] if moments else 0.0,
@@ -1278,13 +1704,13 @@ def build_auto_clip_candidates(
             "campaign_match": f"Stitched {len(moments)} peak moments ({stitched_dur:.1f}s)",
             "hook": str(good_hook)[:44],
             "risk": "",
-            "confidence": "high",
+            "confidence": "high" if avg_score >= 0.5 else "medium",
+            "relaxed": relax_level > 0,
+            "peak_score": round(avg_score, 3),
         })
 
-    if contact_sheet is not None and contact_sheet.exists():
-        contact_sheet.unlink(missing_ok=True)
-
     return results
+
 
 
 # ----------------------------- CAMPAIGN & CLIP INTELLIGENCE -------------
@@ -2359,7 +2785,12 @@ def build_audio_stage(
     vo_input_idx: int | None = None,
     orig_volume: float = 1.0,
     vo_volume: float = 1.15,
+    source_has_audio: bool = True,
 ) -> tuple[str, bool]:
+    # "0:a?" is only valid for -map, never inside a filter graph label.
+    input_spec = str(input_spec).rstrip("?")
+    if not source_has_audio:
+        mute_original = True
     has_vo = bool(voiceover_path and Path(voiceover_path).exists())
     if has_vo and vo_input_idx is None:
         vo_input_idx = sum(1 for i in range(0, len(inputs) - 1, 2) if inputs[i] == "-i")
@@ -2437,6 +2868,10 @@ def render_video(
 
     clip_duration = max(0.5, round(float(end) - float(start), 1))
     out_w, out_h = resolve_target_dimensions(aspect, resolution, src_w, src_h)
+    try:
+        src_has_audio = bool(probe_video(source).get("has_audio", True))
+    except Exception:
+        src_has_audio = True
 
     for ass_mode in (True, False):
         ascii_flag = not ass_mode
@@ -2482,7 +2917,8 @@ def render_video(
             a_label, custom_audio = build_audio_stage(
                 graph=graph,
                 inputs=inputs,
-                input_spec="0:a?",
+                input_spec="0:a",
+                source_has_audio=src_has_audio,
                 clip_duration=clip_duration,
                 mute_original=mute_original,
                 voiceover_path=voiceover_path,
@@ -2549,6 +2985,10 @@ def render_stitched_clip(
         raise RuntimeError("No peak moments selected to stitch.")
 
     out_w, out_h = resolve_target_dimensions(aspect, resolution, src_w, src_h)
+    try:
+        src_has_audio = bool(probe_video(source).get("has_audio", True))
+    except Exception:
+        src_has_audio = True
     ws_dir = workspace_dir(st.session_state.get("workspace_key", "default"))
     seg_files: list[Path] = []
     concat_list_path = ws_dir / f"concat_{next(tempfile._get_candidate_names())}.txt"
@@ -2568,8 +3008,8 @@ def render_stitched_clip(
             vf_seg = build_frame_stage_filter("0:v", out_w, out_h, aspect, "vseg", fit_mode=fit_mode)
             af_seg = (
                 f"anullsrc=r=44100:cl=stereo:d={seg_d:.2f},aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[aseg]"
-                if mute_original
-                else f"[0:a?]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,apad=pad_dur={seg_d:.2f},atrim=0:{seg_d:.2f},asetpts=PTS-STARTPTS[aseg]"
+                if (mute_original or not src_has_audio)
+                else f"[0:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,apad=pad_dur={seg_d:.2f},atrim=0:{seg_d:.2f},asetpts=PTS-STARTPTS[aseg]"
             )
             seg_graph = f"{vf_seg};{af_seg}"
             seg_cmd = [
@@ -2680,7 +3120,7 @@ def render_stitched_clip(
                 a_label, custom_audio = build_audio_stage(
                     graph=graph,
                     inputs=inputs,
-                    input_spec="0:a?",
+                    input_spec="0:a",
                     clip_duration=max(0.5, total_dur),
                     mute_original=mute_original,
                     voiceover_path=voiceover_path,
@@ -2891,9 +3331,62 @@ def burn_subtitles_into_clip(
     return clip_rec, "Could not burn subtitles—original clip was kept safe."
 
 
-def sync_auto_clip_count(source_key: str):
-    val = max(1, min(6, int(st.session_state.get(source_key) or 2)))
-    st.session_state["auto_clip_count"] = val
+def refresh_auto_candidates(mode: str = "pick_new") -> list[dict]:
+    """Single entry point for (re)generating peak-moment candidates.
+
+    mode="replan"   -> forget un-rendered picks, pick again (still avoids rendered clips)
+    mode="pick_new" -> keep everything already shown, pick spots that were never shown
+    mode="reset"    -> forget all used/offered spots and start over
+    """
+    ss = st.session_state
+    vi = ss.get("video_info") or {}
+    dur = max(1.0, float(vi.get("duration") or 10.0))
+    if mode == "reset":
+        ss["used_clip_windows"] = []
+        ss["offered_clip_windows"] = []
+    elif mode == "replan":
+        ss["offered_clip_windows"] = []
+    used = _dedupe_windows(ss.get("used_clip_windows"))
+    offered = _dedupe_windows(ss.get("offered_clip_windows"))
+    minutes = max(0.10, float(ss.get("auto_clip_minutes") or ss.get("desired_clip_minutes") or 0.50))
+    count = max(1, min(6, int(ss.get("auto_clip_count") or 2)))
+
+    energy = None
+    src = ss.get("source_video")
+    if src and Path(src).exists() and vi.get("has_audio", True):
+        try:
+            with st.spinner("Scanning the audio for peak moments..."):
+                energy = compute_energy_profile(str(src), dur, True)
+        except Exception:
+            energy = None
+
+    cands = build_auto_clip_candidates(
+        brief=str(ss.get("brief") or ""),
+        transcript=ss.get("transcript"),
+        contact_sheet=None,
+        duration=dur,
+        target_platform=str(ss.get("target_platform_choice") or "YouTube + IG + Facebook"),
+        clip_count=count,
+        desired_minutes=minutes,
+        used_windows=used + offered,
+        allow_overlap=bool(ss.get("allow_overlap_windows", False)),
+        analysis=ss.get("brief_analysis"),
+        custom_hook=str(ss.get("custom_hook_fallback") or ""),
+        force_custom_hook=bool(ss.get("force_custom_hook", False)),
+        source_label=str(ss.get("video_name") or "Video"),
+        energy_profile=energy,
+        title_offset=len(ss.get("clips") or []),
+    )
+    new_offered = list(offered)
+    for c in cands:
+        c["plan_minutes"] = round(minutes, 4)
+        c["plan_count"] = count
+        for m in c.get("moments") or []:
+            new_offered.append([round(float(m["start"]), 1), round(float(m["end"]), 1)])
+    ss["offered_clip_windows"] = _dedupe_windows(new_offered)
+    ss["auto_candidates"] = cands
+    sync_legacy_keys_to_active_video()
+    return cands
 
 
 def init_state():
@@ -2913,6 +3406,7 @@ def init_state():
         "desired_clip_minutes": 0.50,
         "auto_clip_minutes": 0.50,
         "used_clip_windows": [],
+        "offered_clip_windows": [],
         "hook_mode_choice": "Standard Clip Length (Exact Minutes)",
         "hook_banner_scope": "8-Second Top Banner (0–8s)",
         "pending_hook_banner_scope": None,
@@ -2960,39 +3454,17 @@ def init_state():
 
     if not st.session_state.get("workspace_loaded_once"):
         st.session_state["workspace_loaded_once"] = True
+        qp_ws = ""
+        try:
+            qp_ws = str(st.query_params.get("ws", "") or "")
+        except Exception:
+            qp_ws = ""
+        if qp_ws and not st.session_state.get("source_videos") and not st.session_state.get("clips"):
+            try:
+                load_workspace_by_code(qp_ws)
+            except Exception:
+                pass
         sync_active_video_to_legacy_keys()
-
-
-def load_workspace_by_code(ws_code: str) -> tuple[bool, str]:
-    cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "", (ws_code or "").strip())
-    if not cleaned:
-        return False, "Please enter a valid Workspace Code first."
-
-    candidate_names = [cleaned]
-    if not cleaned.startswith("session_"):
-        candidate_names.append(f"session_{cleaned}")
-
-    for name in candidate_names:
-        wdir = WORKSPACES_ROOT / safe_name(name)
-        state_file = wdir / "workspace_state.json"
-        if state_file.exists():
-            st.session_state["workspace_key"] = name
-            if load_state_from_file(state_file):
-                return True, f"Loaded workspace `{name}`."
-
-    # Also check if a directory with that code exists even without a root state file
-    for name in candidate_names:
-        wdir = WORKSPACES_ROOT / safe_name(name)
-        if wdir.exists() and wdir.is_dir():
-            ckpts = list_checkpoints(name)
-            st.session_state["workspace_key"] = name
-            if ckpts and load_state_from_file(ckpts[0]["path"]):
-                return True, f"Loaded latest checkpoint from workspace `{name}`."
-            wdir.mkdir(parents=True, exist_ok=True)
-            sync_active_video_to_legacy_keys()
-            return True, f"Switched to workspace `{name}` (no prior saved state file found yet)."
-
-    return False, f"No saved workspace found for code `{cleaned}`. If you are on another computer, import your exported `.JSON` project state under Brand Kit & Settings."
 
 
 def stamp_logo_onto_existing_clip(
@@ -3144,6 +3616,7 @@ st.markdown(f"""<div class="hero">
 <span class="pill">Up to {MAX_SOURCE_VIDEOS} Source Videos</span>
 <span class="pill">SRT + Logo Side-by-Side</span>
 <span class="pill">Workspace Code Loader</span>
+<span class="pill">Never-Repeat Peak Picker</span>
 <span class="pill">Post-Clip Logo Stamp</span>
 </div>""", unsafe_allow_html=True)
 
@@ -3163,6 +3636,7 @@ with st.sidebar:
         "Manual Clipper (Start → End)",
         "Brand Kit & Settings",
         "Videos Extracted",
+        "Saved Work",
     ], label_visibility="collapsed", key="nav_page_radio")
 
     st.divider()
@@ -3183,6 +3657,25 @@ with st.sidebar:
 
     if st.session_state.get("last_saved_at"):
         st.caption(f"Last saved: `{st.session_state['last_saved_at']}`")
+
+    saved_ws_all = [w for w in list_saved_workspaces() if not w["current"]]
+    if saved_ws_all:
+        if not slots_now and not st.session_state.get("clips"):
+            st.info("📁 You have saved work. Open it below or on the **Saved Work** page.")
+        quick = saved_ws_all[:15]
+        q_idx = st.selectbox(
+            "Open saved work",
+            list(range(len(quick))),
+            format_func=lambda i: f"{quick[i]['project_name']} · {quick[i]['n_clips']} clip(s) · {quick[i]['saved_at'] or quick[i]['key']}",
+            key="sb_saved_ws_sel",
+        )
+        if st.button("📂 Open Selected Work", width="stretch", key="sb_open_saved_btn"):
+            ok_q, msg_q = open_saved_workspace(quick[int(q_idx)]["key"])
+            if ok_q:
+                st.success(msg_q)
+                st.rerun()
+            else:
+                st.error(msg_q)
 
     if st.button("💾 Save Checkpoint Now", width="stretch", key="sb_save_ckpt_btn"):
         save_named_checkpoint("Manual Checkpoint")
@@ -3466,30 +3959,8 @@ if page == "Campaign & Auto-Clipper":
                                         st.session_state.transcript = tr
                                 except Exception as t_exc:
                                     st.warning(f"Transcription skipped: {t_exc}")
-                            sheet = None
-                            try:
-                                sheet = make_contact_sheet(
-                                    st.session_state.source_video,
-                                    float(st.session_state.video_info.get("duration") or 10.0),
-                                    max_frames=6,
-                                )
-                            except Exception:
-                                sheet = None
-                            st.session_state.auto_candidates = build_auto_clip_candidates(
-    brief=str(st.session_state.brief or ""),
-    transcript=tr,
-    contact_sheet=sheet,
-    duration=float(st.session_state.video_info.get("duration") or 10.0),
-    target_platform=str(st.session_state.target_platform_choice or "YouTube + IG + Facebook"),
-    clip_count=active_count,
-    desired_minutes=float(st.session_state.desired_clip_minutes or 0.50),
-    used_windows=list(st.session_state.used_clip_windows or []),
-    allow_overlap=bool(st.session_state.get("allow_overlap_windows", False)),
-    analysis=analysis,
-    custom_hook=str(st.session_state.get("custom_hook_fallback") or ""),
-    force_custom_hook=bool(st.session_state.get("force_custom_hook", False)),
-    source_label=str(st.session_state.video_name or "Video"),
-)
+                            with st.spinner("Picking fresh peak moments..."):
+                                refresh_auto_candidates("replan")
                             st.session_state.campaign_feedback = evaluate_video_against_campaign(
                                 analysis, st.session_state.video_info, st.session_state.transcript, total_videos=len(slots_now)
                             )
@@ -3552,21 +4023,7 @@ if page == "Campaign & Auto-Clipper":
                     vi_go = st.session_state.get("video_info") or {}
                     dur_go = max(1.0, float(vi_go.get("duration") or 10.0))
                     cnt_go = max(1, min(6, int(st.session_state.get("auto_clip_count", 2) or 2)))
-                    st.session_state["auto_candidates"] = build_auto_clip_candidates(
-                        brief=str(st.session_state.get("brief") or ""),
-                        transcript=st.session_state.get("transcript"),
-                        contact_sheet=None,
-                        duration=dur_go,
-                        target_platform=str(st.session_state.get("target_platform_choice") or "YouTube + IG + Facebook"),
-                        clip_count=cnt_go,
-                        desired_minutes=mins_val,
-                        used_windows=list(st.session_state.get("used_clip_windows") or []),
-                        allow_overlap=bool(st.session_state.get("allow_overlap_windows", False)),
-                        analysis=st.session_state.get("brief_analysis"),
-                        custom_hook=str(st.session_state.get("custom_hook_fallback") or ""),
-                        force_custom_hook=bool(st.session_state.get("force_custom_hook", False)),
-                        source_label=str(st.session_state.get("video_name") or "Video"),
-                    )
+                    refresh_auto_candidates("replan")
                     st.session_state["go_ahead_clips"] = True
                     sync_legacy_keys_to_active_video()
                     save_workspace_state(checkpoint_label="go_ahead")
@@ -3606,42 +4063,11 @@ if page == "Campaign & Auto-Clipper":
 
         with ctrl3:
             if st.button("🔄 Pick Different Peak Spots", width="stretch", key="pick_fresh_spots_btn"):
-                st.session_state.auto_candidates = build_auto_clip_candidates(
-                    brief=str(st.session_state.brief or ""),
-                    transcript=st.session_state.transcript,
-                    contact_sheet=None,
-                    duration=dur,
-                    target_platform=str(st.session_state.target_platform_choice or "YouTube + IG + Facebook"),
-                    clip_count=active_count,
-                    desired_minutes=active_minutes,
-                    used_windows=list(st.session_state.used_clip_windows or []),
-                    allow_overlap=bool(st.session_state.get("allow_overlap_windows", False)),
-                    analysis=st.session_state.brief_analysis,
-                    custom_hook=str(st.session_state.get("custom_hook_fallback") or ""),
-                    force_custom=bool(st.session_state.get("force_custom_hook", False)),
-                    source_label=str(st.session_state.video_name or "Video"),
-                )
-                sync_legacy_keys_to_active_video()
+                refresh_auto_candidates("pick_new")
                 save_workspace_state(checkpoint_label="fresh_spots")
         with ctrl4:
             if st.button("🧹 Reset Used Spots", width="stretch", key="reset_used_ranges_btn"):
-                st.session_state.used_clip_windows = []
-                st.session_state.auto_candidates = build_auto_clip_candidates(
-                    brief=str(st.session_state.brief or ""),
-                    transcript=st.session_state.transcript,
-                    contact_sheet=None,
-                    duration=dur,
-                    target_platform=str(st.session_state.target_platform_choice or "YouTube + IG + Facebook"),
-                    clip_count=active_count,
-                    desired_minutes=active_minutes,
-                    used_windows=[],
-                    allow_overlap=bool(st.session_state.get("allow_overlap_windows", False)),
-                    analysis=st.session_state.brief_analysis,
-                    custom_hook=str(st.session_state.get("custom_hook_fallback") or ""),
-                    force_custom=bool(st.session_state.get("force_custom_hook", False)),
-                    source_label=str(st.session_state.video_name or "Video"),
-                )
-                sync_legacy_keys_to_active_video()
+                refresh_auto_candidates("reset")
                 save_workspace_state(checkpoint_label="reset_windows")
 
         st.checkbox("Allow overlapping moments if source video is short", key="allow_overlap_windows")
@@ -3653,20 +4079,25 @@ if page == "Campaign & Auto-Clipper":
             f"Aspect: **{default_asp}** · Watermark: **{st.session_state.get('logo_watermark_mode', 'Standard Corner (Subtle)')}**."
         )
 
-        cands = st.session_state.auto_candidates or build_auto_clip_candidates(
-            brief=str(st.session_state.brief or ""),
-            transcript=st.session_state.transcript,
-            contact_sheet=None,
-            duration=dur,
-            target_platform=str(st.session_state.target_platform_choice or "YouTube + IG + Facebook"),
-            clip_count=active_count,
-            desired_minutes=active_minutes,
-            used_windows=list(st.session_state.used_clip_windows or []),
-            allow_overlap=bool(st.session_state.get("allow_overlap_windows", False)),
-            analysis=st.session_state.brief_analysis,
-            source_label=str(st.session_state.video_name or "Video"),
+        cands = list(st.session_state.auto_candidates or [])
+        plan_ok = (
+            bool(cands)
+            and len(cands) == active_count
+            and all(abs(float(c.get("plan_minutes", -1)) - round(active_minutes, 4)) < 1e-6 for c in cands)
+            and all(c.get("cid") for c in cands)
         )
+        if not plan_ok:
+            cands = refresh_auto_candidates("replan")
         cands = cands[:active_count]
+
+        fresh_pct = 100.0 * (1.0 - used_coverage_fraction(
+            dur,
+            list(st.session_state.get("used_clip_windows") or []) + list(st.session_state.get("offered_clip_windows") or []),
+        ))
+        st.caption(
+            f"🎯 Fresh footage left: **{fresh_pct:.0f}%** · every click on *Pick Different Peak Spots* avoids all spots "
+            "already shown or rendered. Moments are ranked by audio energy, speech density and your brief keywords."
+        )
 
         q_col1, q_col2, q_col3, q_col4 = st.columns(4)
         with q_col1:
@@ -3701,11 +4132,13 @@ if page == "Campaign & Auto-Clipper":
                 f"**{cand.get('title', f'Peak Stitch #{idx+1}')}** — Total: **{stitched_sec:.1f}s** (`{active_minutes:.2f} min`)\n\n"
                 f"Stitched spots: {chain_str}"
             )
+            if cand.get("relaxed"):
+                st.caption("♻️ Most fresh footage is already used, so this pick overlaps the least-used spots.")
             edited_hook = st.text_input(
                 f"Hook banner for {cand.get('title', f'Peak Stitch #{idx+1}')} (edit anytime before stitching)",
                 value=cand.get("hook", ""),
                 max_chars=48,
-                key=f"sec3_cand_hook_{idx}",
+                key=f"sec3_cand_hook_{cand.get('cid', idx)}",
             )
             cand["hook"] = edited_hook
 
@@ -3755,7 +4188,7 @@ if page == "Campaign & Auto-Clipper":
                     m.get("text") or transcript_slice(st.session_state.transcript, float(m["start"]), float(m["end"]))
                     for m in moments
                 ))
-                raw_cand_hook = (st.session_state.get(f"sec3_cand_hook_{idx}") or cand.get("hook") or "").strip()
+                raw_cand_hook = (st.session_state.get(f"sec3_cand_hook_{cand.get('cid', idx)}") or cand.get("hook") or "").strip()
                 if st.session_state.get("force_custom_hook") and (st.session_state.get("custom_hook_fallback") or "").strip():
                     raw_cand_hook = st.session_state.get("custom_hook_fallback", "").strip()
                 final_hook = normalize_english_subtitle_text(raw_cand_hook) or pick_good_hook(
@@ -3865,21 +4298,7 @@ if page == "Campaign & Auto-Clipper":
             status_slot.empty()
             if rendered_now:
                 st.session_state.clips.extend(rendered_now)
-                st.session_state.auto_candidates = build_auto_clip_candidates(
-                    brief=str(st.session_state.brief or ""),
-                    transcript=st.session_state.transcript,
-                    contact_sheet=None,
-                    duration=dur,
-                    target_platform=str(st.session_state.target_platform_choice or "YouTube + IG + Facebook"),
-                    clip_count=active_count,
-                    desired_minutes=active_minutes,
-                    used_windows=list(st.session_state.used_clip_windows or []),
-                    allow_overlap=bool(st.session_state.get("allow_overlap_windows", False)),
-                    analysis=st.session_state.brief_analysis,
-                    custom_hook=str(st.session_state.get("custom_hook_fallback") or ""),
-                    force_custom=bool(st.session_state.get("force_custom_hook", False)),
-                    source_label=str(st.session_state.video_name or "Video"),
-                )
+                refresh_auto_candidates("replan")
                 sync_legacy_keys_to_active_video()
                 save_workspace_state(checkpoint_label="section3_rendered")
                 st.success(f"Generated {len(rendered_now)} clip(s) in {time.time() - t0:.1f}s. Open **Videos Extracted** to download, stamp logo, or generate captions.")
@@ -4133,6 +4552,73 @@ elif page == "Brand Kit & Settings":
     st.selectbox("Default Logo Watermark Mode", LOGO_WATERMARK_MODES, key="logo_watermark_mode")
     st.text_input("Brand Name", key="brand_name")
     st.text_input("Brand Accent Colour", key="brand_colour")
+
+
+# ----------------------------- PAGE 4: SAVED WORK ----------------------
+elif page == "Saved Work":
+    st.subheader("📁 Saved Work")
+    st.caption(
+        f"Everything is auto-saved in `{WORKSPACES_ROOT}`. Open any project to continue exactly where you stopped "
+        "(videos, spots already used, clips, captions, settings)."
+    )
+    saved_items = list_saved_workspaces()
+    if not saved_items:
+        st.info("Nothing saved yet. Load a video and start clipping; your work is saved automatically.")
+    else:
+        newest_other = next((w for w in saved_items if not w["current"]), None)
+        if newest_other and not slots_now and not st.session_state.get("clips"):
+            if st.button(f"▶ Resume most recent: {newest_other['project_name']}", type="primary", key="sw_resume_latest_btn"):
+                ok_r, msg_r = open_saved_workspace(newest_other["key"])
+                if ok_r:
+                    st.rerun()
+                else:
+                    st.error(msg_r)
+
+        for w_item in saved_items:
+            with st.container(border=True):
+                info_col, act_col = st.columns([3.2, 1.2])
+                with info_col:
+                    tag = "  ·  🟢 **open now**" if w_item["current"] else ""
+                    st.markdown(f"**{w_item['project_name']}**{tag}")
+                    st.caption(
+                        f"Code: `{w_item['key']}` · Saved: {w_item['saved_at'] or 'unknown'} "
+                        f"({w_item['label'] or 'autosave'}) · {w_item['n_videos']} video(s) · {w_item['n_clips']} clip(s)"
+                    )
+                    if w_item["brief"]:
+                        st.caption(f"Brief: {w_item['brief']}…")
+                with act_col:
+                    if st.button("📂 Open", disabled=w_item["current"], width="stretch", key=f"sw_open_{w_item['key']}"):
+                        ok_o, msg_o = open_saved_workspace(w_item["key"])
+                        if ok_o:
+                            st.success(msg_o)
+                            st.rerun()
+                        else:
+                            st.error(msg_o)
+
+                if w_item["clips"]:
+                    show_clips = st.toggle(
+                        f"Preview & download {w_item['n_clips']} saved clip(s)",
+                        key=f"sw_prev_{w_item['key']}",
+                    )
+                    if show_clips:
+                        for c_i, sc in enumerate(w_item["clips"]):
+                            st.markdown(f"**{c_i + 1}. {sc['name']}** {('· ' + sc['aspect']) if sc.get('aspect') else ''}")
+                            st.video(sc["path"])
+                            with open(sc["path"], "rb") as fh_sc:
+                                st.download_button(
+                                    f"⬇ Download clip {c_i + 1}",
+                                    fh_sc,
+                                    file_name=Path(sc["path"]).name,
+                                    mime="video/mp4",
+                                    key=f"sw_dl_{w_item['key']}_{c_i}",
+                                )
+
+                if not w_item["current"]:
+                    with st.expander("Delete this saved project"):
+                        sure = st.checkbox("Yes, permanently delete its videos and clips", key=f"sw_sure_{w_item['key']}")
+                        if st.button("🗑️ Delete", disabled=not sure, key=f"sw_del_{w_item['key']}"):
+                            shutil.rmtree(w_item["dir"], ignore_errors=True)
+                            st.rerun()
 
 
 # ----------------------------- SECTION 4–6: EXTRACTED CLIPS ------------
