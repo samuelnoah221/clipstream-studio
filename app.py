@@ -23,6 +23,8 @@ import streamlit.components.v1 as components
 APP_NAME = "ClipStream Studio"
 MAX_UPLOAD_MB = 2048
 MAX_SOURCE_VIDEOS = 3
+MIN_CLIP_SECONDS = 3.0
+MAX_CLIP_SECONDS = 900.0
 LEGACY_WORK_DIR = Path(tempfile.gettempdir()) / "clipstream_studio"
 
 
@@ -110,6 +112,12 @@ CAPTION_STYLES = [
     "Campaign / CTA",
 ]
 
+MOMENT_ORDERS = [
+    "Chronological (story order)",
+    "Strongest first (hook)",
+    "Shuffle (random mix)",
+]
+
 SUBTITLE_ACCENT_PALETTE = {
     "Creator Yellow": "&H0000D7FF",
     "Electric Cyan": "&H00FFFF00",
@@ -119,8 +127,10 @@ SUBTITLE_ACCENT_PALETTE = {
 
 STATE_FIELDS = [
     "project_name", "brief", "brief_analysis", "campaign_feedback",
-    "go_ahead_clips", "target_platform_choice", "desired_clip_minutes",
-    "auto_clip_minutes", "used_clip_windows", "offered_clip_windows", "moments_per_clip", "moment_order", "hook_mode_choice",
+    "go_ahead_clips", "target_platform_choice", "desired_clip_seconds",
+    "auto_clip_seconds", "used_clip_windows", "offered_clip_windows",
+    "mix_used_windows", "mix_offered_windows", "mix_signatures", "mix_all_videos",
+    "moments_per_clip", "moment_order", "hook_mode_choice",
     "hook_banner_scope", "custom_hook_fallback", "force_custom_hook",
     "burn_subtitles_chk_v2", "subtitle_language", "onscreen_caption_size",
     "subtitle_accent_colour", "vertical_fit_mode", "logo_watermark_mode",
@@ -178,9 +188,20 @@ def fmt_srt_time(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
-def minutes_to_seconds(minutes: float | None) -> float:
-    val = 0.50 if minutes is None else float(minutes)
-    return round(max(1.0, val * 60.0), 1)
+def _clamp_secs(value, default: float = 30.0) -> float:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        v = default
+    return float(max(MIN_CLIP_SECONDS, min(MAX_CLIP_SECONDS, v)))
+
+
+def _floor1(x: float) -> float:
+    return math.floor(float(x) * 10.0 + 1e-6) / 10.0
+
+
+def _ceil1(x: float) -> float:
+    return math.ceil(float(x) * 10.0 - 1e-6) / 10.0
 
 
 def default_aspect_for_platform(platform: str) -> str:
@@ -379,12 +400,16 @@ def _collect_state_payload(checkpoint_label: str = "autosave") -> dict:
         "go_ahead_clips": bool(st.session_state.get("go_ahead_clips", False)),
         "target_platform_choice": st.session_state.get("target_platform_choice", "YouTube + IG + Facebook"),
         "auto_clip_count": int(st.session_state.get("auto_clip_count") or 2),
-        "desired_clip_minutes": float(st.session_state.get("desired_clip_minutes") or 0.50),
-        "auto_clip_minutes": float(st.session_state.get("auto_clip_minutes") or 0.50),
+        "desired_clip_seconds": _clamp_secs(st.session_state.get("desired_clip_seconds"), 30.0),
+        "auto_clip_seconds": _clamp_secs(st.session_state.get("auto_clip_seconds"), 30.0),
         "used_clip_windows": st.session_state.get("used_clip_windows", []),
         "offered_clip_windows": st.session_state.get("offered_clip_windows", []),
+        "mix_used_windows": st.session_state.get("mix_used_windows", {}),
+        "mix_offered_windows": st.session_state.get("mix_offered_windows", {}),
+        "mix_signatures": list(st.session_state.get("mix_signatures") or [])[-300:],
+        "mix_all_videos": bool(st.session_state.get("mix_all_videos", True)),
         "moments_per_clip": int(st.session_state.get("moments_per_clip") or 0),
-        "moment_order": st.session_state.get("moment_order", "Chronological (story order)"),
+        "moment_order": st.session_state.get("moment_order", MOMENT_ORDERS[0]),
         "hook_mode_choice": st.session_state.get("hook_mode_choice", "Standard Clip Length (Exact Minutes)"),
         "hook_banner_scope": st.session_state.get("hook_banner_scope", "8-Second Top Banner (0–8s)"),
         "custom_hook_fallback": st.session_state.get("custom_hook_fallback", ""),
@@ -483,11 +508,28 @@ def apply_state_payload(data: dict) -> bool:
         st.session_state["vertical_fit_mode"] = "Fit All (Full Frame + Ambient Blur)"
     if st.session_state.get("logo_watermark_mode") not in LOGO_WATERMARK_MODES:
         st.session_state["logo_watermark_mode"] = "Standard Corner (Subtle)"
+    if st.session_state.get("moment_order") not in MOMENT_ORDERS:
+        st.session_state["moment_order"] = MOMENT_ORDERS[0]
 
     cnt = max(1, min(6, int(data.get("auto_clip_count") or 2)))
     st.session_state["auto_clip_count"] = cnt
-    st.session_state["desired_clip_minutes"] = float(data.get("desired_clip_minutes") or 0.50)
-    st.session_state["auto_clip_minutes"] = float(data.get("auto_clip_minutes") or st.session_state["desired_clip_minutes"])
+
+    legacy_secs = None
+    if data.get("desired_clip_minutes"):
+        try:
+            legacy_secs = float(data["desired_clip_minutes"]) * 60.0
+        except (TypeError, ValueError):
+            legacy_secs = None
+    st.session_state["desired_clip_seconds"] = _clamp_secs(data.get("desired_clip_seconds") or legacy_secs, 30.0)
+    st.session_state["auto_clip_seconds"] = _clamp_secs(
+        data.get("auto_clip_seconds") or legacy_secs or st.session_state["desired_clip_seconds"], 30.0
+    )
+    if not isinstance(st.session_state.get("mix_used_windows"), dict):
+        st.session_state["mix_used_windows"] = {}
+    if not isinstance(st.session_state.get("mix_offered_windows"), dict):
+        st.session_state["mix_offered_windows"] = {}
+    if not isinstance(st.session_state.get("mix_signatures"), list):
+        st.session_state["mix_signatures"] = []
 
     valid_slots: list[dict] = []
     for sl in data.get("source_videos") or []:
@@ -761,6 +803,9 @@ def clear_workspace_data(ws_key: str, reset_session: bool = True) -> None:
         st.session_state["active_video_idx"] = 0
         st.session_state["used_clip_windows"] = []
         st.session_state["offered_clip_windows"] = []
+        st.session_state["mix_used_windows"] = {}
+        st.session_state["mix_offered_windows"] = {}
+        st.session_state["mix_signatures"] = []
         st.session_state["source_video"] = None
         st.session_state["video_name"] = None
         st.session_state["video_info"] = None
@@ -1131,20 +1176,7 @@ def render_fast_voice_reader(text: str, label: str = "🔊 Fast Readout (Zero Da
     )
 
 
-# ----------------------------- AUTO-CLIPPING & GROUNDED HOOK HELPERS --
-def overlaps_used(start: float, end: float, used_windows: list[list[float]], min_gap: float = 2.0) -> bool:
-    for win in used_windows or []:
-        if not isinstance(win, (list, tuple)) or len(win) < 2:
-            continue
-        try:
-            u_start, u_end = float(win[0]), float(win[1])
-        except (TypeError, ValueError):
-            continue
-        if start < (u_end + min_gap) and end > (u_start - min_gap):
-            return True
-    return False
-
-
+# ----------------------------- HOOK HELPERS -----------------------------
 def transcript_slice(transcript: dict | None, start: float, end: float) -> str:
     if not isinstance(transcript, dict):
         return ""
@@ -1163,7 +1195,7 @@ def transcript_slice(transcript: dict | None, start: float, end: float) -> str:
     if joined:
         return joined
     full_txt = str(transcript.get("text") or "").strip()
-    return full_txt[:350]
+    return full_txt[:350] if segs == [] else ""
 
 
 def _extract_key_terms(text: str, limit: int = 6) -> list[str]:
@@ -1294,9 +1326,11 @@ def pick_good_hook(
     return chosen
 
 
-# ----------------------------- PEAK-MOMENT ENGINE ----------------------
-# Finds genuinely different peak moments every time. Windows that were already
-# offered or rendered are tracked, and fresh footage is always preferred.
+# ----------------------------- PEAK-MOMENT ENGINE (MULTI-VIDEO MIX) ----
+# Every loaded video is scanned (audio loudness, on-screen motion, speech,
+# brief keywords). Each clip is built from moments taken from DIFFERENT videos,
+# the total always tallies with the seconds you typed, and no two clips share
+# the same recipe. If no signal exists at all, spots are guessed at random.
 def _norm_windows(windows) -> list[list[float]]:
     out: list[list[float]] = []
     for w in windows or []:
@@ -1415,7 +1449,7 @@ def compute_energy_profile(video_path: str, duration: float = 0.0, has_audio: bo
         except Exception:
             proc.kill()
 
-    if len(levels) < 3:
+    if len(levels) < 2:
         return None
     lv = np.array(levels, dtype=np.float32)
     lo, hi = float(np.percentile(lv, 10)), float(np.percentile(lv, 95))
@@ -1428,6 +1462,86 @@ def compute_energy_profile(video_path: str, duration: float = 0.0, has_audio: bo
     except Exception:
         pass
     return [float(x) for x in profile]
+
+
+def compute_motion_profile(video_path: str, duration: float = 0.0) -> list[float] | None:
+    """Per-second visual activity (0..1) from frame-to-frame change. Works on silent videos.
+    Cached beside the video file. Gives up after ~4 minutes (very long videos)."""
+    if not video_path:
+        return None
+    vp = Path(video_path)
+    if not vp.exists():
+        return None
+    cache = vp.with_name(vp.name + ".motion.json")
+    try:
+        if cache.exists() and cache.stat().st_mtime >= vp.stat().st_mtime:
+            cached = json.loads(cache.read_text(encoding="utf-8"))
+            if isinstance(cached, list):
+                return [float(x) for x in cached] if cached else None
+    except Exception:
+        pass
+    try:
+        import numpy as np
+    except Exception:
+        return None
+
+    fps, w, h = 4, 48, 28
+    frame_bytes = w * h
+    cmd = [
+        "ffmpeg", "-v", "error", "-i", str(vp), "-an",
+        "-vf", f"fps={fps},scale={w}:{h},format=gray", "-f", "rawvideo", "-",
+    ]
+    diffs: list[float] = []
+    prev = None
+    buf = b""
+    t0 = time.time()
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except Exception:
+        return None
+    try:
+        while True:
+            chunk = proc.stdout.read(frame_bytes * fps * 10) if proc.stdout else b""
+            if not chunk:
+                break
+            buf += chunk
+            n_full = len(buf) // frame_bytes
+            for i in range(n_full):
+                frame = np.frombuffer(buf[i * frame_bytes:(i + 1) * frame_bytes], dtype=np.uint8).astype(np.float32)
+                diffs.append(0.0 if prev is None else float(np.mean(np.abs(frame - prev))))
+                prev = frame
+            buf = buf[n_full * frame_bytes:]
+            if time.time() - t0 > 240:
+                proc.kill()
+                return None
+    except Exception:
+        return None
+    finally:
+        try:
+            if proc.stdout:
+                proc.stdout.close()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+
+    if len(diffs) < fps:
+        return None
+    n_sec = len(diffs) // fps
+    per_sec = [float(np.mean(diffs[i * fps:(i + 1) * fps])) for i in range(n_sec)]
+    arr = np.array(per_sec, dtype=np.float32)
+    lo, hi = float(np.percentile(arr, 10)), float(np.percentile(arr, 95))
+    if hi - lo < 0.4:
+        profile: list[float] = []
+    else:
+        profile = np.clip((arr - lo) / (hi - lo), 0.0, 1.0).round(3).tolist()
+    try:
+        cache.write_text(json.dumps(profile), encoding="utf-8")
+    except Exception:
+        pass
+    return [float(x) for x in profile] or None
 
 
 def _transcript_density(transcript: dict | None, n_secs: int, key_terms: list[str]):
@@ -1481,234 +1595,309 @@ def _gap_for(n_parts: int) -> float:
     return 2.0 if n_parts <= 4 else 0.75
 
 
-def _choose_part_count(total_target: float, safe_dur: float, requested: int = 0) -> int:
-    """How many moments one clip can really hold. requested=0 means Auto (3-4)."""
+def _choose_part_count(total_target: float, requested: int = 0, n_src: int = 1) -> int:
+    """How many moments one clip holds. requested=0 means Auto (at least one per loaded video)."""
     try:
         req = int(requested or 0)
     except (TypeError, ValueError):
         req = 0
-    wanted = req if req > 0 else (3 if total_target <= 30.0 else 4)
+    wanted = req if req > 0 else max(int(n_src or 1), 3 if total_target <= 30.0 else 4)
     wanted = max(1, min(12, wanted))
-    min_seg = 1.5 if req > 0 else 1.0
-    for n in range(wanted, 0, -1):
-        if n > 1 and total_target / n < min_seg:
-            continue
-        if total_target + _gap_for(n) * (n - 1) + 0.5 <= safe_dur:
-            return n
-    return 1
+    while wanted > 1 and total_target / wanted < 1.0:
+        wanted -= 1
+    return wanted
 
 
-def _build_peak_moments(
-    duration: float,
-    desired_minutes: float | None,
-    used_windows: list[list[float]] | None,
-    transcript: dict | None = None,
-    allow_overlap: bool = False,
-    energy_profile: list[float] | None = None,
-    key_terms: list[str] | None = None,
-    rng: random.Random | None = None,
-    moments_per_clip: int = 0,
-    strongest_first: bool = False,
-) -> tuple[list[dict], int]:
-    """Returns (moments, relax_level). relax_level 0 = totally fresh footage."""
-    rng = rng or random.Random(uuid.uuid4().int)
-    safe_dur = max(0.5, float(duration or 15.0))
-    total_target = round(max(1.0, min(safe_dur, minutes_to_seconds(desired_minutes))), 1)
-    used = _norm_windows(used_windows)
-
-    if safe_dur <= 1.0 or total_target >= safe_dur - 0.5:
-        end_s = round(max(0.5, safe_dur), 1)
-        return [{"start": 0.0, "end": end_s, "text": transcript_slice(transcript, 0.0, end_s), "score": 0.0}], 3
-
-    num_parts = _choose_part_count(total_target, safe_dur, moments_per_clip)
-    base_w = [1.3, 0.85, 0.95, 1.1]
-    raw_weights = [base_w[i % 4] for i in range(num_parts)] if num_parts > 1 else [1.0]
-    w_sum = sum(raw_weights)
-    part_durs = [round((w / w_sum) * total_target, 1) for w in raw_weights]
-    part_durs[-1] = round(total_target - sum(part_durs[:-1]), 1)
-    if part_durs[-1] < 0.8:
-        part_durs = [round(total_target / num_parts, 1)] * num_parts
-        part_durs[-1] = round(total_target - sum(part_durs[:-1]), 1)
-
-    n_secs = int(math.ceil(safe_dur)) + 1
-    terms = list(key_terms or [])
-    words, hits, seg_starts = _transcript_density(transcript, n_secs, terms)
+def _source_scorer(src: dict, key_terms: list[str]):
+    """Returns (score_fn(start,end) -> float, speech_segment_starts)."""
+    dur = max(0.5, float(src.get("duration") or 0.5))
+    n_secs = int(math.ceil(dur)) + 1
+    words, hits, seg_starts = _transcript_density(src.get("transcript"), n_secs, key_terms)
     has_speech = sum(words) > 0
-    has_energy = bool(energy_profile) and len(energy_profile or []) >= 3
-    energy = list(energy_profile or [])
-    if has_energy and len(energy) < n_secs:
-        energy += [energy[-1]] * (n_secs - len(energy))
-    e_pre = _prefix_sums(energy) if has_energy else []
+
+    def fit(arr):
+        if not arr or len(arr) < 2:
+            return None
+        a = [float(x) for x in arr]
+        if len(a) < n_secs:
+            a += [a[-1]] * (n_secs - len(a))
+        return a[:n_secs]
+
+    energy = fit(src.get("energy"))
+    motion = fit(src.get("motion"))
+    e_pre = _prefix_sums(energy) if energy else []
+    m_pre = _prefix_sums(motion) if motion else []
     w_pre = _prefix_sums(words)
     h_pre = _prefix_sums(hits)
 
-    def window_score(s: float, e: float) -> float:
+    def score(s: float, e: float) -> float:
         i0 = max(0, int(s))
         i1 = max(i0 + 1, min(n_secs, int(math.ceil(e))))
         span = max(1, i1 - i0)
         sc = 0.0
-        if has_energy:
-            mean_e = (e_pre[i1] - e_pre[i0]) / span
-            max_e = max(energy[i0:i1]) if i1 > i0 else mean_e
-            sc += 0.55 * mean_e + 0.20 * max_e
+        if energy:
+            sc += 0.45 * ((e_pre[i1] - e_pre[i0]) / span) + 0.15 * max(energy[i0:i1])
+        if motion:
+            sc += 0.40 * ((m_pre[i1] - m_pre[i0]) / span) + 0.15 * max(motion[i0:i1])
         if has_speech:
             sc += 0.30 * min(1.0, ((w_pre[i1] - w_pre[i0]) / span) / 3.0)
             sc += 0.45 * min(1.0, ((h_pre[i1] - h_pre[i0]) / span) / 0.6)
         return sc
 
-    def make_pool(d: float) -> list[tuple[float, float, float]]:
-        max_s = max(0.0, safe_dur - d)
-        if max_s <= 0.0:
-            return [(0.0, round(min(safe_dur, d), 1), 0.0)]
-        step = max(1.0, d / 2.0, safe_dur / 700.0)
-        offset = rng.uniform(0.0, step)
-        starts = []
-        t = offset if offset <= max_s else 0.0
-        while t <= max_s + 1e-6:
-            starts.append(round(min(max_s, t), 1))
-            t += step
-        starts.extend([0.0, round(max_s, 1)])
-        starts = [_snap_to_segment_start(s, seg_starts, max_s) for s in starts]
-        pool = []
-        seen: set[float] = set()
-        for s in sorted(set(round(x, 1) for x in starts)):
-            if s in seen:
-                continue
-            seen.add(s)
-            e = round(min(safe_dur, s + d), 1)
-            if e - s < min(d, 0.8):
-                continue
-            pool.append((s, e, window_score(s, e) + rng.uniform(0.0, 0.30)))
-        return pool
+    return score, seg_starts
 
-    pools = [make_pool(d) for d in part_durs]
-    levels = [0.10, 0.25, 0.50] if allow_overlap else [0.0, 0.10, 0.25, 0.50]
 
-    def clash(s: float, e: float, chosen: list[dict], gap: float) -> bool:
-        return any(s < c["end"] + gap and e > c["start"] - gap for c in chosen)
+def _source_pool(src: dict, d: float, score_fn, seg_starts: list[float], rng: random.Random) -> list[tuple[float, float, float]]:
+    """All candidate windows of length d in one source, scored (with a little random noise)."""
+    dur = float(src["duration"])
+    d = max(0.5, min(float(d), dur))
+    max_s = max(0.0, dur - d)
+    if max_s <= 0.05:
+        return [(0.0, _floor1(dur), score_fn(0.0, dur) + rng.uniform(0.0, 0.3))]
+    step = max(0.5, d / 3.0, dur / 700.0)
+    t = rng.uniform(0.0, step)
+    starts: list[float] = []
+    while t <= max_s + 1e-6:
+        starts.append(round(min(max_s, t), 1))
+        t += step
+    starts.extend([0.0, round(max_s, 1)])
+    starts = [_snap_to_segment_start(s, seg_starts, max_s) for s in starts]
+    pool: list[tuple[float, float, float]] = []
+    seen: set[float] = set()
+    for s in sorted(set(round(x, 1) for x in starts)):
+        if s in seen:
+            continue
+        seen.add(s)
+        e = _floor1(min(dur, s + d))
+        if e - s < min(d, 0.8) - 1e-6:
+            continue
+        pool.append((s, e, score_fn(s, e) + rng.uniform(0.0, 0.30)))
+    if not pool:
+        pool.append((0.0, _floor1(min(dur, d)), 0.0))
+    return pool
 
-    def weighted_pick(cands: list[tuple[float, float, float]]) -> tuple[float, float, float]:
+
+def _interleave(groups: list[list[dict]]) -> list[dict]:
+    groups = [list(g) for g in groups if g]
+    out: list[dict] = []
+    while any(groups):
+        for g in groups:
+            if g:
+                out.append(g.pop(0))
+    return out
+
+
+def _order_moments(chosen: list[dict], order_mode: str, rng: random.Random) -> list[dict]:
+    if len(chosen) < 2:
+        return chosen
+    mode = str(order_mode or "")
+    if mode.startswith("Shuffle"):
+        out = list(chosen)
+        rng.shuffle(out)
+        return out
+    pool = list(chosen)
+    best = None
+    if mode.startswith("Strongest"):
+        best = max(pool, key=lambda m: m.get("score", 0.0))
+        pool.remove(best)
+    by_src: dict[str, list[dict]] = {}
+    for m in sorted(pool, key=lambda x: x["start"]):
+        by_src.setdefault(m["source"], []).append(m)
+    groups = list(by_src.values())
+    rng.shuffle(groups)
+    out = _interleave(groups)
+    return ([best] + out) if best else out
+
+
+def _moments_signature(moments: list[dict]) -> str:
+    parts = [
+        f"{Path(str(m.get('source'))).name}@{round(float(m['start']))}-{round(float(m['end']))}"
+        for m in sorted(moments, key=lambda x: (str(x.get("source")), float(x["start"])))
+    ]
+    return "|".join(parts)
+
+
+def _build_mixed_moments(
+    sources: list[dict],
+    scorers: list,
+    target_s: float,
+    avoid: dict[str, list[list[float]]],
+    moments_per_clip: int,
+    order_mode: str,
+    allow_overlap: bool,
+    rng: random.Random,
+) -> tuple[list[dict], int]:
+    n_src = len(sources)
+    total_avail = sum(float(s["duration"]) for s in sources)
+    target = round(max(1.0, min(float(target_s), total_avail)), 1)
+    n = _choose_part_count(target, moments_per_clip, n_src)
+
+    base_w = [1.3, 0.85, 0.95, 1.1]
+    raw_w = [base_w[i % 4] for i in range(n)] if n > 1 else [1.0]
+    w_sum = sum(raw_w)
+    part_durs = [round((w / w_sum) * target, 1) for w in raw_w]
+    part_durs[-1] = round(target - sum(part_durs[:-1]), 1)
+    if min(part_durs) < 0.8:
+        part_durs = [round(target / n, 1)] * n
+        part_durs[-1] = round(target - sum(part_durs[:-1]), 1)
+
+    src_order = list(range(n_src))
+    rng.shuffle(src_order)
+    assign = [src_order[i % n_src] for i in range(n)]
+    levels = [0.10, 0.25, 0.50, 1.0] if allow_overlap else [0.0, 0.10, 0.25, 0.50, 1.0]
+
+    pool_cache: dict[tuple[int, float], list] = {}
+
+    def get_pool(k: int, d: float):
+        key = (k, round(d, 1))
+        if key not in pool_cache:
+            pool_cache[key] = _source_pool(sources[k], d, scorers[k][0], scorers[k][1], rng)
+        return pool_cache[key]
+
+    def clash(k: int, s: float, e: float, chosen: list[dict], gap) -> bool:
+        if gap is None:
+            return False
+        g = min(gap, max(0.25, float(sources[k]["duration"]) * 0.08))
+        return any(c["k"] == k and s < c["end"] + g and e > c["start"] - g for c in chosen)
+
+    def weighted_pick(cands):
         cands = sorted(cands, key=lambda x: -x[2])
         top = cands[: max(4, int(len(cands) * 0.15))]
         lo = min(c[2] for c in top)
         weights = [((c[2] - lo) + 0.08) ** 2 for c in top]
         return rng.choices(top, weights=weights, k=1)[0]
 
-    # Place the slots with the fewest options first so tight videos still work.
-    order = sorted(range(len(part_durs)), key=lambda i: len(pools[i]))
     chosen: list[dict] = []
-    worst_level = 0
-    for idx in order:
-        pool = pools[idx]
+    worst = 0
+    for slot in sorted(range(n), key=lambda i: -part_durs[i]):
+        d = part_durs[slot]
+        prefs = [assign[slot]] + [k for k in range(n_src) if k != assign[slot]]
         pick = None
-        for gap in (_gap_for(num_parts), 0.25):
+        pk = None
+        for gap in (_gap_for(n), 0.25, None):
             for li, lvl in enumerate(levels):
-                cands = [
-                    p for p in pool
-                    if not clash(p[0], p[1], chosen, gap)
-                    and window_overlap_fraction(p[0], p[1], used) <= lvl + 1e-9
-                ]
-                if cands:
-                    pick = weighted_pick(cands)
-                    worst_level = max(worst_level, li)
+                for k in prefs:
+                    used_k = avoid.get(sources[k]["path"], [])
+                    cands = [
+                        p for p in get_pool(k, d)
+                        if not clash(k, p[0], p[1], chosen, gap)
+                        and window_overlap_fraction(p[0], p[1], used_k) <= lvl + 1e-9
+                    ]
+                    if cands:
+                        pick = weighted_pick(cands)
+                        pk = k
+                        worst = max(worst, li)
+                        break
+                if pick:
                     break
             if pick:
                 break
         if pick is None:
-            free = [p for p in pool if not clash(p[0], p[1], chosen, 0.0)] or pool
-            pick = min(free, key=lambda p: (window_overlap_fraction(p[0], p[1], used), -p[2]))
-            worst_level = len(levels)
+            pk = assign[slot]
+            pick = get_pool(pk, d)[0]
+            worst = len(levels)
         chosen.append({
+            "k": pk,
+            "source": sources[pk]["path"],
+            "source_name": sources[pk]["name"],
             "start": float(pick[0]),
             "end": float(pick[1]),
-            "text": transcript_slice(transcript, pick[0], pick[1]),
-            "score": round(float(pick[2]), 3),
         })
 
-    if strongest_first and len(chosen) > 1:
-        best = max(chosen, key=lambda m: m.get("score", 0.0))
-        rest = sorted((m for m in chosen if m is not best), key=lambda m: m["start"])
-        chosen = [best] + rest
-    else:
-        chosen.sort(key=lambda m: m["start"])
-    return chosen, worst_level
+    def cur_total() -> float:
+        return sum(m["end"] - m["start"] for m in chosen)
+
+    # Top up so the stitched total really matches the seconds requested.
+    for _ in range(3):
+        deficit = round(target - cur_total(), 2)
+        if deficit < 0.25:
+            break
+        for m in rng.sample(chosen, len(chosen)):
+            deficit = round(target - cur_total(), 2)
+            if deficit < 0.15:
+                break
+            dur_k = float(sources[m["k"]]["duration"])
+            others = [c for c in chosen if c is not m and c["k"] == m["k"]]
+            limit_end = min([dur_k] + [c["start"] - 0.1 for c in others if c["start"] >= m["end"]])
+            grow = min(deficit, max(0.0, limit_end - m["end"]))
+            if grow > 0.05:
+                m["end"] = max(m["end"], _floor1(min(limit_end, m["end"] + grow)))
+            deficit = round(target - cur_total(), 2)
+            if deficit < 0.15:
+                break
+            limit_start = max([0.0] + [c["end"] + 0.1 for c in others if c["end"] <= m["start"]])
+            grow = min(deficit, max(0.0, m["start"] - limit_start))
+            if grow > 0.05:
+                m["start"] = min(m["start"], _ceil1(max(limit_start, m["start"] - grow)))
+
+    for m in chosen:
+        k = m["k"]
+        m["start"] = round(m["start"], 1)
+        m["end"] = round(m["end"], 1)
+        m["text"] = transcript_slice(sources[k].get("transcript"), m["start"], m["end"])
+        m["score"] = round(float(scorers[k][0](m["start"], m["end"])), 3)
+
+    ordered = _order_moments(chosen, order_mode, rng)
+    for m in ordered:
+        m.pop("k", None)
+    return ordered, worst
 
 
-def build_stitched_peak_moments(
-    duration: float,
-    desired_minutes: float | None,
-    used_windows: list[list[float]] | None,
-    transcript: dict | None = None,
-    seed_offset: int = 0,
-    allow_overlap: bool = False,
-    energy_profile: list[float] | None = None,
-    key_terms: list[str] | None = None,
-) -> list[dict]:
-    moments, _ = _build_peak_moments(
-        duration=duration,
-        desired_minutes=desired_minutes,
-        used_windows=used_windows,
-        transcript=transcript,
-        allow_overlap=allow_overlap,
-        energy_profile=energy_profile,
-        key_terms=key_terms,
-    )
-    return moments
-
-
-def build_auto_clip_candidates(
+def build_mixed_candidates(
     brief: str,
-    transcript: dict | None,
-    contact_sheet,
-    duration: float,
-    target_platform: str,
+    sources: list[dict],
+    target_seconds: float,
     clip_count: int,
-    desired_minutes: float,
-    used_windows: list,
+    target_platform: str,
+    avoid: dict[str, list[list[float]]],
+    seen_signatures: list[str] | None = None,
     allow_overlap: bool = False,
     analysis: dict | None = None,
     custom_hook: str = "",
     force_custom_hook: bool = False,
-    source_label: str = "Video",
-    energy_profile: list[float] | None = None,
     title_offset: int = 0,
     moments_per_clip: int = 0,
-    strongest_first: bool = False,
-) -> list[dict]:
+    order_mode: str = "",
+) -> tuple[list[dict], list[str]]:
     count = max(1, min(6, int(clip_count or 2)))
-    safe_dur = max(0.5, float(duration or 15.0))
-    mins_val = max(0.10, float(desired_minutes or 0.50))
-    results: list[dict] = []
-    combined_used = _norm_windows(used_windows)
-
+    rng = random.Random(uuid.uuid4().int)
     an = analysis if isinstance(analysis, dict) else {}
     term_src = " ".join(
         [str(brief or "")]
         + [str(x) for f in ("must_include", "required_scenes_or_moments", "deliverables") for x in (an.get(f) or [])]
     )
     key_terms = _extract_key_terms(term_src, limit=14)
-    rng = random.Random(uuid.uuid4().int)
+    scorers = [_source_scorer(s, key_terms) for s in sources]
+    avoid_live = {k: list(v) for k, v in (avoid or {}).items()}
+    seen = set(seen_signatures or [])
+    results: list[dict] = []
+    has_signal = any(s.get("energy") or s.get("motion") or s.get("transcript") for s in sources)
 
     for idx in range(count):
-        moments, relax_level = _build_peak_moments(
-            duration=safe_dur,
-            desired_minutes=mins_val,
-            used_windows=combined_used,
-            transcript=transcript,
-            allow_overlap=allow_overlap,
-            energy_profile=energy_profile,
-            key_terms=key_terms,
-            rng=rng,
-            moments_per_clip=moments_per_clip,
-            strongest_first=strongest_first,
-        )
+        picked = None
+        for _attempt in range(8):
+            moments, worst = _build_mixed_moments(
+                sources, scorers, target_seconds, avoid_live, moments_per_clip, order_mode, allow_overlap, rng
+            )
+            sig = _moments_signature(moments)
+            if picked is None:
+                picked = (moments, worst, sig)
+            if sig not in seen:
+                picked = (moments, worst, sig)
+                break
+        moments, worst, sig = picked
+        seen.add(sig)
         for m in moments:
-            combined_used.append([m["start"], m["end"]])
+            avoid_live.setdefault(m["source"], []).append([m["start"], m["end"]])
 
         pick_num = int(title_offset) + idx + 1
         stitched_dur = round(sum(max(0.1, m["end"] - m["start"]) for m in moments), 1)
+        names: list[str] = []
+        for m in moments:
+            if m["source_name"] not in names:
+                names.append(m["source_name"])
         all_spoken = " ".join(m["text"] for m in moments if m.get("text")).strip()
-        span_summary = ", ".join(f"{m['start']:.0f}s–{m['end']:.0f}s" for m in moments)
+        span_summary = ", ".join(f"{m['source_name'][:10]} {m['start']:.1f}-{m['end']:.1f}s" for m in moments)
         good_hook = pick_good_hook(
             all_spoken,
             brief=brief,
@@ -1717,32 +1906,40 @@ def build_auto_clip_candidates(
             custom_hook=custom_hook,
             force_custom=force_custom_hook,
         )
-        prefix = f"[{source_label}] " if source_label else ""
         avg_score = sum(m.get("score", 0.0) for m in moments) / max(1, len(moments))
+        if not has_signal:
+            conf = "guessed (no audio/motion/speech signal)"
+        elif avg_score >= 0.5:
+            conf = "high"
+        elif avg_score >= 0.2:
+            conf = "medium"
+        else:
+            conf = "low"
 
         results.append({
             "cid": uuid.uuid4().hex[:8],
-            "title": f"{prefix}Peak Stitch #{pick_num} ({len(moments)} moment{'s' if len(moments) != 1 else ''})",
-            "source_video_name": source_label,
+            "title": f"Mix Stitch #{pick_num} ({len(moments)} moment{'s' if len(moments) != 1 else ''} · {len(names)} video{'s' if len(names) != 1 else ''})",
+            "source_video_name": " + ".join(names),
+            "sources_used": names,
             "moments": moments,
             "start": moments[0]["start"] if moments else 0.0,
             "end": moments[-1]["end"] if moments else stitched_dur,
             "stitched_duration": stitched_dur,
             "mode": "Auto Peak Stitch",
             "target_platform": target_platform,
-            "reason": all_spoken[:160] if all_spoken else f"Stitched peak spots: {span_summary} ({stitched_dur:.1f}s total).",
-            "campaign_match": f"Stitched {len(moments)} peak moments ({stitched_dur:.1f}s)",
+            "reason": all_spoken[:160] if all_spoken else f"Stitched spots: {span_summary} ({stitched_dur:.1f}s total).",
+            "campaign_match": f"Stitched {len(moments)} moments from {len(names)} video(s) ({stitched_dur:.1f}s)",
             "hook": str(good_hook)[:44],
             "risk": "",
-            "confidence": "high" if avg_score >= 0.5 else "medium",
-            "relaxed": relax_level > 0,
+            "confidence": conf,
+            "relaxed": worst > 0,
             "requested_moments": int(moments_per_clip or 0),
             "moments_capped": bool(moments_per_clip and len(moments) < int(moments_per_clip)),
             "peak_score": round(avg_score, 3),
+            "signature": sig,
         })
 
-    return results
-
+    return results, list(seen)
 
 
 # ----------------------------- CAMPAIGN & CLIP INTELLIGENCE -------------
@@ -1783,9 +1980,9 @@ def heuristic_campaign_analysis(brief: str, project_name: str) -> dict:
         "campaign_name": project_name.strip() or "Campaign Brief",
         "plain_english_summary": (
             f"Campaign across {', '.join(platforms)} ({len(lines)} brief line(s)). "
-            f"Section 3 stitches clips → Section 4 gives instant download, SRT/logo controls & multi-style captions → Section 5 burn-in English subtitles & Stage 6 voiceover."
+            f"Section 3 mixes moments from all loaded videos → Section 4 gives instant download, SRT/logo controls & multi-style captions → Section 5 burn-in English subtitles & Stage 6 voiceover."
         ),
-        "deliverables": ["Multi-moment peak stitch clips with multi-style captions & instant download"],
+        "deliverables": ["Multi-video peak stitch clips with multi-style captions & instant download"],
         "platforms": platforms,
         "requires_onscreen_captions": wants_onscreen_captions,
         "requires_8s_hook": wants_8s_hook,
@@ -1859,14 +2056,14 @@ def evaluate_video_against_campaign(analysis: dict, video_info: dict, transcript
     w = int(video_info.get("width", 0) or 0)
     h = int(video_info.get("height", 0) or 0)
     if total_videos > 1:
-        strengths.append(f"{total_videos}/{MAX_SOURCE_VIDEOS} source videos loaded in workspace.")
+        strengths.append(f"{total_videos}/{MAX_SOURCE_VIDEOS} source videos loaded — clips will mix moments from all of them.")
     if dur > 0:
         strengths.append(f"Active video duration is {dur:.1f}s ({fmt_time(dur)}) at {w}x{h} — clean 9:16 fit + multi-moment stitch ready.")
     if analysis.get("requires_logo_watermark"):
         wm_style = st.session_state.get("logo_watermark_mode", "Standard Corner (Subtle)")
         strengths.append(f"Logo watermark requirement detected → set to '{wm_style}' (standard corner, not everywhere).")
     if not video_info.get("has_audio", True):
-        gaps.append("No audio stream detected in source video—silent stereo track will be synthesized automatically.")
+        gaps.append("No audio stream detected in source video—peak spots will be picked from on-screen motion instead, and a silent track is synthesized.")
     if analysis.get("caption_requirements") or analysis.get("hashtags"):
         strengths.append("Campaign caption/tag requirements detected—Section 4 copy pack will incorporate them.")
     if analysis.get("requires_8s_hook"):
@@ -1894,7 +2091,7 @@ def evaluate_video_against_campaign(analysis: dict, video_info: dict, transcript
 
     return {
         "ready": True,
-        "verdict": "Ready for Go-Ahead — Section 3 Stitch, Section 4 Download & Captions, Section 5 & Stage 6 Ready",
+        "verdict": "Ready for Go-Ahead — Section 3 Mix & Stitch, Section 4 Download & Captions, Section 5 & Stage 6 Ready",
         "strengths": strengths,
         "gaps": gaps,
         "warnings": warnings,
@@ -1942,6 +2139,40 @@ def transcribe_video(video_path: str) -> dict:
         return {"text": getattr(result, "text", str(result)), "segments": []}
     finally:
         audio_path.unlink(missing_ok=True)
+
+
+def ensure_transcripts() -> None:
+    """Transcribe every loaded video that has audio and no transcript yet (needs OPENAI_API_KEY)."""
+    try:
+        client = get_openai_client()
+    except Exception:
+        client = None
+    if not client:
+        return
+    sync_legacy_keys_to_active_video()
+    slots = list(st.session_state.get("source_videos") or [])
+    for i, sl in enumerate(slots):
+        if sl.get("transcript") or not sl.get("path") or not Path(sl["path"]).exists():
+            continue
+        if not (sl.get("info") or {}).get("has_audio", True):
+            continue
+        try:
+            with st.spinner(f"Transcribing {sl.get('name', 'video')}..."):
+                sl["transcript"] = transcribe_video(sl["path"])
+        except Exception as exc:
+            st.warning(f"Transcription skipped for {sl.get('name', 'video')}: {exc}")
+        slots[i] = sl
+    st.session_state["source_videos"] = slots
+    sync_active_video_to_legacy_keys()
+
+
+def all_transcripts() -> dict:
+    sync_legacy_keys_to_active_video()
+    return {
+        sl.get("path"): sl.get("transcript")
+        for sl in (st.session_state.get("source_videos") or [])
+        if sl.get("path") and sl.get("transcript")
+    }
 
 
 def make_contact_sheet(video_path: str, duration: float, max_frames: int = 6) -> Path:
@@ -2303,7 +2534,13 @@ def srt_cues_for_clip(full_cues: list, start: float, end: float, max_chars: int 
     return out
 
 
-def srt_cues_for_stitched_clip(full_cues: list, moments: list[dict], max_chars: int = 28) -> list[tuple[float, float, str]]:
+def srt_cues_for_stitched_clip(
+    full_cues: list,
+    moments: list[dict],
+    max_chars: int = 28,
+    active_path: str | None = None,
+) -> list[tuple[float, float, str]]:
+    """Uploaded SRT only belongs to the active video; moments from other videos advance the timeline but get no SRT cues."""
     out: list[tuple[float, float, str]] = []
     timeline_offset = 0.0
     for moment in moments:
@@ -2311,14 +2548,17 @@ def srt_cues_for_stitched_clip(full_cues: list, moments: list[dict], max_chars: 
         source_b = float(moment.get("end", source_a))
         if source_b <= source_a:
             continue
-        for cue in full_cues or []:
-            a, b, text = float(cue[0]), float(cue[1]), str(cue[2])
-            if b <= source_a or a >= source_b:
-                continue
-            rel_a = timeline_offset + max(0.0, a - source_a)
-            rel_b = timeline_offset + min(source_b, b) - source_a
-            if rel_b > rel_a + 0.04:
-                out.append((round(rel_a, 3), round(rel_b, 3), wrap_caption_lines(text, max_chars=max_chars, max_lines=2)))
+        m_src = moment.get("source")
+        applies = (not m_src) or (not active_path) or (str(m_src) == str(active_path))
+        if applies:
+            for cue in full_cues or []:
+                a, b, text = float(cue[0]), float(cue[1]), str(cue[2])
+                if b <= source_a or a >= source_b:
+                    continue
+                rel_a = timeline_offset + max(0.0, a - source_a)
+                rel_b = timeline_offset + min(source_b, b) - source_a
+                if rel_b > rel_a + 0.04:
+                    out.append((round(rel_a, 3), round(rel_b, 3), wrap_caption_lines(text, max_chars=max_chars, max_lines=2)))
         timeline_offset += source_b - source_a
     out.sort(key=lambda x: x[0])
     return out
@@ -2441,6 +2681,7 @@ def build_stitched_caption_cues(
     max_chars: int = 26,
     fallback_text: str = "",
     clip_duration: float = 15.0,
+    transcripts: dict | None = None,
 ) -> list[tuple]:
     stitched_cues: list[tuple] = []
     timeline_offset = 0.0
@@ -2448,8 +2689,11 @@ def build_stitched_caption_cues(
         m_start = float(m.get("start", 0.0) or 0.0)
         m_end = float(m.get("end", m_start + 3.0) or (m_start + 3.0))
         m_dur = max(0.5, round(m_end - m_start, 2))
+        m_tr = (transcripts or {}).get(m.get("source")) if m.get("source") else None
+        if m_tr is None and (not m.get("source") or not transcripts):
+            m_tr = transcript
         local_cues = build_caption_cues(
-            transcript=transcript,
+            transcript=m_tr,
             start=m_start,
             end=m_end,
             fallback_text=m.get("text") or "",
@@ -3011,16 +3255,26 @@ def render_stitched_clip(
     vo_volume: float = 1.15,
     status_cb=None,
 ) -> str | None:
-    if not source or not Path(source).exists():
-        raise RuntimeError("Source video file is missing.")
+    """Stitch moments into one clip. Each moment may carry its own "source" file,
+    so one clip can mix footage from up to 3 different videos."""
     if not moments:
         raise RuntimeError("No peak moments selected to stitch.")
+    for m in moments:
+        msrc = m.get("source") or source
+        if not msrc or not Path(msrc).exists():
+            raise RuntimeError(f"Source video file is missing: {Path(str(msrc)).name if msrc else 'unknown'}")
 
     out_w, out_h = resolve_target_dimensions(aspect, resolution, src_w, src_h)
-    try:
-        src_has_audio = bool(probe_video(source).get("has_audio", True))
-    except Exception:
-        src_has_audio = True
+    audio_cache: dict[str, bool] = {}
+
+    def has_audio_for(path: str) -> bool:
+        if path not in audio_cache:
+            try:
+                audio_cache[path] = bool(probe_video(path).get("has_audio", True))
+            except Exception:
+                audio_cache[path] = True
+        return audio_cache[path]
+
     ws_dir = workspace_dir(st.session_state.get("workspace_key", "default"))
     seg_files: list[Path] = []
     concat_list_path = ws_dir / f"concat_{next(tempfile._get_candidate_names())}.txt"
@@ -3029,12 +3283,14 @@ def render_stitched_clip(
 
     try:
         for idx, m in enumerate(moments):
+            m_src = str(m.get("source") or source)
+            src_has_audio = has_audio_for(m_src)
             s_v = round(max(0.0, float(m["start"])), 2)
             e_v = round(max(s_v + 0.5, float(m["end"])), 2)
             seg_d = round(e_v - s_v, 2)
             total_dur = round(total_dur + seg_d, 2)
             if status_cb:
-                status_cb(f"Segment {idx + 1}/{len(moments)} ({s_v:.1f}s–{e_v:.1f}s)...")
+                status_cb(f"Segment {idx + 1}/{len(moments)} · {Path(m_src).name[:18]} ({s_v:.1f}s–{e_v:.1f}s)...")
 
             seg_out = ws_dir / f"seg_{idx}_{next(tempfile._get_candidate_names())}.mp4"
             vf_seg = build_frame_stage_filter("0:v", out_w, out_h, aspect, "vseg", fit_mode=fit_mode)
@@ -3045,11 +3301,13 @@ def render_stitched_clip(
             )
             seg_graph = f"{vf_seg};{af_seg}"
             seg_cmd = [
-                "ffmpeg", "-y", "-ss", str(s_v), "-t", str(seg_d), "-i", source,
+                "ffmpeg", "-y", "-ss", str(s_v), "-t", str(seg_d), "-i", m_src,
                 "-filter_complex", seg_graph,
                 "-map", "[vseg]", "-map", "[aseg]",
+                "-t", str(seg_d),
                 "-c:v", "libx264", "-preset", encode_preset, "-crf", str(int(crf)),
                 "-pix_fmt", "yuv420p",
+                "-r", "30",
                 "-c:a", "aac", "-b:a", "128k",
                 "-movflags", "+faststart", str(seg_out),
             ]
@@ -3060,11 +3318,13 @@ def render_stitched_clip(
                     f"anullsrc=r=44100:cl=stereo:d={seg_d:.2f},aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[aseg]"
                 )
                 res2 = run_cmd([
-                    "ffmpeg", "-y", "-ss", str(s_v), "-t", str(seg_d), "-i", source,
+                    "ffmpeg", "-y", "-ss", str(s_v), "-t", str(seg_d), "-i", m_src,
                     "-filter_complex", no_aud_graph,
                     "-map", "[vseg]", "-map", "[aseg]",
+                    "-t", str(seg_d),
                     "-c:v", "libx264", "-preset", encode_preset, "-crf", str(int(crf)),
                     "-pix_fmt", "yuv420p",
+                    "-r", "30",
                     "-c:a", "aac", "-b:a", "128k",
                     "-movflags", "+faststart", str(seg_out),
                 ], timeout=300)
@@ -3302,6 +3562,7 @@ def burn_subtitles_into_clip(
         cues = build_stitched_caption_cues(
             transcript=transcript, moments=moments, max_chars=wrap_chars,
             fallback_text=fallback_txt, clip_duration=clip_dur,
+            transcripts=all_transcripts(),
         )
     else:
         source_offset = float(c_meta.get("source_offset", 0.0) or 0.0)
@@ -3363,64 +3624,132 @@ def burn_subtitles_into_clip(
     return clip_rec, "Could not burn subtitles—original clip was kept safe."
 
 
+# ----------------------------- CANDIDATE PLANNING ----------------------
+def _mix_slots() -> list[dict]:
+    """Slots that take part in auto-clipping (all loaded videos, or only the active one)."""
+    sync_legacy_keys_to_active_video()
+    slots = [s for s in (st.session_state.get("source_videos") or []) if s.get("path")]
+    if not bool(st.session_state.get("mix_all_videos", True)) and slots:
+        idx = max(0, min(len(slots) - 1, int(st.session_state.get("active_video_idx", 0) or 0)))
+        slots = [slots[idx]]
+    return slots
+
+
+def loaded_total_duration() -> float:
+    total = 0.0
+    for s in _mix_slots():
+        try:
+            total += float((s.get("info") or {}).get("duration") or 0)
+        except (TypeError, ValueError):
+            pass
+    return total
+
+
+def _plan_key() -> str:
+    ss = st.session_state
+    paths = "|".join(str(s.get("path")) for s in _mix_slots())
+    return (
+        f"{round(_clamp_secs(ss.get('auto_clip_seconds'), 30.0), 2)}#"
+        f"{int(ss.get('auto_clip_count') or 2)}#{int(ss.get('moments_per_clip') or 0)}#"
+        f"{ss.get('moment_order')}#{bool(ss.get('mix_all_videos', True))}#{paths}"
+    )
+
+
+def _gather_sources() -> list[dict]:
+    out: list[dict] = []
+    for sl in _mix_slots():
+        p = sl.get("path")
+        if not p or not Path(p).exists():
+            continue
+        info = sl.get("info") or {}
+        dur = float(info.get("duration") or 0)
+        if dur <= 0:
+            try:
+                info = probe_video(p)
+                dur = float(info.get("duration") or 0)
+            except Exception:
+                continue
+        if dur < 0.8:
+            continue
+        has_audio = bool(info.get("has_audio", True))
+        try:
+            energy = compute_energy_profile(p, dur, has_audio)
+        except Exception:
+            energy = None
+        try:
+            motion = compute_motion_profile(p, dur)
+        except Exception:
+            motion = None
+        out.append({
+            "path": p,
+            "name": sl.get("name") or Path(p).name,
+            "duration": _floor1(dur),
+            "energy": energy,
+            "motion": motion,
+            "transcript": sl.get("transcript"),
+            "has_audio": has_audio,
+        })
+    return out
+
+
 def refresh_auto_candidates(mode: str = "pick_new") -> list[dict]:
-    """Single entry point for (re)generating peak-moment candidates.
+    """Single entry point for (re)generating mixed peak-moment candidates.
 
     mode="replan"   -> forget un-rendered picks, pick again (still avoids rendered clips)
     mode="pick_new" -> keep everything already shown, pick spots that were never shown
-    mode="reset"    -> forget all used/offered spots and start over
+    mode="reset"    -> forget all used/offered spots and recipes, start over
     """
     ss = st.session_state
-    vi = ss.get("video_info") or {}
-    dur = max(1.0, float(vi.get("duration") or 10.0))
     if mode == "reset":
+        ss["mix_used_windows"] = {}
+        ss["mix_offered_windows"] = {}
+        ss["mix_signatures"] = []
         ss["used_clip_windows"] = []
         ss["offered_clip_windows"] = []
     elif mode == "replan":
-        ss["offered_clip_windows"] = []
-    used = _dedupe_windows(ss.get("used_clip_windows"))
-    offered = _dedupe_windows(ss.get("offered_clip_windows"))
-    minutes = max(0.10, float(ss.get("auto_clip_minutes") or ss.get("desired_clip_minutes") or 0.50))
+        ss["mix_offered_windows"] = {}
+
+    with st.spinner("Scanning every loaded video (audio + motion + speech) for peak moments..."):
+        sources = _gather_sources()
+    if not sources:
+        ss["auto_candidates"] = []
+        return []
+
+    seconds = _clamp_secs(ss.get("auto_clip_seconds") or ss.get("desired_clip_seconds"), 30.0)
     count = max(1, min(6, int(ss.get("auto_clip_count") or 2)))
     mpc = max(0, min(12, int(ss.get("moments_per_clip") or 0)))
 
-    energy = None
-    src = ss.get("source_video")
-    if src and Path(src).exists() and vi.get("has_audio", True):
-        try:
-            with st.spinner("Scanning the audio for peak moments..."):
-                energy = compute_energy_profile(str(src), dur, True)
-        except Exception:
-            energy = None
+    used = {k: _dedupe_windows(v) for k, v in (ss.get("mix_used_windows") or {}).items()}
+    offered = {k: _dedupe_windows(v) for k, v in (ss.get("mix_offered_windows") or {}).items()}
+    active_path = ss.get("source_video")
+    if active_path:
+        used[active_path] = _dedupe_windows(list(used.get(active_path, [])) + list(ss.get("used_clip_windows") or []))
+    avoid = {s["path"]: list(used.get(s["path"], [])) + list(offered.get(s["path"], [])) for s in sources}
 
-    cands = build_auto_clip_candidates(
+    cands, sigs = build_mixed_candidates(
         brief=str(ss.get("brief") or ""),
-        transcript=ss.get("transcript"),
-        contact_sheet=None,
-        duration=dur,
-        target_platform=str(ss.get("target_platform_choice") or "YouTube + IG + Facebook"),
+        sources=sources,
+        target_seconds=seconds,
         clip_count=count,
-        desired_minutes=minutes,
-        used_windows=used + offered,
+        target_platform=str(ss.get("target_platform_choice") or "YouTube + IG + Facebook"),
+        avoid=avoid,
+        seen_signatures=list(ss.get("mix_signatures") or []),
         allow_overlap=bool(ss.get("allow_overlap_windows", False)),
         analysis=ss.get("brief_analysis"),
         custom_hook=str(ss.get("custom_hook_fallback") or ""),
         force_custom_hook=bool(ss.get("force_custom_hook", False)),
-        source_label=str(ss.get("video_name") or "Video"),
-        energy_profile=energy,
         title_offset=len(ss.get("clips") or []),
         moments_per_clip=mpc,
-        strongest_first=str(ss.get("moment_order") or "").startswith("Strongest"),
+        order_mode=str(ss.get("moment_order") or ""),
     )
-    new_offered = list(offered)
+    plan_key = _plan_key()
+    new_offered = {k: list(v) for k, v in offered.items()}
     for c in cands:
-        c["plan_minutes"] = round(minutes, 4)
-        c["plan_count"] = count
-        c["plan_moments"] = mpc
-        c["plan_order"] = str(ss.get("moment_order") or "")
+        c["plan_key"] = plan_key
         for m in c.get("moments") or []:
-            new_offered.append([round(float(m["start"]), 1), round(float(m["end"]), 1)])
-    ss["offered_clip_windows"] = _dedupe_windows(new_offered)
+            new_offered.setdefault(m["source"], []).append([round(float(m["start"]), 1), round(float(m["end"]), 1)])
+    ss["mix_offered_windows"] = {k: _dedupe_windows(v) for k, v in new_offered.items()}
+    ss["mix_signatures"] = sigs[-300:]
     ss["auto_candidates"] = cands
     sync_legacy_keys_to_active_video()
     return cands
@@ -3433,6 +3762,7 @@ def init_state():
         "workspace_loaded_once": False,
         "last_saved_at": None,
         "allow_overlap_windows": False,
+        "mix_all_videos": True,
         "confirm_wipe_ws": False,
         "brief": "",
         "brief_analysis": None,
@@ -3440,12 +3770,15 @@ def init_state():
         "go_ahead_clips": False,
         "target_platform_choice": "YouTube + IG + Facebook",
         "auto_clip_count": 2,
-        "desired_clip_minutes": 0.50,
-        "auto_clip_minutes": 0.50,
+        "desired_clip_seconds": 30.0,
+        "auto_clip_seconds": 30.0,
         "used_clip_windows": [],
         "offered_clip_windows": [],
+        "mix_used_windows": {},
+        "mix_offered_windows": {},
+        "mix_signatures": [],
         "moments_per_clip": 0,
-        "moment_order": "Chronological (story order)",
+        "moment_order": MOMENT_ORDERS[0],
         "hook_mode_choice": "Standard Clip Length (Exact Minutes)",
         "hook_banner_scope": "8-Second Top Banner (0–8s)",
         "pending_hook_banner_scope": None,
@@ -3490,6 +3823,10 @@ def init_state():
         st.session_state["vertical_fit_mode"] = "Fit All (Full Frame + Ambient Blur)"
     if st.session_state.get("logo_watermark_mode") not in LOGO_WATERMARK_MODES:
         st.session_state["logo_watermark_mode"] = "Standard Corner (Subtle)"
+    if st.session_state.get("moment_order") not in MOMENT_ORDERS:
+        st.session_state["moment_order"] = MOMENT_ORDERS[0]
+    st.session_state["desired_clip_seconds"] = _clamp_secs(st.session_state.get("desired_clip_seconds"), 30.0)
+    st.session_state["auto_clip_seconds"] = _clamp_secs(st.session_state.get("auto_clip_seconds"), 30.0)
 
     if not st.session_state.get("workspace_loaded_once"):
         st.session_state["workspace_loaded_once"] = True
@@ -3649,14 +3986,14 @@ init_state()
 
 # ----------------------------- HEADER & NAV -----------------------------
 st.markdown(f"""<div class="hero">
-<div style="color:#a5b4fc;font-weight:750;font-size:.76rem;letter-spacing:.13em">UP TO {MAX_SOURCE_VIDEOS} VIDEOS · SIDE-BY-SIDE SRT & LOGO · WORKSPACE CODE RESUME · MULTI-PLATFORM COPY</div>
+<div style="color:#a5b4fc;font-weight:750;font-size:.76rem;letter-spacing:.13em">UP TO {MAX_SOURCE_VIDEOS} VIDEOS MIXED INTO EVERY CLIP · EXACT SECONDS · WORKSPACE CODE RESUME · MULTI-PLATFORM COPY</div>
 <h1>🎬 {APP_NAME}</h1>
-<p class="muted">Add up to {MAX_SOURCE_VIDEOS} campaign videos, upload SRT & logo side-by-side anytime (even after finishing a clip), resume via Workspace Code, and stitch peak clips in Section 3.</p>
-<span class="pill">Up to {MAX_SOURCE_VIDEOS} Source Videos</span>
-<span class="pill">SRT + Logo Side-by-Side</span>
+<p class="muted">Add up to {MAX_SOURCE_VIDEOS} campaign videos, type the clip length in seconds, and every clip mixes peak moments from all of them. SRT & logo anytime, resume via Workspace Code.</p>
+<span class="pill">Mix Up to {MAX_SOURCE_VIDEOS} Videos Per Clip</span>
+<span class="pill">Exact Seconds Tally</span>
+<span class="pill">Audio + Motion + Guess Fallback</span>
+<span class="pill">Never-Repeat Recipes</span>
 <span class="pill">Workspace Code Loader</span>
-<span class="pill">Never-Repeat Peak Picker</span>
-<span class="pill">Post-Clip Logo Stamp</span>
 </div>""", unsafe_allow_html=True)
 
 if not ffmpeg_ready():
@@ -3806,7 +4143,7 @@ if page == "Campaign & Auto-Clipper":
                     sl_info = sl_obj.get("info") or {}
                     sl_mb = round((sl_info.get("size") or (Path(sl_obj["path"]).stat().st_size if Path(sl_obj["path"]).exists() else 0)) / (1024 * 1024), 1)
                     st.caption(
-                        f"Duration: **{fmt_time(sl_info.get('duration', 0))}** · "
+                        f"Duration: **{fmt_time(sl_info.get('duration', 0))}** ({float(sl_info.get('duration', 0)):.1f}s) · "
                         f"Resolution: **{sl_info.get('width', 0)}x{sl_info.get('height', 0)}** · "
                         f"Size: **{sl_mb} MB** · "
                         f"Broken parts: **{len(sl_obj.get('broken_parts') or [])}**"
@@ -3927,11 +4264,12 @@ if page == "Campaign & Auto-Clipper":
             )
         with min_col:
             st.number_input(
-                "Desired clip length (minutes)",
-                min_value=0.10,
-                max_value=15.0,
-                step=0.25,
-                key="desired_clip_minutes",
+                "Clip length (seconds)",
+                min_value=MIN_CLIP_SECONDS,
+                max_value=MAX_CLIP_SECONDS,
+                step=1.0,
+                key="desired_clip_seconds",
+                help="Type seconds directly, e.g. 10 = a 10-second clip. If your loaded videos are shorter in total, the clip is capped to what you have.",
             )
 
         st.selectbox(
@@ -3969,17 +4307,15 @@ if page == "Campaign & Auto-Clipper":
             st.write("")
             st.checkbox("Always use my hook", key="force_custom_hook")
 
-        active_count = max(1, min(6, int(st.session_state.get("auto_clip_count", 2) or 2)))
-
         if st.button("🧠 Analyse Campaign & Video Fit", type="primary", width="stretch", key="wf_analyse_btn"):
             if not (st.session_state.brief or "").strip():
                 st.error("Enter campaign requirements first.")
             else:
                 try:
-                    with st.spinner("Analysing campaign requirements and inspecting video..."):
+                    with st.spinner("Analysing campaign requirements and inspecting videos..."):
                         analysis = ai_campaign_analysis(st.session_state.brief, st.session_state.project_name)
                         st.session_state.brief_analysis = analysis
-                        st.session_state.auto_clip_minutes = float(st.session_state.desired_clip_minutes or 0.50)
+                        st.session_state.auto_clip_seconds = _clamp_secs(st.session_state.desired_clip_seconds, 30.0)
 
                         if analysis.get("requires_8s_hook"):
                             st.session_state["pending_hook_banner_scope"] = "8-Second Top Banner (0–8s)"
@@ -3990,15 +4326,8 @@ if page == "Campaign & Auto-Clipper":
                             st.session_state["logo_watermark_mode"] = "Standard Corner (Subtle)"
 
                         if st.session_state.source_video and st.session_state.video_info and Path(st.session_state.source_video).exists():
-                            tr = st.session_state.transcript
-                            if get_openai_client() and not tr and st.session_state.video_info.get("has_audio", True):
-                                try:
-                                    with st.spinner("Transcribing spoken words..."):
-                                        tr = transcribe_video(st.session_state.source_video)
-                                        st.session_state.transcript = tr
-                                except Exception as t_exc:
-                                    st.warning(f"Transcription skipped: {t_exc}")
-                            with st.spinner("Picking fresh peak moments..."):
+                            ensure_transcripts()
+                            with st.spinner("Picking fresh peak moments across all videos..."):
                                 refresh_auto_candidates("replan")
                             st.session_state.campaign_feedback = evaluate_video_against_campaign(
                                 analysis, st.session_state.video_info, st.session_state.transcript, total_videos=len(slots_now)
@@ -4057,11 +4386,8 @@ if page == "Campaign & Auto-Clipper":
                 key="wf_go_ahead_btn",
             ):
                 try:
-                    mins_val = max(0.10, float(st.session_state.get("desired_clip_minutes", 0.50) or 0.50))
-                    st.session_state["auto_clip_minutes"] = mins_val
-                    vi_go = st.session_state.get("video_info") or {}
-                    dur_go = max(1.0, float(vi_go.get("duration") or 10.0))
-                    cnt_go = max(1, min(6, int(st.session_state.get("auto_clip_count", 2) or 2)))
+                    st.session_state["auto_clip_seconds"] = _clamp_secs(st.session_state.get("desired_clip_seconds"), 30.0)
+                    ensure_transcripts()
                     refresh_auto_candidates("replan")
                     st.session_state["go_ahead_clips"] = True
                     sync_legacy_keys_to_active_video()
@@ -4072,35 +4398,50 @@ if page == "Campaign & Auto-Clipper":
 
         with go_col2:
             if st.session_state.get("go_ahead_clips"):
-                exact_s = minutes_to_seconds(float(st.session_state.get("auto_clip_minutes", 0.50) or 0.50))
-                st.success(f"Go-ahead granted! Section 3 will stitch clips from `{st.session_state.video_name or 'Active Video'}` totaling ~{float(st.session_state.auto_clip_minutes):.2f} min ({exact_s:.1f}s).")
+                st.success(
+                    f"Go-ahead granted! Section 3 will mix moments from {len(_mix_slots())} loaded video(s) "
+                    f"into clips of ~{float(st.session_state.auto_clip_seconds):.0f}s each."
+                )
 
     # Section 3: Auto-Clipper (Generate / Stitch Clips)
     if st.session_state.get("go_ahead_clips") and st.session_state.get("video_info") and ffmpeg_ready():
         st.divider()
-        st.subheader("Section 3 · Generate & Stitch Peak-Moment Clips (Unstuck Two-Pass Pipeline)")
+        st.subheader("Section 3 · Generate & Mix Peak-Moment Clips From All Your Videos")
         vi = st.session_state.video_info
         dur = max(1.0, float(vi.get("duration") or 10.0))
+        mix_slots_now = _mix_slots()
+        n_mix = max(1, len(mix_slots_now))
+        total_avail = max(1.0, loaded_total_duration())
+
+        top_c1, top_c2 = st.columns([1.4, 1.0])
+        with top_c1:
+            st.checkbox(
+                f"Mix ALL loaded videos into every clip ({len(slots_now)} loaded)",
+                key="mix_all_videos",
+                help="On: each clip takes moments from different videos. Off: only the active video is used.",
+            )
+        with top_c2:
+            st.checkbox("Allow reusing footage if videos are short", key="allow_overlap_windows")
 
         mp_c1, mp_c2 = st.columns([1.1, 1.0])
         with mp_c1:
             st.number_input(
                 "Moments per clip (0 = Auto)",
                 min_value=0, max_value=12, step=1, key="moments_per_clip",
-                help="How many different peak spots are stitched into each clip, e.g. 2, 6 or 10. Spots never repeat across clips or retries.",
+                help="How many different spots are stitched into each clip, e.g. 2, 6 or 10. They are spread across your videos.",
             )
         with mp_c2:
-            st.selectbox(
-                "Moment order",
-                ["Chronological (story order)", "Strongest first (hook)"],
-                key="moment_order",
-            )
+            st.selectbox("Moment order", MOMENT_ORDERS, key="moment_order")
         ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([1.1, 1.0, 1.2, 1.0])
         with ctrl1:
-            st.number_input("Desired clip minutes", min_value=0.10, max_value=15.0, step=0.25, key="auto_clip_minutes")
+            st.number_input(
+                "Clip length (seconds)",
+                min_value=MIN_CLIP_SECONDS, max_value=MAX_CLIP_SECONDS, step=1.0,
+                key="auto_clip_seconds",
+            )
         with ctrl2:
             st.number_input(
-                "How many stitched clips",
+                "How many mixed clips",
                 min_value=1,
                 max_value=6,
                 value=int(st.session_state.get("auto_clip_count", 2)),
@@ -4109,18 +4450,26 @@ if page == "Campaign & Auto-Clipper":
                 on_change=sync_auto_clip_count,
                 args=("auto_clip_count_step3",),
             )
-        active_minutes = max(0.10, float(st.session_state.get("auto_clip_minutes", 0.50) or 0.50))
+        active_seconds = _clamp_secs(st.session_state.get("auto_clip_seconds"), 30.0)
         active_count = max(1, min(6, int(st.session_state.get("auto_clip_count", 2) or 2)))
-        exact_target_sec = round(min(dur, minutes_to_seconds(active_minutes)), 1)
+        exact_target_sec = round(min(total_avail, active_seconds), 1)
         mpc_req = int(st.session_state.get("moments_per_clip") or 0)
-        mpc_eff = _choose_part_count(exact_target_sec, dur, mpc_req)
+        mpc_eff = _choose_part_count(exact_target_sec, mpc_req, n_mix)
+        if active_seconds > total_avail:
+            st.warning(
+                f"You asked for {active_seconds:.0f}s but your loaded videos only hold {total_avail:.1f}s in total, "
+                f"so each clip will be {exact_target_sec:.1f}s. Load more footage or lower the length."
+            )
         if mpc_req and mpc_eff < mpc_req:
             st.warning(
-                f"A {exact_target_sec:.0f}s clip from a {fmt_time(dur)} video fits only **{mpc_eff}** moment(s) of 1.5s+ "
-                f"(you asked for {mpc_req}). Raise the clip length or lower the moments."
+                f"A {exact_target_sec:.0f}s clip fits only **{mpc_eff}** moment(s) of 1s+ (you asked for {mpc_req}). "
+                "Raise the clip length or lower the moments."
             )
         else:
-            st.caption(f"Each clip = **{mpc_eff} moments** · about **{exact_target_sec / max(1, mpc_eff):.1f}s** per moment.")
+            st.caption(
+                f"Each clip = **{mpc_eff} moments** from **{n_mix} video(s)** · about **{exact_target_sec / max(1, mpc_eff):.1f}s** per moment · "
+                f"total **{exact_target_sec:.1f}s**."
+            )
 
         with ctrl3:
             if st.button("🔄 Pick Different Peak Spots", width="stretch", key="pick_fresh_spots_btn"):
@@ -4131,47 +4480,53 @@ if page == "Campaign & Auto-Clipper":
                 refresh_auto_candidates("reset")
                 save_workspace_state(checkpoint_label="reset_windows")
 
-        st.checkbox("Allow overlapping moments if source video is short", key="allow_overlap_windows")
-
         default_asp = default_aspect_for_platform(st.session_state.target_platform_choice)
         st.caption(
-            f"Source: **{st.session_state.video_name or 'Active Video'}** · "
-            f"Each clip stitches peak sub-moments summing to **{active_minutes:.2f} min ({exact_target_sec:.1f}s)** · "
+            f"Videos mixed: **{', '.join(s.get('name', 'video')[:20] for s in mix_slots_now)}** · "
             f"Aspect: **{default_asp}** · Watermark: **{st.session_state.get('logo_watermark_mode', 'Standard Corner (Subtle)')}**."
         )
 
         cands = list(st.session_state.auto_candidates or [])
+        plan_now = _plan_key()
         plan_ok = (
             bool(cands)
             and len(cands) == active_count
-            and all(abs(float(c.get("plan_minutes", -1)) - round(active_minutes, 4)) < 1e-6 for c in cands)
+            and all(c.get("plan_key") == plan_now for c in cands)
             and all(c.get("cid") for c in cands)
-            and all(int(c.get("plan_moments", -1)) == mpc_req for c in cands)
-            and all(c.get("plan_order", "") == str(st.session_state.get("moment_order") or "") for c in cands)
+            and all(c.get("moments") for c in cands)
         )
         if not plan_ok:
             cands = refresh_auto_candidates("replan")
         cands = cands[:active_count]
 
-        fresh_pct = 100.0 * (1.0 - used_coverage_fraction(
-            dur,
-            list(st.session_state.get("used_clip_windows") or []) + list(st.session_state.get("offered_clip_windows") or []),
-        ))
+        used_map = st.session_state.get("mix_used_windows") or {}
+        offered_map = st.session_state.get("mix_offered_windows") or {}
+        fresh_bits = []
+        for s_m in mix_slots_now:
+            d_m = float((s_m.get("info") or {}).get("duration") or 1.0)
+            wins = list(used_map.get(s_m["path"], [])) + list(offered_map.get(s_m["path"], []))
+            fresh_bits.append(100.0 * (1.0 - used_coverage_fraction(d_m, wins)))
+        fresh_pct = sum(fresh_bits) / max(1, len(fresh_bits))
         st.caption(
-            f"🎯 Fresh footage left: **{fresh_pct:.0f}%** · every click on *Pick Different Peak Spots* avoids all spots "
-            "already shown or rendered. Moments are ranked by audio energy, speech density and your brief keywords."
+            f"🎯 Fresh footage left: **{fresh_pct:.0f}%** · every *Pick Different Peak Spots* click avoids spots already shown/rendered "
+            "and never repeats a clip recipe. Ranking uses audio loudness, on-screen motion, speech and brief keywords; "
+            "with no signal at all it guesses."
         )
 
-        used_hist = _dedupe_windows(st.session_state.get("used_clip_windows"))
-        shown_hist = _dedupe_windows(st.session_state.get("offered_clip_windows"))
-        with st.expander(f"🗂️ Spot history ({len(used_hist)} rendered · {len(shown_hist)} shown)"):
+        n_used = sum(len(v) for v in used_map.values())
+        n_shown = sum(len(v) for v in offered_map.values())
+        with st.expander(f"🗂️ Spot history ({n_used} rendered · {n_shown} shown)"):
             st.caption("These time ranges are skipped on every new pick while fresh footage remains.")
-            if used_hist:
-                st.markdown("**Rendered:** " + " · ".join(f"`{fmt_time(a)}–{fmt_time(b)}`" for a, b in sorted(used_hist)[:60]))
-            if shown_hist:
-                st.markdown("**Shown, not rendered:** " + " · ".join(f"`{fmt_time(a)}–{fmt_time(b)}`" for a, b in sorted(shown_hist)[:60]))
-            if not used_hist and not shown_hist:
-                st.caption("No spots used yet.")
+            for s_m in mix_slots_now:
+                u_l = _dedupe_windows(used_map.get(s_m["path"], []))
+                o_l = _dedupe_windows(offered_map.get(s_m["path"], []))
+                st.markdown(f"**{s_m.get('name', 'video')}**")
+                if u_l:
+                    st.markdown("Rendered: " + " · ".join(f"`{a:.1f}–{b:.1f}s`" for a, b in sorted(u_l)[:60]))
+                if o_l:
+                    st.markdown("Shown, not rendered: " + " · ".join(f"`{a:.1f}–{b:.1f}s`" for a, b in sorted(o_l)[:60]))
+                if not u_l and not o_l:
+                    st.caption("No spots used yet.")
 
         q_col1, q_col2, q_col3, q_col4 = st.columns(4)
         with q_col1:
@@ -4188,46 +4543,38 @@ if page == "Campaign & Auto-Clipper":
             encode_preset = st.selectbox("Encode speed", ["ultrafast", "veryfast", "fast"], key="wf_encode_preset")
 
         for idx, cand in enumerate(cands):
-            moments = cand.get("moments") or build_stitched_peak_moments(
-                duration=dur,
-                desired_minutes=active_minutes,
-                used_windows=list(st.session_state.used_clip_windows or []),
-                transcript=st.session_state.transcript,
-                seed_offset=idx + 1,
-                allow_overlap=bool(st.session_state.get("allow_overlap_windows", False)),
-            )
-            cand["moments"] = moments
+            moments = cand.get("moments") or []
+            if not moments:
+                continue
             stitched_sec = round(sum(max(0.1, float(m["end"]) - float(m["start"])) for m in moments), 1)
             chain_str = "  ➜  ".join(
-                f"`{fmt_time(m['start'])}`–`{fmt_time(m['end'])}` ({round(float(m['end']) - float(m['start']), 1):.1f}s)"
+                f"`{str(m.get('source_name', ''))[:14]}` {float(m['start']):.1f}s–{float(m['end']):.1f}s "
+                f"({round(float(m['end']) - float(m['start']), 1):.1f}s)"
                 for m in moments
             )
             st.info(
-                f"**{cand.get('title', f'Peak Stitch #{idx+1}')}** — Total: **{stitched_sec:.1f}s** (`{active_minutes:.2f} min`)\n\n"
+                f"**{cand.get('title', f'Mix Stitch #{idx+1}')}** — Total: **{stitched_sec:.1f}s** (asked {exact_target_sec:.1f}s)\n\n"
                 f"Stitched spots: {chain_str}"
             )
             st.caption(f"Peak strength: **{float(cand.get('peak_score', 0.0)):.2f}** · confidence: **{cand.get('confidence', 'medium')}**")
             if cand.get("moments_capped"):
                 st.caption(f"⚠️ Only {len(moments)} moment(s) fit this clip length (you asked for {cand.get('requested_moments')}).")
             if cand.get("relaxed"):
-                st.caption("♻️ Most fresh footage is already used, so this pick overlaps the least-used spots.")
+                st.caption("♻️ Most fresh footage is already used, so this pick reuses the least-used spots in a new combination.")
             edited_hook = st.text_input(
-                f"Hook banner for {cand.get('title', f'Peak Stitch #{idx+1}')} (edit anytime before stitching)",
+                f"Hook banner for {cand.get('title', f'Mix Stitch #{idx+1}')} (edit anytime before stitching)",
                 value=cand.get("hook", ""),
                 max_chars=48,
                 key=f"sec3_cand_hook_{cand.get('cid', idx)}",
             )
             cand["hook"] = edited_hook
 
-        if st.button("⚡ Generate / Stitch Clips in Section 3", type="primary", width="stretch", key="wf_extract_clips_btn"):
+        if st.button("⚡ Generate / Mix Clips in Section 3", type="primary", width="stretch", key="wf_extract_clips_btn"):
             save_named_checkpoint("Before Section 3 Stitch")
             use_subs_now = bool(st.session_state.get("burn_subtitles_chk_v2", False) or st.session_state.get("full_srt_cues"))
-            if use_subs_now and not st.session_state.transcript and get_openai_client() and vi.get("has_audio", True):
-                try:
-                    with st.spinner("Transcribing spoken audio for English subtitles..."):
-                        st.session_state.transcript = transcribe_video(st.session_state.source_video)
-                except Exception as tr_err:
-                    st.warning(f"Transcription fallback active: {tr_err}")
+            if use_subs_now:
+                ensure_transcripts()
+            transcripts_map = all_transcripts()
 
             active_vo_path: str | None = None
             if st.session_state.get("voiceover_source_mode") == "Uploaded Voice Track":
@@ -4244,6 +4591,7 @@ if page == "Campaign & Auto-Clipper":
             ws_dir = workspace_dir(st.session_state.get("workspace_key", "default"))
             rendered_now: list[dict] = []
             failed_msgs: list[str] = []
+            tally_msgs: list[str] = []
             banner_dur = 8.0 if str(st.session_state.hook_banner_scope or "").startswith("8-Second") else 9999.0
             wm_mode_now = st.session_state.get("logo_watermark_mode", "Standard Corner (Subtle)")
             render_prog = st.progress(0, text=f"Generating clips in Section 3: 0/{len(cands)}")
@@ -4256,13 +4604,13 @@ if page == "Campaign & Auto-Clipper":
                 if not moments:
                     continue
                 clip_num_global = len(st.session_state.clips) + len(rendered_now) + 1
-                base_stem = f"{safe_name(cand.get('title', f'Peak_Stitch_{clip_num_global}'))}_stitch{clip_num_global}"
+                base_stem = f"{safe_name(cand.get('title', f'Mix_Stitch_{clip_num_global}'))}_stitch{clip_num_global}_{uuid.uuid4().hex[:4]}"
                 out_file = ws_dir / f"{base_stem}.mp4"
                 srt_file = ws_dir / f"{base_stem}.srt"
 
                 stitched_sec = round(sum(max(0.1, float(m["end"]) - float(m["start"])) for m in moments), 1)
                 all_spoken = normalize_english_subtitle_text(" ".join(
-                    m.get("text") or transcript_slice(st.session_state.transcript, float(m["start"]), float(m["end"]))
+                    m.get("text") or transcript_slice(transcripts_map.get(m.get("source")), float(m["start"]), float(m["end"]))
                     for m in moments
                 ))
                 raw_cand_hook = (st.session_state.get(f"sec3_cand_hook_{cand.get('cid', idx)}") or cand.get("hook") or "").strip()
@@ -4279,7 +4627,10 @@ if page == "Campaign & Auto-Clipper":
 
                 wrap_chars = 26 if default_asp in {"9:16 Vertical", "4:5 Portrait", "1:1 Square"} else 36
                 if st.session_state.get("full_srt_cues"):
-                    cues = srt_cues_for_stitched_clip(st.session_state.full_srt_cues, moments, max_chars=wrap_chars)
+                    cues = srt_cues_for_stitched_clip(
+                        st.session_state.full_srt_cues, moments, max_chars=wrap_chars,
+                        active_path=st.session_state.source_video,
+                    )
                 else:
                     cues = build_stitched_caption_cues(
                         transcript=st.session_state.transcript,
@@ -4287,6 +4638,7 @@ if page == "Campaign & Auto-Clipper":
                         max_chars=wrap_chars,
                         fallback_text=all_spoken or final_hook,
                         clip_duration=stitched_sec,
+                        transcripts=transcripts_map,
                     ) if use_subs_now else []
 
                 try:
@@ -4318,14 +4670,22 @@ if page == "Campaign & Auto-Clipper":
                         status_cb=_on_stage_msg,
                     )
 
+                    mu = dict(st.session_state.get("mix_used_windows") or {})
                     for m in moments:
-                        st.session_state.used_clip_windows.append([round(float(m["start"]), 1), round(float(m["end"]), 1)])
+                        mu.setdefault(m["source"], []).append([round(float(m["start"]), 1), round(float(m["end"]), 1)])
+                    st.session_state["mix_used_windows"] = mu
+
+                    try:
+                        actual_sec = float(probe_video(str(out_file)).get("duration") or stitched_sec)
+                    except Exception:
+                        actual_sec = stitched_sec
+                    tally_msgs.append(f"Clip {clip_num_global}: planned {stitched_sec:.1f}s → file is {actual_sec:.1f}s")
 
                     clip_meta = {
                         **cand,
                         "mode": "Auto Peak Stitch",
-                        "source_video_name": st.session_state.video_name or "Video",
-                        "title": cand.get("title", f"Peak Stitch #{clip_num_global}"),
+                        "source_video_name": cand.get("source_video_name") or (st.session_state.video_name or "Video"),
+                        "title": cand.get("title", f"Mix Stitch #{clip_num_global}"),
                         "moments": moments,
                         "start": float(moments[0]["start"]),
                         "end": round(float(moments[0]["start"]) + stitched_sec, 1),
@@ -4336,6 +4696,7 @@ if page == "Campaign & Auto-Clipper":
                         "subtitles_burned_en": bool(use_subs_now and saved_srt),
                         "hook": final_hook,
                         "transcript_excerpt": all_spoken,
+                        "actual_seconds": round(actual_sec, 1),
                     }
                     copy_pack = generate_multi_platform_copy(
                         brief=str(st.session_state.brief or ""),
@@ -4378,7 +4739,12 @@ if page == "Campaign & Auto-Clipper":
                 refresh_auto_candidates("replan")
                 sync_legacy_keys_to_active_video()
                 save_workspace_state(checkpoint_label="section3_rendered")
-                st.success(f"Generated {len(rendered_now)} clip(s) in {time.time() - t0:.1f}s. Open **Videos Extracted** to download, stamp logo, or generate captions.")
+                st.success(
+                    f"Generated {len(rendered_now)} clip(s) in {time.time() - t0:.1f}s. "
+                    "Open **Videos Extracted** to download, stamp logo, or generate captions."
+                )
+                for t_msg in tally_msgs:
+                    st.caption(f"⏱ {t_msg}")
 
             for f_msg in failed_msgs:
                 st.error(f_msg)
