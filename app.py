@@ -93,9 +93,9 @@ HOOK_FILLER_STARTERS = {
 }
 
 FIT_MODES = [
+    "Fill & Crop (9:16 Zoom)",
     "Fit All (Full Frame + Ambient Blur)",
     "Fit All (Pure Full Frame)",
-    "Fill & Crop (9:16 Zoom)",
     "Letterbox Fit",
 ]
 
@@ -382,9 +382,9 @@ def _atomic_write_json(target: Path, payload: dict) -> Path:
 def _collect_state_payload(checkpoint_label: str = "autosave") -> dict:
     sync_legacy_keys_to_active_video()
     key = st.session_state.get("workspace_key") or "default_session"
-    fit_val = st.session_state.get("vertical_fit_mode", "Fit All (Full Frame + Ambient Blur)")
+    fit_val = st.session_state.get("vertical_fit_mode", "Fill & Crop (9:16 Zoom)")
     if fit_val not in FIT_MODES:
-        fit_val = "Fit All (Full Frame + Ambient Blur)"
+        fit_val = "Fill & Crop (9:16 Zoom)"
     wm_val = st.session_state.get("logo_watermark_mode", "Standard Corner (Subtle)")
     if wm_val not in LOGO_WATERMARK_MODES:
         wm_val = "Standard Corner (Subtle)"
@@ -505,7 +505,7 @@ def apply_state_payload(data: dict) -> bool:
             st.session_state[field] = data[field]
 
     if st.session_state.get("vertical_fit_mode") not in FIT_MODES:
-        st.session_state["vertical_fit_mode"] = "Fit All (Full Frame + Ambient Blur)"
+        st.session_state["vertical_fit_mode"] = "Fill & Crop (9:16 Zoom)"
     if st.session_state.get("logo_watermark_mode") not in LOGO_WATERMARK_MODES:
         st.session_state["logo_watermark_mode"] = "Standard Corner (Subtle)"
     if st.session_state.get("moment_order") not in MOMENT_ORDERS:
@@ -1744,7 +1744,7 @@ def _build_mixed_moments(
     src_order = list(range(n_src))
     rng.shuffle(src_order)
     assign = [src_order[i % n_src] for i in range(n)]
-    levels = [0.10, 0.25, 0.50, 1.0] if allow_overlap else [0.0, 0.10, 0.25, 0.50, 1.0]
+    levels = [0.05, 0.15, 0.35, 0.70, 1.0] if allow_overlap else [0.0, 0.05, 0.12, 0.25, 0.45, 1.0]
 
     pool_cache: dict[tuple[int, float], list] = {}
 
@@ -1875,7 +1875,8 @@ def build_mixed_candidates(
 
     for idx in range(count):
         picked = None
-        for _attempt in range(8):
+        # Stronger diversity: more attempts + progressive strictness so all N clips differ
+        for _attempt in range(18):
             moments, worst = _build_mixed_moments(
                 sources, scorers, target_seconds, avoid_live, moments_per_clip, order_mode, allow_overlap, rng
             )
@@ -1883,12 +1884,21 @@ def build_mixed_candidates(
             if picked is None:
                 picked = (moments, worst, sig)
             if sig not in seen:
-                picked = (moments, worst, sig)
-                break
+                # Extra check: require at least one moment that does not heavily overlap prior used windows
+                heavy_overlap = False
+                for m in moments:
+                    used_k = avoid_live.get(m["source"], [])
+                    if window_overlap_fraction(m["start"], m["end"], used_k) > 0.55:
+                        heavy_overlap = True
+                        break
+                if not heavy_overlap or _attempt >= 12:
+                    picked = (moments, worst, sig)
+                    break
         moments, worst, sig = picked
         seen.add(sig)
+        # Immediately reserve the chosen windows so the next clip cannot reuse them
         for m in moments:
-            avoid_live.setdefault(m["source"], []).append([m["start"], m["end"]])
+            avoid_live.setdefault(m["source"], []).append([round(float(m["start"]), 1), round(float(m["end"]), 1)])
 
         pick_num = int(title_offset) + idx + 1
         stitched_dur = round(sum(max(0.1, m["end"] - m["start"]) for m in moments), 1)
@@ -2786,7 +2796,7 @@ def build_frame_stage_filter(
     out_h: int,
     aspect: str,
     out_label: str,
-    fit_mode: str = "Fit All (Full Frame + Ambient Blur)",
+    fit_mode: str = "Fill & Crop (9:16 Zoom)",
 ) -> str:
     if fit_mode == "Fill & Crop (9:16 Zoom)":
         return (
@@ -2799,22 +2809,27 @@ def build_frame_stage_filter(
             f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:color=#090c13,setsar=1[{out_label}]"
         )
     if fit_mode == "Fit All (Pure Full Frame)":
-        return f"[{in_label}]scale={out_w}:{out_h}:flags=lanczos,setsar=1[{out_label}]"
+        # Stretch-free: scale to cover then slight center crop (still no blur)
+        return (
+            f"[{in_label}]scale={out_w}:{out_h}:force_original_aspect_ratio=increase:flags=lanczos,"
+            f"crop={out_w}:{out_h}:(iw-{out_w})/2:(ih-{out_h})/2,setsar=1[{out_label}]"
+        )
 
     bg_lbl = f"{out_label}_bg"
     fg_lbl = f"{out_label}_fg"
     composed_lbl = f"{out_label}_comp"
     is_vertical = out_h > out_w
     vignette_step = ",vignette=PI/4.5" if is_vertical else ""
+    # Cleaner ambient blur: milder blur + brighter so sides do not look muddy (matches pro short style)
     return (
         f"[{in_label}]split[{bg_lbl}_raw][{fg_lbl}_raw];"
         f"[{bg_lbl}_raw]scale={out_w}:{out_h}:force_original_aspect_ratio=increase:flags=lanczos,"
-        f"crop={out_w}:{out_h}:(iw-{out_w})/2:(ih-{out_h})/2,gblur=sigma=24:steps=2,"
-        f"eq=brightness=-0.12:saturation=1.08:contrast=1.05{vignette_step},setsar=1[{bg_lbl}];"
+        f"crop={out_w}:{out_h}:(iw-{out_w})/2:(ih-{out_h})/2,gblur=sigma=14:steps=1,"
+        f"eq=brightness=-0.04:saturation=1.05:contrast=1.02{vignette_step},setsar=1[{bg_lbl}];"
         f"[{fg_lbl}_raw]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease:flags=lanczos,"
-        f"eq=contrast=1.03:saturation=1.04,setsar=1[{fg_lbl}];"
+        f"eq=contrast=1.04:saturation=1.05,setsar=1[{fg_lbl}];"
         f"[{bg_lbl}][{fg_lbl}]overlay=(W-w)/2:(H-h)/2:shortest=1[{composed_lbl}];"
-        f"[{composed_lbl}]drawbox=x=0:y=0:w={out_w}:h=4:color=white@0.12:t=fill[{out_label}]"
+        f"[{composed_lbl}]drawbox=x=0:y=0:w={out_w}:h=3:color=white@0.10:t=fill[{out_label}]"
     )
 
 
@@ -3001,23 +3016,23 @@ def append_overlays_and_subs(
     if logo and Path(logo).exists() and logo_input_idx is not None:
         wm_mode = logo_watermark_mode if logo_watermark_mode in LOGO_WATERMARK_MODES else "Standard Corner (Subtle)"
         if wm_mode == "Solid Corner":
-            graph.append(f"[{logo_input_idx}:v]scale=iw*0.12:-1:flags=bilinear[logo]")
-            graph.append(f"[{current}][logo]overlay=W-w-20:20:format=auto[vlogo]")
+            graph.append(f"[{logo_input_idx}:v]scale=iw*0.15:-1:flags=bilinear[logo]")
+            graph.append(f"[{current}][logo]overlay=22:H-h-28:format=auto[vlogo]")
         elif wm_mode == "Standard Corner (First 8s)":
             wm_end = min(max(1.0, float(clip_duration)), 8.0)
             graph.append(
-                f"[{logo_input_idx}:v]scale=iw*0.12:-1:flags=bilinear,"
+                f"[{logo_input_idx}:v]scale=iw*0.15:-1:flags=bilinear,"
                 f"format=rgba,colorchannelmixer=aa=0.78[logo]"
             )
             graph.append(
-                f"[{current}][logo]overlay=W-w-20:20:format=auto:enable='between(t,0,{wm_end:.2f})'[vlogo]"
+                f"[{current}][logo]overlay=22:H-h-28:format=auto:enable='between(t,0,{wm_end:.2f})'[vlogo]"
             )
         else:
             graph.append(
-                f"[{logo_input_idx}:v]scale=iw*0.12:-1:flags=bilinear,"
+                f"[{logo_input_idx}:v]scale=iw*0.15:-1:flags=bilinear,"
                 f"format=rgba,colorchannelmixer=aa=0.78[logo]"
             )
-            graph.append(f"[{current}][logo]overlay=W-w-20:20:format=auto[vlogo]")
+            graph.append(f"[{current}][logo]overlay=22:H-h-28:format=auto[vlogo]")
         current = "vlogo"
 
     if cues:
@@ -3131,7 +3146,7 @@ def render_video(
     normalize_audio: bool = False,
     clip_index: int = 0,
     srt_output_path: str | None = None,
-    fit_mode: str = "Fit All (Full Frame + Ambient Blur)",
+    fit_mode: str = "Fill & Crop (9:16 Zoom)",
     mute_original: bool = False,
     voiceover_path: str | None = None,
     subtitle_accent_colour: str = "Creator Yellow",
@@ -3246,7 +3261,7 @@ def render_stitched_clip(
     caption_font_size: int = 28,
     encode_preset: str = "ultrafast",
     srt_output_path: str | None = None,
-    fit_mode: str = "Fit All (Full Frame + Ambient Blur)",
+    fit_mode: str = "Fill & Crop (9:16 Zoom)",
     mute_original: bool = False,
     voiceover_path: str | None = None,
     subtitle_accent_colour: str = "Creator Yellow",
@@ -3471,21 +3486,21 @@ def apply_logo_to_clip(
     if wm_mode == "Solid Corner":
         vf_complex = (
             "[0:v]setsar=1[vbase];"
-            "[1:v]scale=iw*0.12:-1:flags=bilinear[logo];"
-            "[vbase][logo]overlay=W-w-20:20:format=auto[vout]"
+            "[1:v]scale=iw*0.15:-1:flags=bilinear[logo];"
+            "[vbase][logo]overlay=22:H-h-28:format=auto[vout]"
         )
     elif wm_mode == "Standard Corner (First 8s)":
         wm_end = min(max(1.0, clip_dur), 8.0)
         vf_complex = (
             "[0:v]setsar=1[vbase];"
-            "[1:v]scale=iw*0.12:-1:flags=bilinear,format=rgba,colorchannelmixer=aa=0.78[logo];"
-            f"[vbase][logo]overlay=W-w-20:20:format=auto:enable='between(t,0,{wm_end:.2f})'[vout]"
+            "[1:v]scale=iw*0.15:-1:flags=bilinear,format=rgba,colorchannelmixer=aa=0.78[logo];"
+            f"[vbase][logo]overlay=22:H-h-28:format=auto:enable='between(t,0,{wm_end:.2f})'[vout]"
         )
     else:
         vf_complex = (
             "[0:v]setsar=1[vbase];"
-            "[1:v]scale=iw*0.12:-1:flags=bilinear,format=rgba,colorchannelmixer=aa=0.78[logo];"
-            "[vbase][logo]overlay=W-w-20:20:format=auto[vout]"
+            "[1:v]scale=iw*0.15:-1:flags=bilinear,format=rgba,colorchannelmixer=aa=0.78[logo];"
+            "[vbase][logo]overlay=22:H-h-28:format=auto[vout]"
         )
 
     res = run_cmd([
@@ -3788,7 +3803,7 @@ def init_state():
         "subtitle_language": "English (Default)",
         "onscreen_caption_size": 32,
         "subtitle_accent_colour": "Creator Yellow",
-        "vertical_fit_mode": "Fit All (Full Frame + Ambient Blur)",
+        "vertical_fit_mode": "Fill & Crop (9:16 Zoom)",
         "logo_watermark_mode": "Standard Corner (Subtle)",
         "mute_original_audio": False,
         "voiceover_source_mode": "Uploaded Voice Track",
@@ -3820,7 +3835,7 @@ def init_state():
             st.session_state[k] = v
 
     if st.session_state.get("vertical_fit_mode") not in FIT_MODES:
-        st.session_state["vertical_fit_mode"] = "Fit All (Full Frame + Ambient Blur)"
+        st.session_state["vertical_fit_mode"] = "Fill & Crop (9:16 Zoom)"
     if st.session_state.get("logo_watermark_mode") not in LOGO_WATERMARK_MODES:
         st.session_state["logo_watermark_mode"] = "Standard Corner (Subtle)"
     if st.session_state.get("moment_order") not in MOMENT_ORDERS:
@@ -3867,17 +3882,17 @@ def stamp_logo_onto_existing_clip(
 
     wm_mode = watermark_mode if watermark_mode in LOGO_WATERMARK_MODES else "Standard Corner (Subtle)"
     if wm_mode == "Solid Corner":
-        vf = "[1:v]scale=iw*0.12:-1:flags=bilinear[logo];[0:v][logo]overlay=W-w-20:20:format=auto[vout]"
+        vf = "[1:v]scale=iw*0.15:-1:flags=bilinear[logo];[0:v][logo]overlay=22:H-h-28:format=auto[vout]"
     elif wm_mode == "Standard Corner (First 8s)":
         wm_end = min(max(1.0, clip_dur), 8.0)
         vf = (
-            "[1:v]scale=iw*0.12:-1:flags=bilinear,format=rgba,colorchannelmixer=aa=0.78[logo];"
-            f"[0:v][logo]overlay=W-w-20:20:format=auto:enable='between(t,0,{wm_end:.2f})'[vout]"
+            "[1:v]scale=iw*0.15:-1:flags=bilinear,format=rgba,colorchannelmixer=aa=0.78[logo];"
+            f"[0:v][logo]overlay=22:H-h-28:format=auto:enable='between(t,0,{wm_end:.2f})'[vout]"
         )
     else:
         vf = (
-            "[1:v]scale=iw*0.12:-1:flags=bilinear,format=rgba,colorchannelmixer=aa=0.78[logo];"
-            "[0:v][logo]overlay=W-w-20:20:format=auto[vout]"
+            "[1:v]scale=iw*0.15:-1:flags=bilinear,format=rgba,colorchannelmixer=aa=0.78[logo];"
+            "[0:v][logo]overlay=22:H-h-28:format=auto[vout]"
         )
 
     cmd = [
@@ -4536,7 +4551,12 @@ if page == "Campaign & Auto-Clipper":
                 key="wf_sharp_res",
             )
         with q_col2:
-            fit_mode = st.selectbox("9:16 Frame Fit", FIT_MODES, key="vertical_fit_mode")
+            fit_mode = st.selectbox(
+                "9:16 Frame Fit",
+                FIT_MODES,
+                key="vertical_fit_mode",
+                help="Fill & Crop = sharp full-frame short (no blurry sides). Ambient Blur = soft background. Use Fill & Crop for clean pro-style verticals like the CNPL examples.",
+            )
         with q_col3:
             sharp_crf = st.slider("Quality CRF (18–26)", 18, 26, 22, key="wf_sharp_crf")
         with q_col4:
