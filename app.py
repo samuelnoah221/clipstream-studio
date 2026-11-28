@@ -173,6 +173,169 @@ STATE_FIELDS = [
     "logo_name", "logo_position", "logo_size_pct", "logo_opacity", "caption_look", "brand_name", "brand_colour", "caption_instructions",
 ]
 
+# ----------------------------- LOOK STUDIO (hook / caption / logo styles) -----------
+ACCENT_HEX = {"Creator Yellow": "#FFD700", "Electric Cyan": "#00FFFF", "Lime Pop": "#45FF00", "White": "#FFFFFF"}
+HOOK_POSITIONS = ["Top", "Upper third", "Center"]
+CAPTION_POSITIONS = ["Auto (by look)", "Bottom", "Middle", "Top (under hook)"]
+
+# The hook banner and the captions each have their OWN settings (bold, colours, box, position...),
+# so changing one never changes the other.
+STYLE_DEFAULTS = {
+    "hook_font_size": 30, "hook_bold": True, "hook_text_hex": "#000000", "hook_box_hex": "#FFD700",
+    "hook_box_opacity": 95, "hook_position": "Top", "hook_fade": False, "hook_uppercase": False,
+    "caption_bold": True, "caption_text_hex": "#FFFFFF", "caption_box_hex": "#000000",
+    "caption_box_opacity": 85, "caption_position": "Auto (by look)", "caption_uppercase": False,
+    "caption_hl_hex": "#FFD700", "caption_outline": 3.2,
+}
+
+# canonical setting -> Look Studio widget key
+LS_KEYS = {
+    "logo_size_pct": "ls_logo_size", "logo_opacity": "ls_logo_opacity", "logo_position": "ls_logo_pos",
+    "caption_look": "ls_caption_look", "onscreen_caption_size": "ls_cap_size",
+    "hook_font_size": "ls_hook_size", "hook_bold": "ls_hook_bold", "hook_text_hex": "ls_hook_text",
+    "hook_box_hex": "ls_hook_box", "hook_box_opacity": "ls_hook_box_op", "hook_position": "ls_hook_pos",
+    "hook_fade": "ls_hook_fade", "hook_uppercase": "ls_hook_upper",
+    "caption_bold": "ls_cap_bold", "caption_text_hex": "ls_cap_text", "caption_box_hex": "ls_cap_box",
+    "caption_box_opacity": "ls_cap_box_op", "caption_position": "ls_cap_pos",
+    "caption_uppercase": "ls_cap_upper", "caption_hl_hex": "ls_cap_hl", "caption_outline": "ls_cap_outline",
+}
+LS_HEX_KEYS = ("ls_hook_text", "ls_hook_box", "ls_cap_text", "ls_cap_box", "ls_cap_hl")
+
+BASE_LOOK = {
+    "vertical_fit_mode": SMART_FIT, "logo_position": LOGO_POSITIONS[0], "logo_size_pct": 12.0,
+    "logo_opacity": 90, "logo_watermark_mode": "Standard Corner (Subtle)",
+    "caption_look": CAPTION_LOOKS[0], "onscreen_caption_size": 32,
+    **STYLE_DEFAULTS,
+}
+LOOK_CAPTURE_KEYS = list(BASE_LOOK.keys())
+
+
+def _look(**over) -> dict:
+    d = dict(BASE_LOOK)
+    d.update(over)
+    return d
+
+
+LOOK_PRESETS = {
+    "CNPL short-form · yellow hook, black-box captions": _look(),
+    "Creator karaoke · white-on-black hook, bottom karaoke": _look(
+        caption_look=CAPTION_LOOKS[1], onscreen_caption_size=34,
+        hook_text_hex="#FFFFFF", hook_box_hex="#000000", hook_box_opacity=75, hook_fade=True,
+        caption_position="Bottom", caption_uppercase=True,
+    ),
+    "Clean minimal · light hook, soft captions": _look(
+        logo_position=LOGO_POSITIONS[2], logo_size_pct=9.0, logo_opacity=70,
+        caption_look=CAPTION_LOOKS[1], onscreen_caption_size=30,
+        hook_font_size=26, hook_bold=False, hook_text_hex="#FFFFFF", hook_box_hex="#000000",
+        hook_box_opacity=35, hook_position="Upper third", hook_fade=True,
+        caption_bold=False, caption_box_opacity=60, caption_position="Bottom",
+        caption_hl_hex="#FFFFFF", caption_outline=2.4,
+    ),
+    "Neon pop · purple hook, lime karaoke": _look(
+        caption_look=CAPTION_LOOKS[1], onscreen_caption_size=36,
+        hook_text_hex="#FFFFFF", hook_box_hex="#7C3AED", hook_box_opacity=90, hook_uppercase=True,
+        caption_position="Bottom", caption_uppercase=True, caption_hl_hex="#45FF00", caption_outline=4.0,
+    ),
+}
+
+
+def _hex_clean(value, default: str = "#FFFFFF") -> str:
+    h = str(value or "").strip().lstrip("#")
+    if re.fullmatch(r"[0-9a-fA-F]{3}", h):
+        h = "".join(c * 2 for c in h)
+    if not re.fullmatch(r"[0-9a-fA-F]{6}", h):
+        h = default.lstrip("#")
+    return "#" + h.upper()
+
+
+def hex_to_ass(value, opacity_pct: float = 100) -> str:
+    """#RRGGBB (+ opacity %) -> ASS &HAABBGGRR (ASS alpha 00 = solid, FF = invisible)."""
+    h = _hex_clean(value)[1:]
+    r, g, b = h[0:2], h[2:4], h[4:6]
+    alpha = int(round(255 * (1.0 - max(0.0, min(100.0, float(opacity_pct))) / 100.0)))
+    return f"&H{alpha:02X}{b}{g}{r}"
+
+
+def hex_to_ff(value) -> str:
+    """#RRGGBB -> 0xRRGGBB for FFmpeg drawtext."""
+    return "0x" + _hex_clean(value)[1:]
+
+
+def style_val(key: str):
+    v = st.session_state.get(key)
+    return STYLE_DEFAULTS[key] if v is None else v
+
+
+def hook_metrics(out_w: int, out_h: int, n_lines: int = 2) -> tuple[int, int, int, int]:
+    """(font px, line step, top y, bottom y) of the hook banner for the current hook settings."""
+    scale = max(0.75, min(2.0, float(out_h) / 1280.0))
+    px = max(18, min(90, int(round(int(style_val("hook_font_size")) * scale))))
+    step = int(px * 1.32)
+    block = step * max(1, int(n_lines))
+    pos = str(style_val("hook_position"))
+    if pos.startswith("Center"):
+        top = max(28, int((out_h - block) / 2))
+    elif pos.startswith("Upper"):
+        top = int(out_h * 0.20)
+    else:
+        top = max(28, int(out_h * 0.06))
+    return px, step, top, top + block
+
+
+def _sync_accent_from_preset():
+    hx = ACCENT_HEX.get(st.session_state.get("subtitle_accent_colour"), "#FFD700")
+    st.session_state["caption_hl_hex"] = hx
+    st.session_state["ls_cap_hl"] = hx
+
+
+def all_looks() -> dict:
+    """Built-in looks plus the user's own saved looks (shown with a star)."""
+    out = dict(LOOK_PRESETS)
+    custom = st.session_state.get("custom_looks")
+    if isinstance(custom, dict):
+        for name, cfg in custom.items():
+            if isinstance(cfg, dict):
+                out[f"★ {name}"] = cfg
+    return out
+
+
+def apply_look_preset(name: str) -> None:
+    """Apply a whole look (logo + hook + caption) in one click."""
+    ss = st.session_state
+    looks = all_looks()
+    preset = looks.get(name) or next(iter(LOOK_PRESETS.values()))
+    merged = dict(BASE_LOOK)
+    merged.update({k: v for k, v in preset.items() if k in BASE_LOOK})
+    for k, v in merged.items():
+        ss[k] = v
+        if k in LS_KEYS:
+            ss[LS_KEYS[k]] = v
+    ss["look_preview_path"] = ""
+
+
+def apply_shortform_preset() -> None:
+    apply_look_preset(next(iter(LOOK_PRESETS)))
+
+
+def _cb_apply_look(sel_key: str) -> None:
+    apply_look_preset(st.session_state.get(sel_key) or next(iter(LOOK_PRESETS)))
+
+
+def _cb_reset_look() -> None:
+    apply_look_preset(next(iter(LOOK_PRESETS)))
+
+
+def _cb_delete_look(sel_key: str) -> None:
+    name = str(st.session_state.get(sel_key) or "")
+    if name.startswith("★ "):
+        custom = dict(st.session_state.get("custom_looks") or {})
+        custom.pop(name[2:], None)
+        st.session_state["custom_looks"] = custom
+        st.session_state[sel_key] = next(iter(LOOK_PRESETS))
+
+
+STATE_FIELDS += list(STYLE_DEFAULTS.keys()) + ["custom_looks"]
+
 
 # ----------------------------- CORE HELPERS -----------------------------
 def run_cmd(args: list[str], timeout: int | None = 300) -> subprocess.CompletedProcess[str]:
@@ -257,15 +420,21 @@ def escape_ffmpeg_path(p: Path) -> str:
     return resolved
 
 
-def find_system_font() -> str | None:
-    candidates = [
+def find_system_font(bold: bool = True) -> str | None:
+    bold_candidates = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
         "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
         "C:/Windows/Fonts/arialbd.ttf",
+    ]
+    regular_candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "C:/Windows/Fonts/arial.ttf",
         "C:/Windows/Fonts/segoeui.ttf",
     ]
-    for candidate in candidates:
+    for candidate in (bold_candidates + regular_candidates) if bold else (regular_candidates + bold_candidates):
         p = Path(candidate)
         if p.exists():
             return escape_ffmpeg_path(p)
@@ -419,7 +588,7 @@ def _collect_state_payload(checkpoint_label: str = "autosave") -> dict:
     if wm_val not in LOGO_WATERMARK_MODES:
         wm_val = "Standard Corner (Subtle)"
 
-    return {
+    payload = {
         "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "checkpoint_label": checkpoint_label,
         "workspace_key": key,
@@ -479,6 +648,12 @@ def _collect_state_payload(checkpoint_label: str = "autosave") -> dict:
         "brand_colour": st.session_state.get("brand_colour", "#FFFFFF"),
         "caption_instructions": st.session_state.get("caption_instructions", ""),
     }
+    # Look Studio: hook + caption styles and the user's own saved looks.
+    for k, dv in STYLE_DEFAULTS.items():
+        payload[k] = st.session_state.get(k, dv)
+    custom = st.session_state.get("custom_looks")
+    payload["custom_looks"] = custom if isinstance(custom, dict) else {}
+    return payload
 
 
 def save_workspace_state(ws_key: str | None = None, checkpoint_label: str = "autosave") -> Path:
@@ -548,6 +723,23 @@ def apply_state_payload(data: dict) -> bool:
         st.session_state["caption_look"] = CAPTION_LOOKS[0]
     if st.session_state.get("moment_order") not in MOMENT_ORDERS:
         st.session_state["moment_order"] = MOMENT_ORDERS[0]
+
+    # Look Studio widgets re-read the loaded values; missing style keys fall back to defaults.
+    for _k in [k for k in list(st.session_state.keys()) if str(k).startswith("ls_")]:
+        try:
+            del st.session_state[_k]
+        except Exception:
+            pass
+    st.session_state.pop("_ls_sync", None)
+    for _k, _dv in STYLE_DEFAULTS.items():
+        if st.session_state.get(_k) is None:
+            st.session_state[_k] = _dv
+    if st.session_state.get("hook_position") not in HOOK_POSITIONS:
+        st.session_state["hook_position"] = HOOK_POSITIONS[0]
+    if st.session_state.get("caption_position") not in CAPTION_POSITIONS:
+        st.session_state["caption_position"] = CAPTION_POSITIONS[0]
+    if not isinstance(st.session_state.get("custom_looks"), dict):
+        st.session_state["custom_looks"] = {}
 
     cnt = max(1, min(6, int(data.get("auto_clip_count") or 2)))
     st.session_state["auto_clip_count"] = cnt
@@ -2947,17 +3139,45 @@ def write_creator_ass_file(
     accent_colour: str = "Creator Yellow",
 ) -> Path:
     accent = SUBTITLE_ACCENT_PALETTE.get(accent_colour, SUBTITLE_ACCENT_PALETTE["Creator Yellow"])
+    if st.session_state.get("caption_hl_hex"):
+        accent = hex_to_ass(st.session_state.get("caption_hl_hex"))
     box_look = str(st.session_state.get("caption_look", CAPTION_LOOKS[0])).startswith("Black Box")
     scale = max(0.75, min(2.0, float(out_h) / 1280.0))
     font_px = max(24, min(76, int(round(int(font_size) * scale))))
-    margin_v = max(58, int(round(out_h * (0.115 if out_h >= out_w else 0.075))))
-    if box_look:
+
+    # Caption position is independent from the hook banner position.
+    cap_pos = str(style_val("caption_position"))
+    if cap_pos.startswith("Auto"):
+        cap_pos = "Top (under hook)" if box_look else "Bottom"
+    align = {"Bottom": 2, "Middle": 5}.get(cap_pos, 8)
+    if cap_pos == "Bottom":
+        margin_v = max(58, int(round(out_h * (0.115 if out_h >= out_w else 0.075))))
+    elif cap_pos == "Middle":
+        margin_v = 0
+    else:
         margin_v = int(round(out_h * (0.185 if out_h >= out_w else 0.10)))
-    style_line = (
-        f"Style: Creator,Arial,{font_px},&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,3,{max(8, int(font_px * 0.28))},0,8,60,60,{margin_v},1"
-        if box_look else
-        f"Style: Creator,Arial,{font_px},{accent},&H00FFFFFF,&H00101010,&H64000000,-1,0,0,0,100,100,0,0,1,3.2,1.4,2,48,48,{margin_v},1"
-    )
+        if str(style_val("hook_position")).startswith("Top"):
+            hook_bottom = hook_metrics(out_w, out_h, 2)[3]
+            margin_v = max(margin_v, int(hook_bottom + out_h * 0.02))  # never overlap the hook
+
+    bold_flag = -1 if style_val("caption_bold") else 0
+    txt_col = hex_to_ass(style_val("caption_text_hex"))
+    box_col = hex_to_ass(style_val("caption_box_hex"), style_val("caption_box_opacity"))
+    try:
+        outline_px = max(0.0, min(10.0, float(style_val("caption_outline"))))
+    except (TypeError, ValueError):
+        outline_px = 3.2
+    if box_look:
+        style_line = (
+            f"Style: Creator,Arial,{font_px},{txt_col},{txt_col},{box_col},{box_col},{bold_flag},0,0,0,100,100,0,0,3,"
+            f"{max(8, int(font_px * 0.28))},0,{align},60,60,{margin_v},1"
+        )
+    else:
+        # karaoke: Primary = highlight colour (spoken word), Secondary = normal text colour
+        style_line = (
+            f"Style: Creator,Arial,{font_px},{accent},{txt_col},&H00101010,&H64000000,{bold_flag},0,0,0,100,100,0,0,1,"
+            f"{outline_px:.1f},1.4,{align},48,48,{margin_v},1"
+        )
     header = f"""[Script Info]
 Title: ClipStream Studio Creator Captions
 ScriptType: v4.00+
@@ -2973,6 +3193,7 @@ Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour,
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
+
     def ass_time(seconds: float) -> str:
         cs = max(0, int(round(seconds * 100)))
         hh, rem = divmod(cs, 360000)
@@ -2989,6 +3210,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             continue
 
         safe_text = _ass_safe_text(str(cue_text or "").replace("\\N", " "))
+        if style_val("caption_uppercase"):
+            safe_text = safe_text.upper()
         max_chars = max(16, min(30, int(out_w / max(1.0, font_px * 0.58))))
         wrapped_lines = wrap_text_lines(safe_text, max_chars=max_chars, max_lines=2)
         words_by_line = [line.split() for line in wrapped_lines if line.strip()]
@@ -3029,7 +3252,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             karaoke_lines.append(" ".join(karaoke_parts[word_cursor:word_cursor + line_count]))
             word_cursor += line_count
         karaoke_text = r"\N".join(karaoke_lines)
-        events.append(f"Dialogue: 0,{ass_time(start)},{ass_time(end)},Creator,,0,0,0,,{{\\an{8 if box_look else 2}\\q2}}{karaoke_text}")
+        events.append(f"Dialogue: 0,{ass_time(start)},{ass_time(end)},Creator,,0,0,0,,{{\\an{align}\\q2}}{karaoke_text}")
 
     output_path.write_text(header + "\n".join(events) + "\n", encoding="utf-8")
     return output_path
@@ -3043,8 +3266,9 @@ def _drawtext_subtitle_filters(
     temp_files: list[Path],
     ascii_only: bool = False,
 ) -> list[str]:
-    sys_font = find_system_font()
+    sys_font = find_system_font(bold=bool(style_val("caption_bold")))
     font_opt = f":fontfile='{sys_font}'" if sys_font else ""
+    txt_col = hex_to_ff(style_val("caption_text_hex"))
     scale_ratio = max(0.8, float(out_h) / 1280.0)
     sub_px = max(22, min(54, int(round(int(caption_font_size) * scale_ratio))))
     bottom_margin = max(52, int(round(out_h * 0.115)))
@@ -3054,7 +3278,10 @@ def _drawtext_subtitle_filters(
         c_start, c_end, c_text = cue[:3]
         c_a = max(0.0, min(clip_duration, float(c_start)))
         c_b = max(c_a + 0.15, min(clip_duration, float(c_end)))
-        lines_list = wrap_text_lines(" ".join(str(c_text).splitlines()), max_chars=26, max_lines=2, ascii_only=ascii_only)
+        shown = " ".join(str(c_text).splitlines())
+        if style_val("caption_uppercase"):
+            shown = shown.upper()
+        lines_list = wrap_text_lines(shown, max_chars=26, max_lines=2, ascii_only=ascii_only)
         if not lines_list:
             continue
         base_y = out_h - bottom_margin - line_step * len(lines_list)
@@ -3065,7 +3292,7 @@ def _drawtext_subtitle_filters(
             escaped = escape_ffmpeg_path(text_path)
             y_pos = max(24, base_y + line_idx * line_step)
             filters.append(
-                f"drawtext=textfile='{escaped}'{font_opt}:fontcolor=white:fontsize={sub_px}:"
+                f"drawtext=textfile='{escaped}'{font_opt}:fontcolor={txt_col}:fontsize={sub_px}:"
                 f"x=max(24\\,(w-text_w)/2):y={y_pos}:"
                 f"borderw=4:bordercolor=black@0.98:shadowcolor=black@0.75:shadowx=2:shadowy=2:"
                 f"enable='between(t,{c_a:.2f},{c_b:.2f})'"
@@ -3091,20 +3318,29 @@ def append_overlays_and_subs(
     use_ass: bool = True,
     subtitle_accent_colour: str = "Creator Yellow",
     logo_watermark_mode: str = "Standard Corner (Subtle)",
+    hook_fade: bool | None = None,
 ) -> tuple[str, str | None]:
     current = current_label
     srt_file: Path | None = None
-    font_opt = ""
-    sys_font = find_system_font()
-    if sys_font:
-        font_opt = f":fontfile='{sys_font}'"
 
-    hook_lines = wrap_text_lines(hook_banner_text, max_chars=24, max_lines=2, ascii_only=ascii_only)
+    # ---- hook banner: uses ONLY the hook_* settings (never the caption look) ----
+    hook_src = str(hook_banner_text or "")
+    if style_val("hook_uppercase"):
+        hook_src = hook_src.upper()
+    hook_px0 = hook_metrics(out_w, out_h)[0]
+    hook_chars = max(12, min(30, int(out_w / (hook_px0 * 0.62)) - 2))
+    hook_lines = wrap_text_lines(hook_src, max_chars=hook_chars, max_lines=2, ascii_only=ascii_only)
     if hook_lines:
-        hook_font_px = max(20, min(36, int(out_h * 0.025)))
-        hook_step = int(hook_font_px * 1.28)
-        top_y = max(28, int(out_h * 0.06))
+        hook_px, hook_step, top_y, _ = hook_metrics(out_w, out_h, len(hook_lines))
+        hook_font = find_system_font(bold=bool(style_val("hook_bold")))
+        hook_font_opt = f":fontfile='{hook_font}'" if hook_font else ""
         active_end = min(clip_duration, max(1.0, float(hook_banner_duration)))
+        use_fade = bool(style_val("hook_fade")) if hook_fade is None else bool(hook_fade)
+        fade_opt = f":alpha='clip(min(t/0.35,({active_end:.2f}-t)/0.35),0,1)'" if use_fade else ""
+        box_op = max(0, min(100, int(style_val("hook_box_opacity")))) / 100.0
+        text_col = hex_to_ff(style_val("hook_text_hex"))
+        box_col = hex_to_ff(style_val("hook_box_hex"))
+        box_pad = max(8, int(hook_px * 0.28))
         hook_filters: list[str] = []
 
         for h_i, h_line in enumerate(hook_lines):
@@ -3114,10 +3350,10 @@ def append_overlays_and_subs(
             hook_file_esc = escape_ffmpeg_path(hook_txt_path)
             y_hook = top_y + (h_i * hook_step)
             hook_filters.append(
-                f"drawtext=textfile='{hook_file_esc}'{font_opt}:fontcolor=white:fontsize={hook_font_px}:"
+                f"drawtext=textfile='{hook_file_esc}'{hook_font_opt}:fontcolor={text_col}:fontsize={hook_px}:"
                 f"x=max(24\\,(w-text_w)/2):y={y_hook}:"
-                f"box=1:boxcolor=black@0.75:boxborderw=8:"
-                f"enable='between(t,0,{active_end:.2f})'"
+                f"box=1:boxcolor={box_col}@{box_op:.2f}:boxborderw={box_pad}:"
+                f"enable='between(t,0,{active_end:.2f})'{fade_opt}"
             )
 
         graph.append(f"[{current}]{','.join(hook_filters)}[vhook]")
@@ -3931,7 +4167,10 @@ def init_state():
         "brand_name": "",
         "brand_colour": "#FFFFFF",
         "caption_instructions": "",
+        "custom_looks": {},
     }
+    for k, v in STYLE_DEFAULTS.items():
+        defaults.setdefault(k, v)
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
@@ -3965,92 +4204,7 @@ def stamp_logo_onto_existing_clip(
     logo_file_path: str,
     watermark_mode: str = "Standard Corner (Subtle)",
 ) -> tuple[dict, str]:
-    src_p = clip_rec.get("path") or ""
-    if not src_p or not Path(src_p).exists():
-        return clip_rec, "Skipped (clip video file not found)."
-    if not logo_file_path or not Path(logo_file_path).exists():
-        return clip_rec, "Skipped (logo file not found)."
-    if not ffmpeg_ready():
-        return clip_rec, "Skipped (FFmpeg not available)."
-
-    try:
-        info = probe_video(src_p)
-        clip_dur = max(0.5, float(info.get("duration") or max(0.5, float(clip_rec.get("end", 15)) - float(clip_rec.get("start", 0)))))
-    except Exception:
-        clip_dur = max(0.5, round(float(clip_rec.get("end", 15)) - float(clip_rec.get("start", 0)), 1))
-
-    ws_dir = workspace_dir(st.session_state.get("workspace_key", "default"))
-    out_mp4 = ws_dir / f"{safe_name(Path(src_p).stem)}_logo_{next(tempfile._get_candidate_names())}.mp4"
-
-    wm_mode = watermark_mode if watermark_mode in LOGO_WATERMARK_MODES else "Standard Corner (Subtle)"
-    if wm_mode == "Solid Corner":
-        vf = "[1:v]scale=iw*0.12:-1:flags=bilinear[logo];[0:v][logo]overlay=W-w-20:20:format=auto[vout]"
-    elif wm_mode == "Standard Corner (First 8s)":
-        wm_end = min(max(1.0, clip_dur), 8.0)
-        vf = (
-            "[1:v]scale=iw*0.12:-1:flags=bilinear,format=rgba,colorchannelmixer=aa=0.78[logo];"
-            f"[0:v][logo]overlay=W-w-20:20:format=auto:enable='between(t,0,{wm_end:.2f})'[vout]"
-        )
-    else:
-        vf = (
-            "[1:v]scale=iw*0.12:-1:flags=bilinear,format=rgba,colorchannelmixer=aa=0.78[logo];"
-            "[0:v][logo]overlay=W-w-20:20:format=auto[vout]"
-        )
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", src_p,
-        "-i", str(logo_file_path),
-        "-filter_complex", vf,
-        "-map", "[vout]",
-        "-map", "0:a?",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "21",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "copy",
-        "-movflags", "+faststart",
-        str(out_mp4),
-    ]
-    res = run_cmd(cmd, timeout=300)
-    if res.returncode != 0 or not out_mp4.exists() or out_mp4.stat().st_size == 0:
-        # Fallback re-encoding audio cleanly if stream copy fails
-        cmd_reenc = [
-            "ffmpeg", "-y",
-            "-i", src_p,
-            "-i", str(logo_file_path),
-            "-filter_complex", vf,
-            "-map", "[vout]",
-            "-map", "0:a?",
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "21",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac",
-            "-b:a", "128k",
-            "-movflags", "+faststart",
-            str(out_mp4),
-        ]
-        res2 = run_cmd(cmd_reenc, timeout=300)
-        if res2.returncode != 0 or not out_mp4.exists() or out_mp4.stat().st_size == 0:
-            out_mp4.unlink(missing_ok=True)
-            return clip_rec, (res2.stderr[-1500:] or res.stderr[-1500:] or "Logo stamp failed.")
-
-    updated = dict(clip_rec)
-    updated_meta = dict(clip_rec.get("meta") or {})
-    updated["path"] = str(out_mp4)
-    updated_meta["logo_applied_post_render"] = True
-    updated_meta["logo_watermark_mode"] = wm_mode
-    updated["meta"] = updated_meta
-    gc.collect()
-    return updated, f"Stamped logo ({wm_mode}) onto clip."
-
-
-def stamp_logo_onto_existing_clip(
-    clip_rec: dict,
-    logo_file_path: str,
-    watermark_mode: str = "Standard Corner (Subtle)",
-) -> tuple[dict, str]:
+    """Stamp the brand logo onto a finished clip using the Look Studio size / opacity / position."""
     src_p = clip_rec.get("path") or ""
     if not src_p or not Path(src_p).exists():
         return clip_rec, "Skipped (clip video file not found)."
@@ -4158,16 +4312,18 @@ def render_look_preview(source: str, at: float = 1.0) -> Path | None:
         inputs += ["-i", str(logo)]
     tmp: list[Path] = []
     out_jpg = workspace_dir(ss.get("workspace_key", "default")) / f"lookprev_{next(tempfile._get_candidate_names())}.jpg"
+    hook_demo = normalize_english_subtitle_text(str(ss.get("custom_hook_fallback") or "")) or "Your hook banner"
     try:
         cur, _ = append_overlays_and_subs(
             graph=graph, current_label="vstage", clip_duration=5.0, out_w=out_w, out_h=out_h,
             logo=logo, logo_input_idx=logo_idx,
             cues=[(0.0, 5.0, "Your caption looks like this")],
-            hook_banner_text="Your hook banner", hook_banner_duration=5.0,
+            hook_banner_text=hook_demo, hook_banner_duration=5.0,
             caption_font_size=int(ss.get("onscreen_caption_size", 32)), srt_output_path=None,
             temp_text_files=tmp, use_ass=True,
             subtitle_accent_colour=ss.get("subtitle_accent_colour", "Creator Yellow"),
             logo_watermark_mode="Standard Corner (Subtle)" if ss.get("logo_watermark_mode") == "Standard Corner (First 8s)" else ss.get("logo_watermark_mode", "Standard Corner (Subtle)"),
+            hook_fade=False,  # a still frame at t=0 would be invisible with fade-in
         )
         res = run_cmd(["ffmpeg", "-y", *inputs, "-filter_complex", ";".join(graph), "-map", f"[{cur}]",
                        "-frames:v", "1", "-q:v", "3", str(out_jpg)], timeout=90)
@@ -4181,58 +4337,156 @@ def render_look_preview(source: str, at: float = 1.0) -> Path | None:
     return None
 
 
-def apply_shortform_preset():
-    """One click: the look of the CNPL-style shorts (full-frame crop, small corner logo, black-box captions)."""
+def _ls_pull() -> None:
+    """Copy the saved look into the Look Studio widgets, but only when the saved value changed
+    from somewhere else (a preset, a loaded workspace, another page). Keeps the user's live edits."""
     ss = st.session_state
-    ss["vertical_fit_mode"] = SMART_FIT
-    ss["logo_position"] = LOGO_POSITIONS[0]
-    ss["logo_size_pct"] = 12.0
-    ss["logo_opacity"] = 90
-    ss["caption_look"] = CAPTION_LOOKS[0]
-    ss["logo_watermark_mode"] = "Standard Corner (Subtle)"
-    ss["ls_logo_size"] = 12.0
-    ss["ls_logo_opacity"] = 90
-    ss["ls_logo_pos"] = LOGO_POSITIONS[0]
-    ss["ls_caption_look"] = CAPTION_LOOKS[0]
+    last = ss.get("_ls_sync") or {}
+    for canon, wk in LS_KEYS.items():
+        cur = ss.get(canon)
+        if cur is None:
+            cur = BASE_LOOK.get(canon)
+        if cur is None:
+            continue
+        if wk not in ss or last.get(canon) != cur:
+            ss[wk] = cur
+    for wk in LS_HEX_KEYS:
+        ss[wk] = _hex_clean(ss.get(wk))
+    if ss.get("ls_logo_pos") not in LOGO_POSITIONS:
+        ss["ls_logo_pos"] = LOGO_POSITIONS[0]
+    if ss.get("ls_caption_look") not in CAPTION_LOOKS:
+        ss["ls_caption_look"] = CAPTION_LOOKS[0]
+    if ss.get("ls_hook_pos") not in HOOK_POSITIONS:
+        ss["ls_hook_pos"] = HOOK_POSITIONS[0]
+    if ss.get("ls_cap_pos") not in CAPTION_POSITIONS:
+        ss["ls_cap_pos"] = CAPTION_POSITIONS[0]
 
 
 def render_look_studio(prefix: str = "ls"):
-    """Logo size / opacity / position + caption look, with a live preview frame."""
+    """Logo, hook banner and caption editors (size, position, colours) with a live preview frame.
+    Hook and caption each keep their own bold / colour / box / position settings."""
     ss = st.session_state
-    ss.setdefault("ls_logo_size", float(ss.get("logo_size_pct", 12.0)))
-    ss.setdefault("ls_logo_opacity", int(ss.get("logo_opacity", 90)))
-    ss.setdefault("ls_logo_pos", ss.get("logo_position", LOGO_POSITIONS[0]))
-    ss.setdefault("ls_caption_look", ss.get("caption_look", CAPTION_LOOKS[0]))
+    _ls_pull()
+
     st.markdown("#### 🎨 Look Studio")
-    st.caption("Make the logo bigger or smaller, change its position and the caption style, then preview before you render.")
-    top_a, top_b = st.columns([1.0, 1.0])
-    with top_a:
-        if st.button("⚡ Use short-form preset (full frame · small logo · box captions)", key=f"{prefix}_preset", width="stretch"):
-            apply_shortform_preset()
-            st.rerun()
-    c1, c2 = st.columns([1.2, 1.0], gap="large")
-    with c1:
-        size = st.slider("Logo size (% of video width)", 3.0, 45.0, step=0.5, key="ls_logo_size",
-                         help="Bigger number = bigger logo in the finished clip.")
-        opac = st.slider("Logo opacity (%)", 10, 100, step=5, key="ls_logo_opacity")
-        pos = st.selectbox("Logo position", LOGO_POSITIONS, key="ls_logo_pos")
-        look = st.selectbox("Caption look", CAPTION_LOOKS, key="ls_caption_look")
-        ss["logo_size_pct"], ss["logo_opacity"], ss["logo_position"], ss["caption_look"] = float(size), int(opac), pos, look
-        if not (ss.get("logo_path") and Path(ss["logo_path"]).exists()):
-            st.warning("Upload a logo (SRT & Logo section) to see it in the preview.")
-        t_at = st.slider("Preview at (seconds into the active video)", 0.0, max(1.0, float((ss.get("video_info") or {}).get("duration") or 10.0) - 0.5), 1.0, 0.5, key=f"{prefix}_prev_t")
+    st.caption("Logo, hook banner and captions each have their own size, position, bold and colours. Change them, then preview before you render.")
+
+    looks = all_looks()
+    look_names = list(looks.keys())
+    sel_key = f"{prefix}_preset_sel"
+    if ss.get(sel_key) not in look_names:
+        ss[sel_key] = look_names[0]
+    pr_a, pr_b, pr_c = st.columns([2.2, 1.0, 1.0])
+    with pr_a:
+        st.selectbox("Look preset", look_names, key=sel_key)
+    with pr_b:
+        st.write("")
+        st.button("⚡ Apply preset", key=f"{prefix}_preset", width="stretch",
+                  on_click=_cb_apply_look, args=(sel_key,))
+    with pr_c:
+        st.write("")
+        st.button("↺ Reset look", key=f"{prefix}_reset_look", width="stretch", on_click=_cb_reset_look)
+
+    left, right = st.columns([1.35, 1.0], gap="large")
+    with left:
+        tab_logo, tab_hook, tab_cap = st.tabs(["🏷️ Logo", "🪝 Hook banner", "💬 Captions"])
+        with tab_logo:
+            st.slider("Logo size (% of video width)", 3.0, 45.0, step=0.5, key="ls_logo_size",
+                      help="Bigger number = bigger logo in the finished clip.")
+            st.slider("Logo opacity (%)", 10, 100, step=5, key="ls_logo_opacity")
+            st.selectbox("Logo position", LOGO_POSITIONS, key="ls_logo_pos")
+            if not (ss.get("logo_path") and Path(ss["logo_path"]).exists()):
+                st.warning("Upload a logo (SRT & Logo section) to see it in the preview.")
+        with tab_hook:
+            st.caption("The hook is the headline banner at the start of the clip. It has its own look, separate from captions.")
+            h1, h2 = st.columns(2)
+            with h1:
+                st.slider("Hook text size", 18, 56, step=1, key="ls_hook_size")
+                st.selectbox("Hook position", HOOK_POSITIONS, key="ls_hook_pos")
+                st.checkbox("Bold hook text", key="ls_hook_bold")
+                st.checkbox("ALL CAPS hook", key="ls_hook_upper")
+                st.checkbox("Fade hook in and out", key="ls_hook_fade")
+            with h2:
+                st.color_picker("Hook text colour", key="ls_hook_text")
+                st.color_picker("Hook box colour", key="ls_hook_box")
+                st.slider("Hook box opacity (%)", 0, 100, step=5, key="ls_hook_box_op",
+                          help="0 = no box, just text.")
+        with tab_cap:
+            st.caption("Captions are the spoken words. Black-box look uses the text and box colours; karaoke look uses text, highlight colour and outline.")
+            st.selectbox("Caption look", CAPTION_LOOKS, key="ls_caption_look")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.slider("Caption size", 20, 48, step=1, key="ls_cap_size")
+                st.selectbox("Caption position", CAPTION_POSITIONS, key="ls_cap_pos")
+                st.checkbox("Bold caption text", key="ls_cap_bold")
+                st.checkbox("ALL CAPS captions", key="ls_cap_upper")
+                st.slider("Karaoke outline thickness", 0.0, 8.0, step=0.2, key="ls_cap_outline",
+                          help="Only used by the Creator Karaoke look.")
+            with c2:
+                st.color_picker("Caption text colour", key="ls_cap_text")
+                st.color_picker("Caption box colour (black-box look)", key="ls_cap_box")
+                st.slider("Caption box opacity (%)", 0, 100, step=5, key="ls_cap_box_op")
+                st.color_picker("Highlight colour (karaoke look)", key="ls_cap_hl")
+
+        with st.expander("💾 My own looks (save / delete)", expanded=False):
+            name_in = st.text_input("Name for this look", key=f"{prefix}_new_look_name", placeholder="e.g. Brand A shorts")
+            sv_a, sv_b = st.columns(2)
+            with sv_a:
+                if st.button("💾 Save current look", key=f"{prefix}_save_look_btn", width="stretch"):
+                    nm = re.sub(r"\s+", " ", str(name_in or "")).strip()[:40]
+                    if not nm:
+                        st.warning("Type a name first.")
+                    else:
+                        # capture what is on screen right now (widgets are the source of truth)
+                        snap = {}
+                        for canon in LOOK_CAPTURE_KEYS:
+                            wk = LS_KEYS.get(canon)
+                            snap[canon] = ss.get(wk) if (wk and wk in ss) else ss.get(canon)
+                        custom = dict(ss.get("custom_looks") or {})
+                        custom[nm] = snap
+                        ss["custom_looks"] = custom
+                        save_workspace_state(checkpoint_label="custom_look_saved")
+                        st.success(f"Saved look “{nm}”. Pick it in *Look preset* (shown with ★).")
+            with sv_b:
+                st.button("🗑️ Delete selected ★ look", key=f"{prefix}_del_look_btn", width="stretch",
+                          on_click=_cb_delete_look, args=(sel_key,),
+                          disabled=not str(ss.get(sel_key) or "").startswith("★ "))
+
+    # Widgets are the live values; mirror them into the settings the renderer reads.
+    for canon, wk in LS_KEYS.items():
+        if wk in ss:
+            ss[canon] = ss[wk]
+    ss["logo_size_pct"] = float(ss["logo_size_pct"])
+    ss["logo_opacity"] = int(ss["logo_opacity"])
+    ss["caption_outline"] = float(ss["caption_outline"])
+    ss["_ls_sync"] = {canon: ss.get(canon) for canon in LS_KEYS}
+
+    style_sig = json.dumps(
+        {k: ss.get(k) for k in list(LS_KEYS) + ["logo_path", "vertical_fit_mode", "custom_hook_fallback"]},
+        sort_keys=True, default=str,
+    )
+    prev_saved = ss.get("look_saved_sig")
+    ss["look_saved_sig"] = style_sig
+    if prev_saved is not None and prev_saved != style_sig:
+        save_workspace_state(checkpoint_label="look_changed")
+
+    with right:
+        t_max = max(1.0, float((ss.get("video_info") or {}).get("duration") or 10.0) - 0.5)
+        t_at = st.slider("Preview at (seconds into the active video)", 0.0, t_max, min(1.0, t_max), 0.5, key=f"{prefix}_prev_t")
+        auto_prev = st.checkbox("Auto-refresh preview when I change something", value=True, key=f"{prefix}_auto_prev")
         go = st.button("👁️ Preview this look", type="primary", key=f"{prefix}_prev_btn", width="stretch")
-    with c2:
-        if go:
-            if not (ss.get("source_video") and Path(ss["source_video"]).exists()):
-                st.info("Load a video first to preview.")
-            else:
-                with st.spinner("Rendering preview..."):
-                    ss["look_preview_path"] = str(render_look_preview(ss["source_video"], t_at) or "")
-                save_workspace_state(checkpoint_label="look_changed")
+        prev_sig = f"{style_sig}|{t_at:.1f}"
+        has_video = bool(ss.get("source_video") and Path(ss["source_video"]).exists())
+        want_auto = bool(auto_prev and ss.get("look_prev_sig") and ss.get("look_prev_sig") != prev_sig)
+        if go and not has_video:
+            st.info("Load a video first to preview.")
+        elif (go or want_auto) and has_video:
+            with st.spinner("Rendering preview..."):
+                ss["look_preview_path"] = str(render_look_preview(ss["source_video"], t_at) or "")
+            ss["look_prev_sig"] = prev_sig
         pp = ss.get("look_preview_path")
         if pp and Path(pp).exists():
-            st.image(pp, caption="Preview (what your clips will look like)", width=260)
+            st.image(pp, caption="Preview (what your clips will look like)", width=300)
         else:
             st.caption("Press **Preview this look** to see a frame here.")
 
@@ -4257,6 +4511,7 @@ st.markdown(f"""<div class="hero">
 <span class="pill">Audio + Motion + Guess Fallback</span>
 <span class="pill">Never-Repeat Recipes</span>
 <span class="pill">Workspace Code Loader</span>
+<span class="pill">Look Studio: Logo · Hook · Captions</span>
 </div>""", unsafe_allow_html=True)
 
 if not ffmpeg_ready():
@@ -4806,7 +5061,7 @@ if page == "Campaign & Auto-Clipper":
                 if not u_l and not o_l:
                     st.caption("No spots used yet.")
 
-        with st.expander("🎨 Look Studio · logo size, opacity, position & caption look (with preview)", expanded=False):
+        with st.expander("🎨 Look Studio · logo, hook banner & captions (size, position, bold, colours, preview)", expanded=False):
             render_look_studio("s3")
         q_col1, q_col2, q_col3, q_col4 = st.columns(4)
         with q_col1:
@@ -5248,7 +5503,7 @@ elif page == "Brand Kit & Settings":
 
     st.divider()
     st.markdown("### Export & Import Project State (JSON)")
-    st.caption("Save a portable JSON snapshot of your brief, analysis, clip windows, captions, and settings—or load one from another computer.")
+    st.caption("Save a portable JSON snapshot of your brief, analysis, clip windows, captions, looks and settings—or load one from another computer.")
 
     export_payload = _collect_state_payload(checkpoint_label="exported_json")
     st.download_button(
@@ -5568,6 +5823,7 @@ if page == "Videos Extracted":
     # Section 5: Subtitles
     st.divider()
     st.subheader("Section 5 · Creator-Style English Captions & Burn-In")
+    st.caption("Tip: full control of caption colours, bold, position and the hook banner lives in **Look Studio** (Brand Kit & Settings, or Section 3).")
     s5_c1, s5_c2, s5_c3, s5_c4 = st.columns([1.25, 1.0, 1.2, 1.15])
     with s5_c1:
         st.checkbox("Auto-include English subtitles on future renders", key="burn_subtitles_chk_v2")
@@ -5580,7 +5836,10 @@ if page == "Videos Extracted":
             key="onscreen_caption_size",
         )
     with s5_c4:
-        st.selectbox("Highlight colour (karaoke look)", list(SUBTITLE_ACCENT_PALETTE.keys()), key="subtitle_accent_colour")
+        st.selectbox(
+            "Highlight colour preset", list(SUBTITLE_ACCENT_PALETTE.keys()),
+            key="subtitle_accent_colour", on_change=_sync_accent_from_preset,
+        )
         st.selectbox("Caption look", CAPTION_LOOKS, key="caption_look")
 
     if st.session_state.clips:
