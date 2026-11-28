@@ -62,19 +62,36 @@ st.set_page_config(page_title=APP_NAME, page_icon="🎬", layout="wide")
 # ----------------------------- UI & THEME -------------------------------
 st.markdown("""
 <style>
-:root{color-scheme:dark}
-.stApp{background:#090c13;color:#f4f5fa}
-[data-testid="stHeader"]{background:rgba(9,12,19,.92)}
-.block-container{max-width:1550px;padding-top:1.1rem;padding-bottom:3rem}
-[data-testid="stMetric"]{background:#151b29;border:1px solid #2b354b;padding:13px;border-radius:14px}
-[data-testid="stVerticalBlockBorderWrapper"]{background:#111827;border:1px solid #293449;border-radius:15px}
-.stButton>button,.stDownloadButton>button{border-radius:10px;font-weight:650;min-height:2.45rem}
-[data-testid="stSidebar"]{background:#0f1623}
-.hero{padding:22px;border:1px solid #34405a;border-radius:20px;background:linear-gradient(115deg,#211d3b,#141c2d 58%,#30203b);margin-bottom:1.1rem}
-.hero h1{margin:0;letter-spacing:-1.2px;font-size:2.1rem}
-.muted{color:#a5b0c4;font-size:.9rem}
-.pill{display:inline-block;border:1px solid #46516d;color:#c7d2fe;border-radius:30px;padding:4px 10px;font-size:.78rem;margin:4px 5px 0 0}
-.ws-code-box{background:#151b29;border:1px dashed #6366f1;border-radius:10px;padding:8px 10px;font-family:monospace;font-size:.82rem;color:#c7d2fe;word-break:break-all}
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+:root{color-scheme:dark;--bg:#080b12;--card:#111726;--card2:#151c2e;--line:#27324a;--acc:#7c83ff;--acc2:#22d3a6;--txt:#f3f5fb;--mut:#9aa7bf}
+html,body,.stApp,[class*="css"]{font-family:'Inter',system-ui,sans-serif}
+.stApp{background:radial-gradient(1100px 500px at 8% -10%,#1c1a3d 0%,transparent 60%),radial-gradient(900px 480px at 100% 0%,#0f2a30 0%,transparent 55%),var(--bg);color:var(--txt)}
+[data-testid="stHeader"]{background:rgba(8,11,18,.75);backdrop-filter:blur(8px)}
+.block-container{max-width:1500px;padding-top:1.1rem;padding-bottom:4rem}
+h2,h3,h4{letter-spacing:-.02em;font-weight:750}
+[data-testid="stMetric"]{background:linear-gradient(160deg,var(--card2),var(--card));border:1px solid var(--line);padding:13px 15px;border-radius:14px}
+[data-testid="stMetricValue"]{font-weight:750}
+[data-testid="stVerticalBlockBorderWrapper"]{background:var(--card);border:1px solid var(--line);border-radius:16px}
+[data-testid="stExpander"]{background:var(--card);border:1px solid var(--line);border-radius:14px}
+.stButton>button,.stDownloadButton>button{border-radius:11px;font-weight:650;min-height:2.5rem;border:1px solid var(--line);transition:transform .08s ease,box-shadow .15s ease,border-color .15s}
+.stButton>button:hover,.stDownloadButton>button:hover{border-color:var(--acc);transform:translateY(-1px);box-shadow:0 6px 18px rgba(124,131,255,.18)}
+.stButton>button[kind="primary"]{background:linear-gradient(120deg,#6d6bff,#8b5cf6);border:none;color:#fff;box-shadow:0 6px 20px rgba(109,107,255,.30)}
+[data-testid="stSidebar"]{background:linear-gradient(180deg,#0e1424,#0a0f1b);border-right:1px solid var(--line)}
+[data-testid="stTabs"] button[role="tab"]{font-weight:600}
+[data-testid="stFileUploaderDropzone"]{background:var(--card2);border:1.5px dashed #3b4770;border-radius:14px}
+textarea,input{border-radius:10px!important}
+.hero{padding:26px 28px;border:1px solid #38426a;border-radius:22px;background:linear-gradient(120deg,rgba(124,131,255,.20),rgba(34,211,166,.10) 60%,rgba(236,72,153,.12));margin-bottom:1.1rem;box-shadow:0 12px 40px rgba(0,0,0,.35)}
+.hero h1{margin:0;letter-spacing:-1.4px;font-size:2.2rem;font-weight:800}
+.hero .kick{color:#b4b9ff;font-weight:750;font-size:.74rem;letter-spacing:.14em}
+.muted{color:var(--mut);font-size:.92rem}
+.pill{display:inline-block;border:1px solid #4a557a;background:rgba(255,255,255,.03);color:#d3d8ff;border-radius:30px;padding:4px 11px;font-size:.76rem;margin:6px 6px 0 0}
+.stepper{display:flex;gap:10px;flex-wrap:wrap;margin:0 0 1.1rem 0}
+.step{flex:1 1 150px;display:flex;align-items:center;gap:10px;padding:10px 13px;border-radius:13px;border:1px solid var(--line);background:var(--card)}
+.step .n{width:26px;height:26px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:.8rem;background:#222c47;color:#aab4d6}
+.step.done{border-color:#1f6f5c;background:linear-gradient(160deg,#0f2a26,#111726)}
+.step.done .n{background:var(--acc2);color:#04231b}
+.step .t{font-weight:650;font-size:.86rem}.step .s{color:var(--mut);font-size:.74rem}
+.ws-code-box{background:var(--card2);border:1px dashed #6366f1;border-radius:10px;padding:8px 10px;font-family:monospace;font-size:.82rem;color:#c7d2fe;word-break:break-all}
 </style>
 """, unsafe_allow_html=True)
 
@@ -153,7 +170,7 @@ STATE_FIELDS = [
     "active_video_idx", "source_video", "video_name", "video_info",
     "broken_parts", "transcript", "full_srt_path", "full_srt_name",
     "full_srt_cues", "auto_candidates", "clips", "logo_path",
-    "logo_name", "logo_position", "caption_look", "brand_name", "brand_colour", "caption_instructions",
+    "logo_name", "logo_position", "logo_size_pct", "logo_opacity", "caption_look", "brand_name", "brand_colour", "caption_instructions",
 ]
 
 
@@ -434,6 +451,8 @@ def _collect_state_payload(checkpoint_label: str = "autosave") -> dict:
         "vertical_fit_mode": fit_val,
         "logo_watermark_mode": wm_val,
         "logo_position": st.session_state.get("logo_position", LOGO_POSITIONS[0]),
+        "logo_size_pct": float(st.session_state.get("logo_size_pct", 12.0)),
+        "logo_opacity": int(st.session_state.get("logo_opacity", 90)),
         "caption_look": st.session_state.get("caption_look", CAPTION_LOOKS[0]),
         "mute_original_audio": bool(st.session_state.get("mute_original_audio", False)),
         "orig_audio_volume": float(st.session_state.get("orig_audio_volume", 1.0)),
@@ -2887,19 +2906,27 @@ def build_frame_stage_filter(
 
 
 def logo_geometry(out_w: int, mode: str, position: str, clip_dur: float) -> tuple[int, str, float, str]:
-    """(logo pixel width, overlay x:y, alpha, enable expression)."""
+    """(logo pixel width, overlay x:y, alpha, enable expression). Size/opacity come from the Look Studio sliders."""
     pos = position if position in LOGO_POSITIONS else LOGO_POSITIONS[0]
     m = mode if mode in LOGO_WATERMARK_MODES else "Standard Corner (Subtle)"
+    try:
+        size_pct = float(st.session_state.get("logo_size_pct", 12.0))
+    except Exception:
+        size_pct = 12.0
+    try:
+        alpha = max(0.1, min(1.0, float(st.session_state.get("logo_opacity", 90)) / 100.0))
+    except Exception:
+        alpha = 0.9
+    size_pct = max(3.0, min(45.0, size_pct))
     if pos.startswith("Bottom-Left"):
-        w_px, xy, alpha = int(out_w * 0.30), "W*0.06:H-h-H*0.10", 0.55
+        xy = "W*0.05:H-h-H*0.09"
     elif pos.startswith("Top-Right"):
-        w_px, xy, alpha = int(out_w * 0.12), "W-w-W*0.04:H*0.04", 0.92
+        xy = "W-w-W*0.04:H*0.04"
     else:
-        w_px, xy, alpha = int(out_w * 0.115), "W-w-W*0.035:H-h-H*0.035", 0.95
-    if m == "Standard Corner (Subtle)":
-        alpha = min(alpha, 0.88)
+        xy = "W-w-W*0.035:H-h-H*0.035"
     if m == "Solid Corner":
         alpha = 1.0
+    w_px = int(out_w * size_pct / 100.0)
     w_px = max(24, w_px - (w_px % 2))
     enable = f":enable='between(t,0,{min(max(1.0, clip_dur), 8.0):.2f})'" if m == "Standard Corner (First 8s)" else ""
     return w_px, xy, alpha, enable
@@ -2925,7 +2952,7 @@ def write_creator_ass_file(
     font_px = max(24, min(76, int(round(int(font_size) * scale))))
     margin_v = max(58, int(round(out_h * (0.115 if out_h >= out_w else 0.075))))
     if box_look:
-        margin_v = int(round(out_h * (0.15 if out_h >= out_w else 0.08)))
+        margin_v = int(round(out_h * (0.185 if out_h >= out_w else 0.10)))
     style_line = (
         f"Style: Creator,Arial,{font_px},&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,3,{max(8, int(font_px * 0.28))},0,8,60,60,{margin_v},1"
         if box_look else
@@ -3877,6 +3904,8 @@ def init_state():
         "vertical_fit_mode": SMART_FIT,
         "logo_watermark_mode": "Standard Corner (Subtle)",
         "logo_position": LOGO_POSITIONS[0],
+        "logo_size_pct": 12.0,
+        "logo_opacity": 90,
         "caption_look": CAPTION_LOOKS[0],
         "mute_original_audio": False,
         "voiceover_source_mode": "Uploaded Voice Track",
@@ -4106,6 +4135,108 @@ def render_srt_and_logo_beside(key_prefix: str = "beside", title: str = "SRT & L
             st.image(st.session_state["logo_path"], caption=st.session_state.get("logo_name") or "Brand Logo", width=120)
 
 
+def render_look_preview(source: str, at: float = 1.0) -> Path | None:
+    """One still frame showing the exact fit, logo, hook and caption look a render will use."""
+    if not source or not Path(source).exists() or not ffmpeg_ready():
+        return None
+    ss = st.session_state
+    try:
+        info = probe_video(source)
+    except Exception:
+        return None
+    aspect = default_aspect_for_platform(ss.get("target_platform_choice", ""))
+    out_w, out_h = resolve_target_dimensions(aspect, "720p HD", int(info.get("width") or 1280), int(info.get("height") or 720))
+    fit = ss.get("vertical_fit_mode", SMART_FIT)
+    t = max(0.0, min(float(at), max(0.0, float(info.get("duration") or 1.0) - 0.3)))
+    focus = motion_focus_x(source, t, t + 3.0) if fit == SMART_FIT else None
+    graph = [build_frame_stage_filter("0:v", out_w, out_h, aspect, "vstage", fit_mode=fit, crop_x_frac=focus)]
+    inputs = ["-ss", f"{t:.2f}", "-i", source]
+    logo = ss.get("logo_path")
+    logo_idx = None
+    if logo and Path(logo).exists():
+        logo_idx = 1
+        inputs += ["-i", str(logo)]
+    tmp: list[Path] = []
+    out_jpg = workspace_dir(ss.get("workspace_key", "default")) / f"lookprev_{next(tempfile._get_candidate_names())}.jpg"
+    try:
+        cur, _ = append_overlays_and_subs(
+            graph=graph, current_label="vstage", clip_duration=5.0, out_w=out_w, out_h=out_h,
+            logo=logo, logo_input_idx=logo_idx,
+            cues=[(0.0, 5.0, "Your caption looks like this")],
+            hook_banner_text="Your hook banner", hook_banner_duration=5.0,
+            caption_font_size=int(ss.get("onscreen_caption_size", 32)), srt_output_path=None,
+            temp_text_files=tmp, use_ass=True,
+            subtitle_accent_colour=ss.get("subtitle_accent_colour", "Creator Yellow"),
+            logo_watermark_mode="Standard Corner (Subtle)" if ss.get("logo_watermark_mode") == "Standard Corner (First 8s)" else ss.get("logo_watermark_mode", "Standard Corner (Subtle)"),
+        )
+        res = run_cmd(["ffmpeg", "-y", *inputs, "-filter_complex", ";".join(graph), "-map", f"[{cur}]",
+                       "-frames:v", "1", "-q:v", "3", str(out_jpg)], timeout=90)
+        if res.returncode == 0 and out_jpg.exists() and out_jpg.stat().st_size > 0:
+            return out_jpg
+    except Exception:
+        pass
+    finally:
+        for tf in tmp:
+            tf.unlink(missing_ok=True)
+    return None
+
+
+def apply_shortform_preset():
+    """One click: the look of the CNPL-style shorts (full-frame crop, small corner logo, black-box captions)."""
+    ss = st.session_state
+    ss["vertical_fit_mode"] = SMART_FIT
+    ss["logo_position"] = LOGO_POSITIONS[0]
+    ss["logo_size_pct"] = 12.0
+    ss["logo_opacity"] = 90
+    ss["caption_look"] = CAPTION_LOOKS[0]
+    ss["logo_watermark_mode"] = "Standard Corner (Subtle)"
+    ss["ls_logo_size"] = 12.0
+    ss["ls_logo_opacity"] = 90
+    ss["ls_logo_pos"] = LOGO_POSITIONS[0]
+    ss["ls_caption_look"] = CAPTION_LOOKS[0]
+
+
+def render_look_studio(prefix: str = "ls"):
+    """Logo size / opacity / position + caption look, with a live preview frame."""
+    ss = st.session_state
+    ss.setdefault("ls_logo_size", float(ss.get("logo_size_pct", 12.0)))
+    ss.setdefault("ls_logo_opacity", int(ss.get("logo_opacity", 90)))
+    ss.setdefault("ls_logo_pos", ss.get("logo_position", LOGO_POSITIONS[0]))
+    ss.setdefault("ls_caption_look", ss.get("caption_look", CAPTION_LOOKS[0]))
+    st.markdown("#### 🎨 Look Studio")
+    st.caption("Make the logo bigger or smaller, change its position and the caption style, then preview before you render.")
+    top_a, top_b = st.columns([1.0, 1.0])
+    with top_a:
+        if st.button("⚡ Use short-form preset (full frame · small logo · box captions)", key=f"{prefix}_preset", width="stretch"):
+            apply_shortform_preset()
+            st.rerun()
+    c1, c2 = st.columns([1.2, 1.0], gap="large")
+    with c1:
+        size = st.slider("Logo size (% of video width)", 3.0, 45.0, step=0.5, key="ls_logo_size",
+                         help="Bigger number = bigger logo in the finished clip.")
+        opac = st.slider("Logo opacity (%)", 10, 100, step=5, key="ls_logo_opacity")
+        pos = st.selectbox("Logo position", LOGO_POSITIONS, key="ls_logo_pos")
+        look = st.selectbox("Caption look", CAPTION_LOOKS, key="ls_caption_look")
+        ss["logo_size_pct"], ss["logo_opacity"], ss["logo_position"], ss["caption_look"] = float(size), int(opac), pos, look
+        if not (ss.get("logo_path") and Path(ss["logo_path"]).exists()):
+            st.warning("Upload a logo (SRT & Logo section) to see it in the preview.")
+        t_at = st.slider("Preview at (seconds into the active video)", 0.0, max(1.0, float((ss.get("video_info") or {}).get("duration") or 10.0) - 0.5), 1.0, 0.5, key=f"{prefix}_prev_t")
+        go = st.button("👁️ Preview this look", type="primary", key=f"{prefix}_prev_btn", width="stretch")
+    with c2:
+        if go:
+            if not (ss.get("source_video") and Path(ss["source_video"]).exists()):
+                st.info("Load a video first to preview.")
+            else:
+                with st.spinner("Rendering preview..."):
+                    ss["look_preview_path"] = str(render_look_preview(ss["source_video"], t_at) or "")
+                save_workspace_state(checkpoint_label="look_changed")
+        pp = ss.get("look_preview_path")
+        if pp and Path(pp).exists():
+            st.image(pp, caption="Preview (what your clips will look like)", width=260)
+        else:
+            st.caption("Press **Preview this look** to see a frame here.")
+
+
 def sync_auto_clip_count(source_key: str):
     try:
         val = max(1, min(6, int(st.session_state.get(source_key, 2))))
@@ -4118,7 +4249,7 @@ init_state()
 
 # ----------------------------- HEADER & NAV -----------------------------
 st.markdown(f"""<div class="hero">
-<div style="color:#a5b4fc;font-weight:750;font-size:.76rem;letter-spacing:.13em">UP TO {MAX_SOURCE_VIDEOS} VIDEOS MIXED INTO EVERY CLIP · EXACT SECONDS · WORKSPACE CODE RESUME · MULTI-PLATFORM COPY</div>
+<div class="kick">UP TO {MAX_SOURCE_VIDEOS} VIDEOS MIXED INTO EVERY CLIP · EXACT SECONDS · WORKSPACE CODE RESUME · MULTI-PLATFORM COPY</div>
 <h1>🎬 {APP_NAME}</h1>
 <p class="muted">Add up to {MAX_SOURCE_VIDEOS} campaign videos, type the clip length in seconds, and every clip mixes peak moments from all of them. SRT & logo anytime, resume via Workspace Code.</p>
 <span class="pill">Mix Up to {MAX_SOURCE_VIDEOS} Videos Per Clip</span>
@@ -4218,6 +4349,21 @@ with st.sidebar:
 
 # ----------------------------- PAGE 1: CAMPAIGN & AUTO-CLIPPER --------
 if page == "Campaign & Auto-Clipper":
+    _steps = [
+        ("Load videos", f"{len(slots_now)}/{MAX_SOURCE_VIDEOS} loaded", bool(slots_now)),
+        ("Add brief", "optional", bool((st.session_state.get("brief") or "").strip())),
+        ("Analyse", "fit check", bool(st.session_state.get("brief_analysis"))),
+        ("Go-ahead", "unlock mixer", bool(st.session_state.get("go_ahead_clips"))),
+        ("Clips made", f"{len(st.session_state.get('clips') or [])} ready", bool(st.session_state.get("clips"))),
+    ]
+    st.markdown(
+        '<div class="stepper">' + "".join(
+            f'<div class="step{" done" if d else ""}"><div class="n">{"✓" if d else i + 1}</div>'
+            f'<div><div class="t">{html.escape(t)}</div><div class="s">{html.escape(sub)}</div></div></div>'
+            for i, (t, sub, d) in enumerate(_steps)
+        ) + "</div>",
+        unsafe_allow_html=True,
+    )
     st.subheader(f"Step 1 · Up to {MAX_SOURCE_VIDEOS} Videos + Live % + 3/5-Part Breaker + Campaign Requirements")
     left_col, right_col = st.columns([1.15, 1], gap="large")
 
@@ -4426,7 +4572,6 @@ if page == "Campaign & Auto-Clipper":
             LOGO_WATERMARK_MODES,
             key="logo_watermark_mode",
         )
-        st.selectbox("Logo position & size", LOGO_POSITIONS, key="logo_position")
 
         hk_c1, hk_c2 = st.columns([1.6, 1.0])
         with hk_c1:
@@ -4661,6 +4806,8 @@ if page == "Campaign & Auto-Clipper":
                 if not u_l and not o_l:
                     st.caption("No spots used yet.")
 
+        with st.expander("🎨 Look Studio · logo size, opacity, position & caption look (with preview)", expanded=False):
+            render_look_studio("s3")
         q_col1, q_col2, q_col3, q_col4 = st.columns(4)
         with q_col1:
             sharp_res = st.selectbox(
@@ -5128,8 +5275,7 @@ elif page == "Brand Kit & Settings":
     st.divider()
     render_srt_and_logo_beside(key_prefix="brandkit_beside", title="Brand Kit: SRT & Logo Side-by-Side")
     st.selectbox("Default Logo Watermark Mode", LOGO_WATERMARK_MODES, key="logo_watermark_mode")
-    st.selectbox("Logo position & size", LOGO_POSITIONS, key="logo_position")
-    st.selectbox("Caption look", CAPTION_LOOKS, key="caption_look")
+    render_look_studio("bk")
     st.text_input("Brand Name", key="brand_name")
     st.text_input("Brand Accent Colour", key="brand_colour")
 
